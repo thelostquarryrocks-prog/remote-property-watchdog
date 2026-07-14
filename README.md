@@ -39,6 +39,43 @@ Implement only R0-001. Add the required tests and validation commands, run them,
 4) assumptions, and 5) remaining risks. Do not begin R0-002.
 ```
 
+
+## Windows developer prerequisites
+
+Install these prerequisites before working on R0 code:
+
+1. Windows 11 or Windows Server 2025 with PowerShell 7.4 or newer.
+2. .NET 10 SDK, matching `global.json` (`10.0.100` with latest-feature roll-forward).
+3. Docker Desktop or a Docker-compatible engine for local PostgreSQL 18.
+4. Git for Windows.
+
+Verify the tools from a PowerShell prompt:
+
+```powershell
+dotnet --info
+pwsh --version
+docker --version
+git --version
+```
+
+## Bootstrap, build, test, and local startup
+
+From the repository root on Windows:
+
+```powershell
+pwsh ./scripts/bootstrap.ps1
+docker compose up -d postgres
+dotnet restore ./RemotePropertyWatchdog.sln
+dotnet build ./RemotePropertyWatchdog.sln --configuration Release --no-restore
+dotnet test ./RemotePropertyWatchdog.sln --configuration Release --no-build
+pwsh ./scripts/test.ps1
+dotnet run --project ./src/Cloud/RemotePropertyWatchdog.Cloud.Host/RemotePropertyWatchdog.Cloud.Host.csproj
+```
+
+The cloud bootstrap health endpoint is available at `GET /healthz` while the cloud host is running. The R0-001 agent project is only a host-construction smoke target; Windows Service installation and lifecycle behavior belong to R0-003.
+
+For local PostgreSQL, use the checked-in `compose.yaml` development service only. Its password is a documented local-development placeholder and must not be reused outside local development.
+
 ## Delivery sequence
 
 The tasks are intentionally ordered. R0-001 through R0-009 are primarily sequential because later interfaces depend on earlier contracts. R0-010 through R0-013 can be parallelized cautiously after contracts stabilize. R0-014 is the end-to-end gate. R0-015 is the controlled home dogfood pilot.

@@ -1,0 +1,5 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\RemotePropertyWatchdog.Cloud.Application\RemotePropertyWatchdog.Cloud.Application.csproj" />
+  </ItemGroup>
+</Project>

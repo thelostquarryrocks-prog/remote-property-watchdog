@@ -41,3 +41,42 @@ When internet service disappears, the cloud initially knows only that the proper
 - Persistence: SQLite locally; managed PostgreSQL in cloud.
 - Messaging: internal provider-neutral adapters.
 - No Kubernetes, service mesh, Kafka, public LAN listener, or reverse tunnel in R0.
+
+
+## R0-001 project dependency map
+
+```text
+RemotePropertyWatchdog.Agent.Service
+  -> RemotePropertyWatchdog.Shared.Contracts
+
+RemotePropertyWatchdog.Cloud.Host
+  -> RemotePropertyWatchdog.Cloud.Application
+  -> RemotePropertyWatchdog.Cloud.Infrastructure
+
+RemotePropertyWatchdog.Cloud.Infrastructure
+  -> RemotePropertyWatchdog.Cloud.Application
+
+RemotePropertyWatchdog.Cloud.Application
+  -> RemotePropertyWatchdog.Cloud.Domain
+  -> RemotePropertyWatchdog.Shared.Contracts
+
+RemotePropertyWatchdog.Cloud.Domain
+  -> no project references
+
+RemotePropertyWatchdog.Shared.Contracts
+  -> no project references
+
+RemotePropertyWatchdog.UnitTests
+  -> RemotePropertyWatchdog.Agent.Service
+
+RemotePropertyWatchdog.IntegrationTests
+  -> RemotePropertyWatchdog.Cloud.Host
+
+RemotePropertyWatchdog.ContractTests
+  -> RemotePropertyWatchdog.Shared.Contracts
+
+RemotePropertyWatchdog.BuildTests
+  -> repository scripts only
+```
+
+The cloud remains deployable as one ASP.NET Core host process with modular domain, application, and infrastructure projects. The bootstrap does not add business monitoring logic, inbound LAN exposure, tunnels, or provider credentials.
