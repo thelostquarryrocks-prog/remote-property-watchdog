@@ -1,5 +1,6 @@
 using System.Text.Json;
-using RemotePropertyWatchdog.Shared.Contracts;
+using Json.Schema;
+using RemotePropertyWatchdog.Contracts;
 
 namespace RemotePropertyWatchdog.ContractTests;
 
@@ -13,8 +14,11 @@ public sealed class JsonSchemaSmokeTests
         foreach (string schemaFile in ContractSchema.RequiredSchemaFiles)
         {
             string path = Path.Combine(repositoryRoot, "schemas", schemaFile);
-            using FileStream stream = File.OpenRead(path);
-            using JsonDocument document = JsonDocument.Parse(stream);
+            string schemaText = File.ReadAllText(path);
+            JsonSchema parsedSchema = JsonSchema.FromText(schemaText);
+            using JsonDocument document = JsonDocument.Parse(schemaText);
+
+            Assert.NotNull(parsedSchema);
 
             JsonElement root = document.RootElement;
             Assert.Equal(JsonValueKind.Object, root.ValueKind);

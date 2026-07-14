@@ -1,4 +1,4 @@
-namespace RemotePropertyWatchdog.Shared.Contracts;
+namespace RemotePropertyWatchdog.Contracts;
 
 public static class ContractSchema
 {
