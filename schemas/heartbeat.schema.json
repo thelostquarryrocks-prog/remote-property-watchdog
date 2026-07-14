@@ -1,0 +1,170 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.remote-property-watchdog.example/v0.1/heartbeat.json",
+  "title": "Agent Heartbeat v0.1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "heartbeat_id",
+    "agent_id",
+    "property_id",
+    "sequence",
+    "session_id",
+    "sent_at",
+    "agent_uptime_seconds",
+    "mode",
+    "gateway",
+    "internet",
+    "critical",
+    "last_event_sequence",
+    "queued_events",
+    "agent_version"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "0.1"
+    },
+    "heartbeat_id": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 128
+    },
+    "agent_id": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 128
+    },
+    "property_id": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 128
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "session_id": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 128
+    },
+    "sent_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "agent_uptime_seconds": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "mode": {
+      "enum": [
+        "normal",
+        "away",
+        "maintenance"
+      ]
+    },
+    "gateway": {
+      "$ref": "#/$defs/gateway"
+    },
+    "internet": {
+      "$ref": "#/$defs/internet"
+    },
+    "critical": {
+      "$ref": "#/$defs/critical"
+    },
+    "last_event_sequence": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "queued_events": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "agent_version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    }
+  },
+  "$defs": {
+    "state": {
+      "enum": [
+        "unknown",
+        "up",
+        "degraded",
+        "down"
+      ]
+    },
+    "gateway": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state"
+      ],
+      "properties": {
+        "state": {
+          "$ref": "#/$defs/state"
+        },
+        "latency_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 60000
+        }
+      }
+    },
+    "internet": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "dns_state",
+        "https_ok"
+      ],
+      "properties": {
+        "state": {
+          "$ref": "#/$defs/state"
+        },
+        "dns_state": {
+          "$ref": "#/$defs/state"
+        },
+        "https_ok": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10
+        }
+      }
+    },
+    "critical": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "healthy",
+        "degraded",
+        "offline",
+        "unknown"
+      ],
+      "properties": {
+        "healthy": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "degraded": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "offline": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "unknown": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}

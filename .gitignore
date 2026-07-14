@@ -1,0 +1,37 @@
+# .NET
+bin/
+obj/
+*.user
+*.suo
+*.nupkg
+TestResults/
+coverage/
+artifacts/
+
+# IDE
+.vs/
+.vscode/*
+!.vscode/extensions.json
+.idea/
+
+# Local databases and secrets
+*.db
+*.db-shm
+*.db-wal
+.env
+.env.*
+!.env.example
+secrets.json
+appsettings.Local.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs and support bundles
+*.log
+support-bundles/
+
+# Local test output
+.tmp/
+reports/

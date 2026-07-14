@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.remote-property-watchdog.example/v0.1/material-event.json",
+  "title": "Material Event v0.1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "message_id",
+    "agent_id",
+    "property_id",
+    "event_sequence",
+    "session_id",
+    "observed_at",
+    "event_type",
+    "evidence"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "0.1"
+    },
+    "message_id": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 128
+    },
+    "agent_id": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 128
+    },
+    "property_id": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 128
+    },
+    "event_sequence": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "session_id": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 128
+    },
+    "observed_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "event_type": {
+      "enum": [
+        "target_state_changed",
+        "gateway_state_changed",
+        "internet_state_changed",
+        "agent_lifecycle_changed",
+        "mode_changed",
+        "clock_anomaly_detected",
+        "configuration_apply_result"
+      ]
+    },
+    "target_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 128
+    },
+    "target_label": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 160
+    },
+    "from_state": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 64
+    },
+    "to_state": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 64
+    },
+    "evidence": {
+      "type": "array",
+      "maxItems": 16,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 96
+      },
+      "uniqueItems": true
+    },
+    "gateway_state": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 32
+    },
+    "internet_state": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 32
+    }
+  }
+}

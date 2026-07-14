@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.remote-property-watchdog.example/v0.1/incident-summary.json",
+  "title": "Incident Summary v0.1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "incident_id",
+    "property_id",
+    "incident_class",
+    "severity",
+    "state",
+    "confirmed_observation",
+    "limitations",
+    "confidence",
+    "started_at"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "0.1"
+    },
+    "incident_id": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 128
+    },
+    "property_id": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 128
+    },
+    "incident_class": {
+      "enum": [
+        "property_unreachable",
+        "internet_unavailable",
+        "gateway_or_local_network_unavailable",
+        "critical_device_offline",
+        "service_unavailable",
+        "shared_dependency_failure",
+        "unusual_sequential_failures",
+        "monitoring_stopped"
+      ]
+    },
+    "severity": {
+      "enum": [
+        "info",
+        "medium",
+        "high",
+        "critical"
+      ]
+    },
+    "state": {
+      "enum": [
+        "open",
+        "acknowledged",
+        "recovering",
+        "resolved"
+      ]
+    },
+    "confirmed_observation": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 500
+    },
+    "interpretation": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 1000
+    },
+    "limitations": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1000
+    },
+    "recommended_action": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 500
+    },
+    "confidence": {
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    "started_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "resolved_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    }
+  }
+}

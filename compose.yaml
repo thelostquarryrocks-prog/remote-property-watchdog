@@ -1,0 +1,19 @@
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: rpw_dev
+      POSTGRES_USER: rpw_dev
+      POSTGRES_PASSWORD: local-development-only
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rpw_dev -d rpw_dev"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - rpw-postgres:/var/lib/postgresql/data
+
+volumes:
+  rpw-postgres:
