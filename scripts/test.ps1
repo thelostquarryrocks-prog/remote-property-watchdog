@@ -1,4 +1,6 @@
 $ErrorActionPreference = 'Stop'
+$PSNativeCommandUseErrorActionPreference = $true
+
 
 python ./scripts/validate-kickoff.py
 python ./scripts/scan-secrets.py

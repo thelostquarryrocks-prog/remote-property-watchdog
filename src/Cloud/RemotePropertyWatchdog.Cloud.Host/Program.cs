@@ -1,4 +1,4 @@
-using RemotePropertyWatchdog.Shared.Contracts;
+using RemotePropertyWatchdog.Contracts;
 
 WebApplicationBuilder builder = WebApplication.CreateBuilder(args);
 builder.Services.AddHealthChecks();

@@ -20,7 +20,12 @@ agent_bytes = (ROOT / 'AGENTS.md').stat().st_size
 if agent_bytes > 32 * 1024:
     raise SystemExit(f'AGENTS.md exceeds 32 KiB: {agent_bytes}')
 
+excluded_directories = {'.git', 'bin', 'obj'}
+
 for path in ROOT.rglob('*'):
+    if excluded_directories.intersection(path.relative_to(ROOT).parts):
+        continue
+
     if path.is_file() and path.suffix.lower() in {'.md','.json','.yml','.yaml','.ps1','.py','.props'}:
         raw = path.read_bytes()
         if b'\r\n' in raw:

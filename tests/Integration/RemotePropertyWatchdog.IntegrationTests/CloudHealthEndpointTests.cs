@@ -15,12 +15,12 @@ public sealed class CloudHealthEndpointTests : IClassFixture<WebApplicationFacto
     }
 
     [Fact]
-    public async Task HealthzReturnsOkStatus(CancellationToken cancellationToken)
+    public async Task HealthzReturnsOkStatus()
     {
         using HttpClient client = factory.CreateClient();
 
-        using HttpResponseMessage response = await client.GetAsync("/healthz", cancellationToken);
-        HealthResponse? body = await response.Content.ReadFromJsonAsync<HealthResponse>(cancellationToken);
+        using HttpResponseMessage response = await client.GetAsync("/healthz", CancellationToken.None);
+        HealthResponse? body = await response.Content.ReadFromJsonAsync<HealthResponse>(CancellationToken.None);
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.NotNull(body);
