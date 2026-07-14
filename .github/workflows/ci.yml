@@ -18,6 +18,8 @@ jobs:
           python-version: '3.12'
       - name: Validate kickoff package
         run: python scripts/validate-kickoff.py
+      - name: Scan for accidental secrets
+        run: python scripts/scan-secrets.py
       - name: Set up .NET 10
         uses: actions/setup-dotnet@v4
         with:

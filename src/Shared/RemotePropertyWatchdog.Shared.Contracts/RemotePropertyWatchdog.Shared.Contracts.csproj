@@ -1,0 +1,5 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <Description>Shared wire contracts and schema metadata for Remote Property Watchdog.</Description>
+  </PropertyGroup>
+</Project>

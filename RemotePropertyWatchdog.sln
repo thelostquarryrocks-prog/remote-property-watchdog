@@ -1,0 +1,72 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RemotePropertyWatchdog.Shared.Contracts", "src\Shared\RemotePropertyWatchdog.Shared.Contracts\RemotePropertyWatchdog.Shared.Contracts.csproj", "{DE9851F7-9862-49C4-8343-C2BD11FC2218}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RemotePropertyWatchdog.Agent.Service", "src\Agent\RemotePropertyWatchdog.Agent.Service\RemotePropertyWatchdog.Agent.Service.csproj", "{9B9D99AF-7056-4883-A3F4-C1A680910328}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RemotePropertyWatchdog.Cloud.Host", "src\Cloud\RemotePropertyWatchdog.Cloud.Host\RemotePropertyWatchdog.Cloud.Host.csproj", "{3AEE8056-70C5-438B-99E7-733658FB11E6}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RemotePropertyWatchdog.Cloud.Domain", "src\Cloud\RemotePropertyWatchdog.Cloud.Domain\RemotePropertyWatchdog.Cloud.Domain.csproj", "{32C0DA7A-1B09-45EF-A534-AA23F2AF64E7}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RemotePropertyWatchdog.Cloud.Application", "src\Cloud\RemotePropertyWatchdog.Cloud.Application\RemotePropertyWatchdog.Cloud.Application.csproj", "{86C9C781-8B22-4264-B939-C1D221A5C84A}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RemotePropertyWatchdog.Cloud.Infrastructure", "src\Cloud\RemotePropertyWatchdog.Cloud.Infrastructure\RemotePropertyWatchdog.Cloud.Infrastructure.csproj", "{F04A326F-7060-4AA4-9279-1BE394971805}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RemotePropertyWatchdog.UnitTests", "tests\Unit\RemotePropertyWatchdog.UnitTests\RemotePropertyWatchdog.UnitTests.csproj", "{206264F1-1488-4D6D-8E33-D16FE6A0E4A7}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RemotePropertyWatchdog.IntegrationTests", "tests\Integration\RemotePropertyWatchdog.IntegrationTests\RemotePropertyWatchdog.IntegrationTests.csproj", "{A8EE3DD2-5379-430F-A159-14BA472F2FD0}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RemotePropertyWatchdog.ContractTests", "tests\Contract\RemotePropertyWatchdog.ContractTests\RemotePropertyWatchdog.ContractTests.csproj", "{EDF85986-55A9-4FF8-9BB6-16402397D87A}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RemotePropertyWatchdog.BuildTests", "tests\Build\RemotePropertyWatchdog.BuildTests\RemotePropertyWatchdog.BuildTests.csproj", "{D742F117-6D22-4700-91CD-02617698D7C6}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{DE9851F7-9862-49C4-8343-C2BD11FC2218}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{DE9851F7-9862-49C4-8343-C2BD11FC2218}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{DE9851F7-9862-49C4-8343-C2BD11FC2218}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{DE9851F7-9862-49C4-8343-C2BD11FC2218}.Release|Any CPU.Build.0 = Release|Any CPU
+		{9B9D99AF-7056-4883-A3F4-C1A680910328}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{9B9D99AF-7056-4883-A3F4-C1A680910328}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{9B9D99AF-7056-4883-A3F4-C1A680910328}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{9B9D99AF-7056-4883-A3F4-C1A680910328}.Release|Any CPU.Build.0 = Release|Any CPU
+		{3AEE8056-70C5-438B-99E7-733658FB11E6}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{3AEE8056-70C5-438B-99E7-733658FB11E6}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{3AEE8056-70C5-438B-99E7-733658FB11E6}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{3AEE8056-70C5-438B-99E7-733658FB11E6}.Release|Any CPU.Build.0 = Release|Any CPU
+		{32C0DA7A-1B09-45EF-A534-AA23F2AF64E7}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{32C0DA7A-1B09-45EF-A534-AA23F2AF64E7}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{32C0DA7A-1B09-45EF-A534-AA23F2AF64E7}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{32C0DA7A-1B09-45EF-A534-AA23F2AF64E7}.Release|Any CPU.Build.0 = Release|Any CPU
+		{86C9C781-8B22-4264-B939-C1D221A5C84A}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{86C9C781-8B22-4264-B939-C1D221A5C84A}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{86C9C781-8B22-4264-B939-C1D221A5C84A}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{86C9C781-8B22-4264-B939-C1D221A5C84A}.Release|Any CPU.Build.0 = Release|Any CPU
+		{F04A326F-7060-4AA4-9279-1BE394971805}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{F04A326F-7060-4AA4-9279-1BE394971805}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{F04A326F-7060-4AA4-9279-1BE394971805}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{F04A326F-7060-4AA4-9279-1BE394971805}.Release|Any CPU.Build.0 = Release|Any CPU
+		{206264F1-1488-4D6D-8E33-D16FE6A0E4A7}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{206264F1-1488-4D6D-8E33-D16FE6A0E4A7}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{206264F1-1488-4D6D-8E33-D16FE6A0E4A7}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{206264F1-1488-4D6D-8E33-D16FE6A0E4A7}.Release|Any CPU.Build.0 = Release|Any CPU
+		{A8EE3DD2-5379-430F-A159-14BA472F2FD0}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A8EE3DD2-5379-430F-A159-14BA472F2FD0}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A8EE3DD2-5379-430F-A159-14BA472F2FD0}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A8EE3DD2-5379-430F-A159-14BA472F2FD0}.Release|Any CPU.Build.0 = Release|Any CPU
+		{EDF85986-55A9-4FF8-9BB6-16402397D87A}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{EDF85986-55A9-4FF8-9BB6-16402397D87A}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{EDF85986-55A9-4FF8-9BB6-16402397D87A}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{EDF85986-55A9-4FF8-9BB6-16402397D87A}.Release|Any CPU.Build.0 = Release|Any CPU
+		{D742F117-6D22-4700-91CD-02617698D7C6}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{D742F117-6D22-4700-91CD-02617698D7C6}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{D742F117-6D22-4700-91CD-02617698D7C6}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{D742F117-6D22-4700-91CD-02617698D7C6}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal

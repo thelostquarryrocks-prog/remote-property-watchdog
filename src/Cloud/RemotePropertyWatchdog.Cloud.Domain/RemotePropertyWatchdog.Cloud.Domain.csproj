@@ -1,0 +1,5 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <Description>Cloud domain model placeholders for R0 modular monolith boundaries.</Description>
+  </PropertyGroup>
+</Project>

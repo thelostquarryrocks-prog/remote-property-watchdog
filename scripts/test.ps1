@@ -1,6 +1,7 @@
 $ErrorActionPreference = 'Stop'
 
 python ./scripts/validate-kickoff.py
+python ./scripts/scan-secrets.py
 
 if (Test-Path './RemotePropertyWatchdog.sln') {
     dotnet restore ./RemotePropertyWatchdog.sln
