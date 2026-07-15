@@ -7,4 +7,6 @@ public sealed class AgentLifecycleOptions
     public string? MarkerPath { get; set; }
 
     public TimeSpan ReadinessTimeout { get; set; } = TimeSpan.FromSeconds(60);
+
+    public TimeSpan CleanShutdownWriteTimeout { get; set; } = TimeSpan.FromSeconds(5);
 }

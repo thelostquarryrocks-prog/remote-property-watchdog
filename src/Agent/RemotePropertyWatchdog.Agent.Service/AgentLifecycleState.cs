@@ -4,6 +4,7 @@ public sealed record AgentLifecycleState(
     Guid SessionId,
     DateTimeOffset StartedAtUtc,
     DateTimeOffset? ReadyAtUtc,
+    TimeSpan? ReadinessElapsed,
     DateTimeOffset? StoppedAtUtc,
     bool PlannedShutdown,
     Guid? PreviousSessionId,

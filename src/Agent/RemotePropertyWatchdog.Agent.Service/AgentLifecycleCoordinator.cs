@@ -1,8 +1,11 @@
+using Microsoft.Extensions.Options;
+
 namespace RemotePropertyWatchdog.Agent.Service;
 
 public sealed class AgentLifecycleCoordinator(
     IAgentLifecycleStore store,
-    TimeProvider timeProvider) : IAgentLifecycleCoordinator, IDisposable
+    TimeProvider timeProvider,
+    IOptions<AgentLifecycleOptions> options) : IAgentLifecycleCoordinator, IDisposable
 {
     private readonly SemaphoreSlim gate = new(1, 1);
     private AgentLifecycleState? currentState;
@@ -25,6 +28,7 @@ public sealed class AgentLifecycleCoordinator(
                 Guid.NewGuid(),
                 now,
                 ReadyAtUtc: null,
+                ReadinessElapsed: null,
                 StoppedAtUtc: null,
                 PlannedShutdown: false,
                 previous?.SessionId,
@@ -51,7 +55,19 @@ public sealed class AgentLifecycleCoordinator(
                 return state;
             }
 
-            state = state with { ReadyAtUtc = timeProvider.GetUtcNow() };
+            DateTimeOffset readyAtUtc = timeProvider.GetUtcNow();
+            TimeSpan elapsed = readyAtUtc - state.StartedAtUtc;
+            if (elapsed < TimeSpan.Zero)
+            {
+                elapsed = TimeSpan.Zero;
+            }
+
+            if (elapsed > options.Value.ReadinessTimeout)
+            {
+                throw new InvalidOperationException("Lifecycle readiness exceeded the configured timeout.");
+            }
+
+            state = state with { ReadyAtUtc = readyAtUtc, ReadinessElapsed = elapsed };
             await store.WriteMarkerAsync(ToMarker(state), cancellationToken);
             currentState = state;
             return state;
@@ -87,5 +103,13 @@ public sealed class AgentLifecycleCoordinator(
     public void Dispose() => gate.Dispose();
 
     private static AgentLifecycleMarker ToMarker(AgentLifecycleState state) =>
-        new(state.SessionId, state.StartedAtUtc, state.ReadyAtUtc, state.StoppedAtUtc, state.PlannedShutdown);
+        new(
+            state.SessionId,
+            state.StartedAtUtc,
+            state.ReadyAtUtc,
+            state.ReadinessElapsed is null ? null : Convert.ToInt64(state.ReadinessElapsed.Value.TotalMilliseconds),
+            state.StoppedAtUtc,
+            state.PlannedShutdown,
+            state.PreviousSessionId,
+            state.PreviousSessionEndedCleanly);
 }
