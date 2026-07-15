@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.remote-property-watchdog.example/v0.1/material-event.json",
+  "$id": "https://schemas.remote-property-watchdog.example/v0.1/material-event.schema.json",
   "title": "Material Event v0.1",
   "type": "object",
   "additionalProperties": false,

@@ -2,7 +2,7 @@ using System.Text.Json.Serialization;
 
 namespace RemotePropertyWatchdog.Contracts;
 
-public sealed record GatewaySummary(ProbeState State, int? LatencyMs = null) : IContractValidatable
+public sealed record GatewaySummary([property: JsonRequired] ProbeState State, int? LatencyMs = null) : IContractValidatable
 {
     public IReadOnlyList<ContractValidationError> Validate()
     {
@@ -13,7 +13,7 @@ public sealed record GatewaySummary(ProbeState State, int? LatencyMs = null) : I
     }
 }
 
-public sealed record InternetSummary(ProbeState State, ProbeState DnsState, int HttpsOk) : IContractValidatable
+public sealed record InternetSummary([property: JsonRequired] ProbeState State, [property: JsonRequired] ProbeState DnsState, [property: JsonRequired] int HttpsOk) : IContractValidatable
 {
     public IReadOnlyList<ContractValidationError> Validate()
     {
@@ -25,7 +25,7 @@ public sealed record InternetSummary(ProbeState State, ProbeState DnsState, int 
     }
 }
 
-public sealed record CriticalTargetSummary(int Healthy, int Degraded, int Offline, int Unknown) : IContractValidatable
+public sealed record CriticalTargetSummary([property: JsonRequired] int Healthy, [property: JsonRequired] int Degraded, [property: JsonRequired] int Offline, [property: JsonRequired] int Unknown) : IContractValidatable
 {
     public IReadOnlyList<ContractValidationError> Validate()
     {
@@ -39,21 +39,21 @@ public sealed record CriticalTargetSummary(int Healthy, int Degraded, int Offlin
 }
 
 public sealed record HeartbeatDto(
-    [property: JsonPropertyOrder(0)] string SchemaVersion,
-    [property: JsonPropertyOrder(1)] string HeartbeatId,
-    [property: JsonPropertyOrder(2)] string AgentId,
-    [property: JsonPropertyOrder(3)] string PropertyId,
-    [property: JsonPropertyOrder(4)] long Sequence,
-    [property: JsonPropertyOrder(5)] string SessionId,
-    [property: JsonPropertyOrder(6)] DateTimeOffset SentAt,
-    [property: JsonPropertyOrder(7)] long AgentUptimeSeconds,
-    [property: JsonPropertyOrder(8)] AgentMode Mode,
-    [property: JsonPropertyOrder(9)] GatewaySummary Gateway,
-    [property: JsonPropertyOrder(10)] InternetSummary Internet,
-    [property: JsonPropertyOrder(11)] CriticalTargetSummary Critical,
-    [property: JsonPropertyOrder(12)] long LastEventSequence,
-    [property: JsonPropertyOrder(13)] int QueuedEvents,
-    [property: JsonPropertyOrder(14)] string AgentVersion) : IContractValidatable
+    [property: JsonRequired, JsonPropertyOrder(0)] string SchemaVersion,
+    [property: JsonRequired, JsonPropertyOrder(1)] string HeartbeatId,
+    [property: JsonRequired, JsonPropertyOrder(2)] string AgentId,
+    [property: JsonRequired, JsonPropertyOrder(3)] string PropertyId,
+    [property: JsonRequired, JsonPropertyOrder(4)] long Sequence,
+    [property: JsonRequired, JsonPropertyOrder(5)] string SessionId,
+    [property: JsonRequired, JsonPropertyOrder(6)] DateTimeOffset SentAt,
+    [property: JsonRequired, JsonPropertyOrder(7)] long AgentUptimeSeconds,
+    [property: JsonRequired, JsonPropertyOrder(8)] AgentMode Mode,
+    [property: JsonRequired, JsonPropertyOrder(9)] GatewaySummary Gateway,
+    [property: JsonRequired, JsonPropertyOrder(10)] InternetSummary Internet,
+    [property: JsonRequired, JsonPropertyOrder(11)] CriticalTargetSummary Critical,
+    [property: JsonRequired, JsonPropertyOrder(12)] long LastEventSequence,
+    [property: JsonRequired, JsonPropertyOrder(13)] int QueuedEvents,
+    [property: JsonRequired, JsonPropertyOrder(14)] string AgentVersion) : IContractValidatable
 {
     public IReadOnlyList<ContractValidationError> Validate()
     {
@@ -67,9 +67,9 @@ public sealed record HeartbeatDto(
         ContractValidation.RequireUtc(errors, "sent_at", SentAt);
         ContractValidation.RequireNonNegative(errors, "agent_uptime_seconds", AgentUptimeSeconds);
         ContractValidation.RejectUndefinedEnum(errors, "mode", Mode);
-        errors.AddRange(Gateway.Validate());
-        errors.AddRange(Internet.Validate());
-        errors.AddRange(Critical.Validate());
+        if (ContractValidation.RequireNotNull(errors, "gateway", Gateway)) errors.AddRange(Gateway.Validate());
+        if (ContractValidation.RequireNotNull(errors, "internet", Internet)) errors.AddRange(Internet.Validate());
+        if (ContractValidation.RequireNotNull(errors, "critical", Critical)) errors.AddRange(Critical.Validate());
         ContractValidation.RequireNonNegative(errors, "last_event_sequence", LastEventSequence);
         ContractValidation.RequireNonNegative(errors, "queued_events", QueuedEvents);
         if (string.IsNullOrWhiteSpace(AgentVersion) || AgentVersion.Length > 64) errors.Add(new("agent_version", "invalid_length", "Agent version is required and must be no more than 64 characters."));

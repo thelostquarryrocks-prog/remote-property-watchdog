@@ -76,9 +76,24 @@ public static class ContractValidation
         if (!Enum.IsDefined(value)) errors.Add(new(field, "unsupported_value", "Enum value is not defined by the current contract."));
     }
 
+    internal static bool RequireNotNull<T>(List<ContractValidationError> errors, string field, T? value) where T : class
+    {
+        if (value is not null) return true;
+
+        errors.Add(new(field, "required", "Required object or collection is missing."));
+        return false;
+    }
+
     internal static void RequireMaxSerializedSize<T>(List<ContractValidationError> errors, string field, T value, int maxBytes)
     {
-        int bytes = JsonSerializer.SerializeToUtf8Bytes(value, ContractJson.Options).Length;
-        if (bytes > maxBytes) errors.Add(new(field, "payload_too_large", $"Serialized payload must be no more than {maxBytes} bytes."));
+        try
+        {
+            int bytes = JsonSerializer.SerializeToUtf8Bytes(value, ContractJson.Options).Length;
+            if (bytes > maxBytes) errors.Add(new(field, "payload_too_large", $"Serialized payload must be no more than {maxBytes} bytes."));
+        }
+        catch (JsonException)
+        {
+            errors.Add(new(field, "serialization_failed", "Payload cannot be serialized with contract JSON settings."));
+        }
     }
 }

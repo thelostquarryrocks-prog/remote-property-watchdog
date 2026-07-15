@@ -3,18 +3,18 @@ using System.Text.Json.Serialization;
 namespace RemotePropertyWatchdog.Contracts;
 
 public sealed record IncidentSummaryDto(
-    [property: JsonPropertyOrder(0)] string SchemaVersion,
-    [property: JsonPropertyOrder(1)] string IncidentId,
-    [property: JsonPropertyOrder(2)] string PropertyId,
-    [property: JsonPropertyOrder(3)] IncidentClass IncidentClass,
-    [property: JsonPropertyOrder(4)] IncidentSeverity Severity,
-    [property: JsonPropertyOrder(5)] IncidentState State,
-    [property: JsonPropertyOrder(6)] string ConfirmedObservation,
+    [property: JsonRequired, JsonPropertyOrder(0)] string SchemaVersion,
+    [property: JsonRequired, JsonPropertyOrder(1)] string IncidentId,
+    [property: JsonRequired, JsonPropertyOrder(2)] string PropertyId,
+    [property: JsonRequired, JsonPropertyOrder(3)] IncidentClass IncidentClass,
+    [property: JsonRequired, JsonPropertyOrder(4)] IncidentSeverity Severity,
+    [property: JsonRequired, JsonPropertyOrder(5)] IncidentState State,
+    [property: JsonRequired, JsonPropertyOrder(6)] string ConfirmedObservation,
     [property: JsonPropertyOrder(7)] string? Interpretation,
-    [property: JsonPropertyOrder(8)] string Limitations,
+    [property: JsonRequired, JsonPropertyOrder(8)] string Limitations,
     [property: JsonPropertyOrder(9)] string? RecommendedAction,
-    [property: JsonPropertyOrder(10)] Confidence Confidence,
-    [property: JsonPropertyOrder(11)] DateTimeOffset StartedAt,
+    [property: JsonRequired, JsonPropertyOrder(10)] Confidence Confidence,
+    [property: JsonRequired, JsonPropertyOrder(11)] DateTimeOffset StartedAt,
     [property: JsonPropertyOrder(12)] DateTimeOffset? ResolvedAt) : IContractValidatable
 {
     public IReadOnlyList<ContractValidationError> Validate()
@@ -49,19 +49,19 @@ public sealed record IncidentSummaryDto(
 }
 
 public sealed record ErrorEnvelopeDto(
-    [property: JsonPropertyOrder(0)] string SchemaVersion,
-    [property: JsonPropertyOrder(1)] string ErrorCode,
-    [property: JsonPropertyOrder(2)] string Message,
+    [property: JsonRequired, JsonPropertyOrder(0)] string SchemaVersion,
+    [property: JsonRequired, JsonPropertyOrder(1)] string ErrorCode,
+    [property: JsonRequired, JsonPropertyOrder(2)] string Message,
     [property: JsonPropertyOrder(3)] string? CorrelationId = null,
     [property: JsonPropertyOrder(4)] IReadOnlyList<ContractValidationError>? ValidationErrors = null);
 
 public sealed record AgentConfigurationDto(
-    [property: JsonPropertyOrder(0)] string SchemaVersion,
-    [property: JsonPropertyOrder(1)] string ConfigurationId,
-    [property: JsonPropertyOrder(2)] string PropertyId,
-    [property: JsonPropertyOrder(3)] AgentMode Mode,
-    [property: JsonPropertyOrder(4)] int HeartbeatIntervalSeconds,
-    [property: JsonPropertyOrder(5)] IReadOnlyList<ConfiguredTargetDto> CriticalTargets) : IContractValidatable
+    [property: JsonRequired, JsonPropertyOrder(0)] string SchemaVersion,
+    [property: JsonRequired, JsonPropertyOrder(1)] string ConfigurationId,
+    [property: JsonRequired, JsonPropertyOrder(2)] string PropertyId,
+    [property: JsonRequired, JsonPropertyOrder(3)] AgentMode Mode,
+    [property: JsonRequired, JsonPropertyOrder(4)] int HeartbeatIntervalSeconds,
+    [property: JsonRequired, JsonPropertyOrder(5)] IReadOnlyList<ConfiguredTargetDto> CriticalTargets) : IContractValidatable
 {
     public IReadOnlyList<ContractValidationError> Validate()
     {
@@ -71,12 +71,15 @@ public sealed record AgentConfigurationDto(
         ContractValidation.RequireIdentifier(errors, "property_id", PropertyId);
         ContractValidation.RejectUndefinedEnum(errors, "mode", Mode);
         if (HeartbeatIntervalSeconds is < 5 or > 3600) errors.Add(new("heartbeat_interval_seconds", "out_of_range", "Heartbeat interval must be between 5 and 3600 seconds."));
-        foreach (ConfiguredTargetDto target in CriticalTargets) errors.AddRange(target.Validate());
+        if (ContractValidation.RequireNotNull(errors, "critical_targets", CriticalTargets))
+        {
+            foreach (ConfiguredTargetDto target in CriticalTargets) errors.AddRange(target.Validate());
+        }
         return errors;
     }
 }
 
-public sealed record ConfiguredTargetDto(string TargetId, string Label) : IContractValidatable
+public sealed record ConfiguredTargetDto([property: JsonRequired] string TargetId, [property: JsonRequired] string Label) : IContractValidatable
 {
     public IReadOnlyList<ContractValidationError> Validate()
     {

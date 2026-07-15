@@ -7,25 +7,37 @@ namespace RemotePropertyWatchdog.ContractTests;
 
 public sealed class ContractPayloadSchemaTests
 {
-    public static TheoryData<string, object> Payloads => new()
+    public static TheoryData<string, string, Type> ExampleFiles => new()
     {
-        { "heartbeat.schema.json", ContractExamples.Heartbeat() },
-        { "material-event.schema.json", ContractExamples.MaterialEvent() },
-        { "event-batch.schema.json", ContractExamples.EventBatch() },
-        { "incident-summary.schema.json", ContractExamples.IncidentSummary() }
+        { "heartbeat.example.json", "heartbeat.schema.json", typeof(HeartbeatDto) },
+        { "material-event.example.json", "material-event.schema.json", typeof(MaterialEventDto) },
+        { "event-batch.example.json", "event-batch.schema.json", typeof(EventBatchDto) },
+        { "incident-summary.example.json", "incident-summary.schema.json", typeof(IncidentSummaryDto) }
     };
 
     [Theory]
-    [MemberData(nameof(Payloads))]
-    public void ExamplePayloadsValidateAgainstSchemas(string schemaFile, object payload)
+    [MemberData(nameof(ExampleFiles))]
+    public void CheckedExampleFilesDeserializeValidateAgainstSchemaAndMatchCanonicalSerialization(string exampleFile, string schemaFile, Type dtoType)
     {
         RegisterAllSchemas();
-        JsonSchema schema = LoadSchema(schemaFile);
-        JsonNode node = JsonNode.Parse(ContractJson.Serialize(payload))!;
+        string repositoryRoot = FindRepositoryRoot();
+        string exampleJson = File.ReadAllText(Path.Combine(repositoryRoot, "examples", "contracts", exampleFile)).TrimEnd();
+        object payload = JsonSerializer.Deserialize(exampleJson, dtoType, ContractJson.Options) ?? throw new JsonException($"{exampleFile} did not deserialize.");
+        IContractValidatable validatable = Assert.IsAssignableFrom<IContractValidatable>(payload);
 
-        EvaluationResults results = schema.Evaluate(node, new EvaluationOptions { OutputFormat = OutputFormat.List });
+        Assert.Empty(validatable.Validate());
+        AssertValidAgainstSchema(schemaFile, JsonNode.Parse(exampleJson)!);
+        Assert.Equal(ContractJson.Serialize(payload), exampleJson);
+    }
 
-        Assert.True(results.IsValid, results.ToString());
+    [Fact]
+    public void EveryCheckedExampleFileHasContractCoverage()
+    {
+        string examplesPath = Path.Combine(FindRepositoryRoot(), "examples", "contracts");
+        string[] checkedExamples = Directory.GetFiles(examplesPath, "*.json").Select(Path.GetFileName).Order(StringComparer.Ordinal).ToArray()!;
+        string[] coveredExamples = ExampleFiles.Select(row => (string)row[0]).Order(StringComparer.Ordinal).ToArray();
+
+        Assert.Equal(coveredExamples, checkedExamples);
     }
 
     [Fact]
@@ -54,6 +66,14 @@ public sealed class ContractPayloadSchemaTests
         Assert.Empty(payload.Validate());
     }
 
+    private static void AssertValidAgainstSchema(string schemaFile, JsonNode node)
+    {
+        JsonSchema schema = LoadSchema(schemaFile);
+        EvaluationResults results = schema.Evaluate(node, new EvaluationOptions { OutputFormat = OutputFormat.List });
+
+        Assert.True(results.IsValid, results.ToString());
+    }
+
     private static void RegisterAllSchemas()
     {
         string repositoryRoot = FindRepositoryRoot();
@@ -68,16 +88,7 @@ public sealed class ContractPayloadSchemaTests
     {
         string repositoryRoot = FindRepositoryRoot();
         string path = Path.Combine(repositoryRoot, "schemas", schemaFile);
-        string schemaText = File.ReadAllText(path);
-        if (schemaFile == "event-batch.schema.json")
-        {
-            JsonNode root = JsonNode.Parse(schemaText)!;
-            JsonNode materialEvent = JsonNode.Parse(File.ReadAllText(Path.Combine(repositoryRoot, "schemas", "material-event.schema.json")))!;
-            root["properties"]!["events"]!["items"] = materialEvent;
-            schemaText = root.ToJsonString();
-        }
-
-        return JsonSchema.FromText(schemaText);
+        return JsonSchema.FromText(File.ReadAllText(path));
     }
 
     private static string FindRepositoryRoot()

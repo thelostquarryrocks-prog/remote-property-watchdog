@@ -21,7 +21,7 @@ public static class ContractJson
             WriteIndented = false
         };
 
-        options.Converters.Add(new JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower));
+        options.Converters.Add(new JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower, allowIntegerValues: false));
         return options;
     }
 }
