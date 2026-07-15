@@ -1,0 +1,79 @@
+using System.Text.Json.Serialization;
+
+namespace RemotePropertyWatchdog.Contracts;
+
+public sealed record GatewaySummary(ProbeState State, int? LatencyMs = null) : IContractValidatable
+{
+    public IReadOnlyList<ContractValidationError> Validate()
+    {
+        List<ContractValidationError> errors = [];
+        ContractValidation.RejectUndefinedEnum(errors, "gateway.state", State);
+        if (LatencyMs is < 0 or > 60000) errors.Add(new("gateway.latency_ms", "out_of_range", "Latency must be between 0 and 60000 ms."));
+        return errors;
+    }
+}
+
+public sealed record InternetSummary(ProbeState State, ProbeState DnsState, int HttpsOk) : IContractValidatable
+{
+    public IReadOnlyList<ContractValidationError> Validate()
+    {
+        List<ContractValidationError> errors = [];
+        ContractValidation.RejectUndefinedEnum(errors, "internet.state", State);
+        ContractValidation.RejectUndefinedEnum(errors, "internet.dns_state", DnsState);
+        if (HttpsOk is < 0 or > 10) errors.Add(new("internet.https_ok", "out_of_range", "HTTPS success count must be between 0 and 10."));
+        return errors;
+    }
+}
+
+public sealed record CriticalTargetSummary(int Healthy, int Degraded, int Offline, int Unknown) : IContractValidatable
+{
+    public IReadOnlyList<ContractValidationError> Validate()
+    {
+        List<ContractValidationError> errors = [];
+        ContractValidation.RequireNonNegative(errors, "critical.healthy", Healthy);
+        ContractValidation.RequireNonNegative(errors, "critical.degraded", Degraded);
+        ContractValidation.RequireNonNegative(errors, "critical.offline", Offline);
+        ContractValidation.RequireNonNegative(errors, "critical.unknown", Unknown);
+        return errors;
+    }
+}
+
+public sealed record HeartbeatDto(
+    [property: JsonPropertyOrder(0)] string SchemaVersion,
+    [property: JsonPropertyOrder(1)] string HeartbeatId,
+    [property: JsonPropertyOrder(2)] string AgentId,
+    [property: JsonPropertyOrder(3)] string PropertyId,
+    [property: JsonPropertyOrder(4)] long Sequence,
+    [property: JsonPropertyOrder(5)] string SessionId,
+    [property: JsonPropertyOrder(6)] DateTimeOffset SentAt,
+    [property: JsonPropertyOrder(7)] long AgentUptimeSeconds,
+    [property: JsonPropertyOrder(8)] AgentMode Mode,
+    [property: JsonPropertyOrder(9)] GatewaySummary Gateway,
+    [property: JsonPropertyOrder(10)] InternetSummary Internet,
+    [property: JsonPropertyOrder(11)] CriticalTargetSummary Critical,
+    [property: JsonPropertyOrder(12)] long LastEventSequence,
+    [property: JsonPropertyOrder(13)] int QueuedEvents,
+    [property: JsonPropertyOrder(14)] string AgentVersion) : IContractValidatable
+{
+    public IReadOnlyList<ContractValidationError> Validate()
+    {
+        List<ContractValidationError> errors = [];
+        ContractValidation.RequireSchemaVersion(errors, SchemaVersion);
+        ContractValidation.RequireIdentifier(errors, "heartbeat_id", HeartbeatId);
+        ContractValidation.RequireIdentifier(errors, "agent_id", AgentId);
+        ContractValidation.RequireIdentifier(errors, "property_id", PropertyId);
+        ContractValidation.RequirePositive(errors, "sequence", Sequence);
+        ContractValidation.RequireIdentifier(errors, "session_id", SessionId);
+        ContractValidation.RequireUtc(errors, "sent_at", SentAt);
+        ContractValidation.RequireNonNegative(errors, "agent_uptime_seconds", AgentUptimeSeconds);
+        ContractValidation.RejectUndefinedEnum(errors, "mode", Mode);
+        errors.AddRange(Gateway.Validate());
+        errors.AddRange(Internet.Validate());
+        errors.AddRange(Critical.Validate());
+        ContractValidation.RequireNonNegative(errors, "last_event_sequence", LastEventSequence);
+        ContractValidation.RequireNonNegative(errors, "queued_events", QueuedEvents);
+        if (string.IsNullOrWhiteSpace(AgentVersion) || AgentVersion.Length > 64) errors.Add(new("agent_version", "invalid_length", "Agent version is required and must be no more than 64 characters."));
+        ContractValidation.RequireMaxSerializedSize(errors, "heartbeat", this, ContractValidation.MaximumHeartbeatUtf8Bytes);
+        return errors;
+    }
+}
