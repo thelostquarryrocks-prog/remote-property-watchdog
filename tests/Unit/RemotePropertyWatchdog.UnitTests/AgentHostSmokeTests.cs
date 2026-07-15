@@ -67,6 +67,18 @@ public sealed class AgentHostSmokeTests
     }
 
     [Fact]
+    public async Task AgentHostRejectsCleanShutdownWriteTimeoutOverThirtySecondsOnStartup()
+    {
+        string markerPath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.json");
+        using IHost host = Program.CreateHostBuilder([
+            "--AgentLifecycle:MarkerPath", markerPath,
+            "--AgentLifecycle:CleanShutdownWriteTimeout", "00:00:31"
+        ]).Build();
+
+        await Assert.ThrowsAsync<OptionsValidationException>(() => host.StartAsync(CancellationToken.None));
+    }
+
+    [Fact]
     public void CanonicalServiceNameDoesNotDriftFromWindowsLifecycleScript()
     {
         string script = File.ReadAllText(FindRepositoryFile("scripts", "windows-service-lifecycle.ps1"));
@@ -91,15 +103,16 @@ public sealed class AgentHostSmokeTests
     }
 
     [Fact]
-    public async Task AgentWorkerLeavesMarkerUncleanWhenFinalLifecycleWriteTimesOut()
+    public async Task AgentWorkerLeavesMarkerUncleanAndContinuesShutdownWhenFinalLifecycleWriteTimesOut()
     {
         RecordingLifecycleCoordinator coordinator = new() { DelayStopUntilCancelled = true };
         AgentWorker worker = CreateWorker(coordinator, TimeSpan.FromMilliseconds(1));
         await worker.StartAsync(CancellationToken.None);
         await WaitUntilStartedAsync(coordinator);
 
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => worker.StopAsync(CancellationToken.None));
+        await worker.StopAsync(CancellationToken.None);
 
+        Assert.True(coordinator.StopCalled);
         Assert.False(coordinator.CleanShutdownRecorded);
     }
 

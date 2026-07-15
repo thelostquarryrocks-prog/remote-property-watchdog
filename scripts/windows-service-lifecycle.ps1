@@ -9,6 +9,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
+$ScheduledTaskName = 'RemotePropertyWatchdog-R0-003-RebootEvidence'
 
 function Assert-WindowsAdministrator {
     if (-not $IsWindows) {
@@ -45,48 +46,73 @@ function Read-LifecycleMarker {
     param([string]$Path)
 
     if (-not (Test-Path -Path $Path)) {
-        throw "Lifecycle marker not found at $Path."
+        return $null
     }
 
     Get-Content -Path $Path -Raw | ConvertFrom-Json
 }
 
-function Assert-RunningMarker {
+function Test-LifecycleMarker {
     param(
         [object]$Marker,
-        [string]$Context,
         [string]$PreviousSessionId,
-        [bool]$PreviousCleanExpected
+        [bool]$PreviousCleanExpected,
+        [bool]$RequireNewSession
     )
 
-    if ([string]::IsNullOrWhiteSpace([string]$Marker.session_id)) {
-        throw "$Context marker has an empty session_id."
-    }
-    if ($null -eq $Marker.ready_at_utc) {
-        throw "$Context marker does not contain ready_at_utc."
-    }
-    if ($Marker.planned_shutdown -ne $false) {
-        throw "$Context marker should have planned_shutdown=false while running."
-    }
-    if ($null -eq $Marker.readiness_elapsed_milliseconds -or [int64]$Marker.readiness_elapsed_milliseconds -gt 60000) {
-        throw "$Context marker readiness elapsed is missing or greater than 60 seconds."
-    }
-    if ($PreviousSessionId -and ([string]$Marker.previous_session_id -ne $PreviousSessionId)) {
-        throw "$Context marker previous_session_id mismatch. Expected $PreviousSessionId but found $($Marker.previous_session_id)."
-    }
-    if ($Marker.previous_session_ended_cleanly -ne $PreviousCleanExpected) {
-        throw "$Context marker previous_session_ended_cleanly mismatch. Expected $PreviousCleanExpected but found $($Marker.previous_session_ended_cleanly)."
-    }
+    if ($null -eq $Marker) { return $false }
+    if ([string]::IsNullOrWhiteSpace([string]$Marker.session_id)) { return $false }
+    if ($RequireNewSession -and ([string]$Marker.session_id -eq $PreviousSessionId)) { return $false }
+    if ($null -eq $Marker.ready_at_utc) { return $false }
+    if ($null -eq $Marker.readiness_elapsed_milliseconds) { return $false }
+    if ([int64]$Marker.readiness_elapsed_milliseconds -gt 60000) { return $false }
+    if ($Marker.planned_shutdown -ne $false) { return $false }
+    if ($PreviousSessionId -and ([string]$Marker.previous_session_id -ne $PreviousSessionId)) { return $false }
+    if ($Marker.previous_session_ended_cleanly -ne $PreviousCleanExpected) { return $false }
+    return $true
+}
+
+function Wait-LifecycleMarker {
+    param(
+        [string]$Path,
+        [string]$Context,
+        [string]$PreviousSessionId = '',
+        [bool]$PreviousCleanExpected = $true,
+        [bool]$RequireNewSession = $false,
+        [int]$TimeoutSeconds = 30
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        $marker = Read-LifecycleMarker -Path $Path
+        if (Test-LifecycleMarker -Marker $marker -PreviousSessionId $PreviousSessionId -PreviousCleanExpected $PreviousCleanExpected -RequireNewSession $RequireNewSession) {
+            return $marker
+        }
+        Start-Sleep -Milliseconds 250
+    } while ((Get-Date) -lt $deadline)
+
+    $lastMarker = Read-LifecycleMarker -Path $Path
+    $lastJson = if ($null -eq $lastMarker) { '<missing>' } else { $lastMarker | ConvertTo-Json -Depth 6 -Compress }
+    throw "$Context lifecycle marker did not reach the expected state within $TimeoutSeconds seconds. Last marker: $lastJson"
 }
 
 function Assert-StoppedMarker {
     param([object]$Marker)
 
+    if ($null -eq $Marker) {
+        throw 'Planned stop marker was not found.'
+    }
     if ($Marker.planned_shutdown -ne $true) {
         throw 'Planned stop marker did not record planned_shutdown=true.'
     }
     if ($null -eq $Marker.stopped_at_utc) {
         throw 'Planned stop marker did not record stopped_at_utc.'
+    }
+}
+
+function Remove-AcceptanceScheduledTask {
+    if (Get-ScheduledTask -TaskName $ScheduledTaskName -ErrorAction SilentlyContinue) {
+        Unregister-ScheduledTask -TaskName $ScheduledTaskName -Confirm:$false
     }
 }
 
@@ -101,11 +127,92 @@ function Install-AgentService {
     New-Service -Name $ServiceName -BinaryPathName $binaryPath -DisplayName $DisplayName -StartupType Automatic | Out-Null
 }
 
+function Install-RebootEvidenceTask {
+    $captureScriptPath = Join-Path $rebootEvidenceDir 'capture-reboot-evidence.ps1'
+    $captureScript = @'
+param(
+    [string]$ServiceName,
+    [string]$MarkerPath,
+    [string]$EvidenceDir
+)
+
+$ErrorActionPreference = 'Stop'
+$deadline = (Get-Date).AddSeconds(120)
+do {
+    $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if ($service -and $service.Status -eq 'Running' -and (Test-Path -Path $MarkerPath)) {
+        $marker = Get-Content -Path $MarkerPath -Raw | ConvertFrom-Json
+        if ($marker.session_id -and $marker.ready_at_utc -and $null -ne $marker.readiness_elapsed_milliseconds -and $marker.planned_shutdown -eq $false) {
+            break
+        }
+    }
+    Start-Sleep -Seconds 1
+} while ((Get-Date) -lt $deadline)
+
+$service = Get-Service -Name $ServiceName -ErrorAction Stop
+$serviceCim = Get-CimInstance Win32_Service -Filter "Name='$ServiceName'"
+$process = if ($serviceCim.ProcessId) { Get-Process -Id $serviceCim.ProcessId -ErrorAction SilentlyContinue } else { $null }
+$bootTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+$markerJson = if (Test-Path -Path $MarkerPath) { Get-Content -Path $MarkerPath -Raw } else { $null }
+$evidence = [ordered]@{
+    generated_at_utc = (Get-Date).ToUniversalTime().ToString('o')
+    os_boot_time_utc = $bootTime.ToUniversalTime().ToString('o')
+    service_name = $ServiceName
+    service_status = [string]$service.Status
+    service_start_type = [string]$service.StartType
+    service_process_id = $serviceCim.ProcessId
+    service_process_start_time_utc = if ($process) { $process.StartTime.ToUniversalTime().ToString('o') } else { $null }
+    marker = if ($markerJson) { $markerJson | ConvertFrom-Json } else { $null }
+}
+New-Item -ItemType Directory -Force -Path $EvidenceDir | Out-Null
+$path = Join-Path $EvidenceDir ('reboot-evidence-{0}.json' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+$evidence | ConvertTo-Json -Depth 8 | Set-Content -Path $path -Encoding utf8
+'@
+    Set-Content -Path $captureScriptPath -Value $captureScript -Encoding utf8
+    $argument = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -ServiceName "{1}" -MarkerPath "{2}" -EvidenceDir "{3}"' -f $captureScriptPath, $ServiceName, $markerPath, $rebootEvidenceDir
+    $action = New-ScheduledTaskAction -Execute 'pwsh.exe' -Argument $argument
+    $trigger = New-ScheduledTaskTrigger -AtStartup
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+    Remove-AcceptanceScheduledTask
+    Register-ScheduledTask -TaskName $ScheduledTaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings | Out-Null
+}
+
+function Assert-RebootEvidence {
+    $evidenceFile = Get-ChildItem -Path $rebootEvidenceDir -Filter 'reboot-evidence-*.json' -ErrorAction Stop | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+    if ($null -eq $evidenceFile) {
+        throw "No reboot evidence file was found in $rebootEvidenceDir."
+    }
+
+    $evidence = Get-Content -Path $evidenceFile.FullName -Raw | ConvertFrom-Json
+    $bootTime = [DateTimeOffset]::Parse([string]$evidence.os_boot_time_utc)
+    $generatedAt = [DateTimeOffset]::Parse([string]$evidence.generated_at_utc)
+    if ($generatedAt -lt $bootTime) {
+        throw "Reboot evidence $($evidenceFile.FullName) was not generated during the current startup."
+    }
+    if ([string]$evidence.service_status -ne 'Running') {
+        throw "Reboot evidence service_status is $($evidence.service_status), expected Running."
+    }
+    if ([string]$evidence.service_start_type -ne 'Automatic') {
+        throw "Reboot evidence service_start_type is $($evidence.service_start_type), expected Automatic."
+    }
+    if ($null -eq $evidence.service_process_start_time_utc) {
+        throw 'Reboot evidence did not include service process start time.'
+    }
+    if (-not (Test-LifecycleMarker -Marker $evidence.marker -PreviousSessionId '' -PreviousCleanExpected $true -RequireNewSession $false)) {
+        throw "Reboot evidence marker is incomplete or not ready: $($evidence.marker | ConvertTo-Json -Depth 6 -Compress)"
+    }
+
+    Write-Host "Verified reboot evidence: $($evidenceFile.FullName)"
+    return $evidenceFile.FullName
+}
+
 Assert-WindowsAdministrator
 
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot '..')
-$timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $artifactRoot = Join-Path $repoRoot 'artifacts/r0-003'
+$rebootEvidenceDir = Join-Path $artifactRoot 'reboot-evidence'
+$timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $evidenceDir = Join-Path $artifactRoot $timestamp
 $publishDir = Join-Path $artifactRoot 'windows-service'
 $markerPath = Join-Path $env:ProgramData 'RemotePropertyWatchdog/Agent/r0-003-lifecycle-marker.json'
@@ -113,12 +220,27 @@ $transcriptPath = Join-Path $evidenceDir 'windows-service-lifecycle-transcript.t
 $markerEvidencePath = Join-Path $evidenceDir 'markers.jsonl'
 $projectPath = Join-Path $repoRoot 'src/Agent/RemotePropertyWatchdog.Agent.Service/RemotePropertyWatchdog.Agent.Service.csproj'
 
-New-Item -ItemType Directory -Force -Path $publishDir | Out-Null
 New-Item -ItemType Directory -Force -Path $evidenceDir | Out-Null
+New-Item -ItemType Directory -Force -Path $rebootEvidenceDir | Out-Null
 New-Item -ItemType Directory -Force -Path (Split-Path $markerPath -Parent) | Out-Null
 
 Start-Transcript -Path $transcriptPath -Force | Out-Null
 try {
+    if ($VerifyRebootAndCleanup) {
+        $service = Wait-ServiceStatus -Name $ServiceName -Status Running -TimeoutSeconds 60
+        $service | Format-List Name,Status,StartType
+        $rebootEvidencePath = Assert-RebootEvidence
+        $marker = Wait-LifecycleMarker -Path $markerPath -Context 'post-reboot' -PreviousCleanExpected $true -TimeoutSeconds 60
+        $marker | ConvertTo-Json -Depth 6 | Add-Content -Path $markerEvidencePath
+        Stop-Service -Name $ServiceName
+        Wait-ServiceStatus -Name $ServiceName -Status Stopped -TimeoutSeconds 30 | Out-Null
+        Remove-AcceptanceScheduledTask
+        sc.exe delete $ServiceName | Out-Null
+        Write-Host "Reboot verification phase 2 complete. Evidence: $rebootEvidencePath"
+        return
+    }
+
+    New-Item -ItemType Directory -Force -Path $publishDir | Out-Null
     dotnet publish $projectPath --configuration $Configuration --output $publishDir
 
     $exePath = Join-Path $publishDir 'RemotePropertyWatchdog.Agent.Service.exe'
@@ -126,43 +248,28 @@ try {
 
     if ($PrepareRebootVerification) {
         Install-AgentService
+        Install-RebootEvidenceTask
         Start-Service -Name $ServiceName
         Wait-ServiceStatus -Name $ServiceName -Status Running -TimeoutSeconds 30 | Format-List Name,Status,StartType
-        Read-LifecycleMarker -Path $markerPath | ConvertTo-Json -Depth 4 | Add-Content -Path $markerEvidencePath
-        Write-Host 'Reboot verification phase 1 complete. Reboot the host, then run this script with -VerifyRebootAndCleanup before user login-dependent validation.'
-        return
-    }
-
-    if ($VerifyRebootAndCleanup) {
-        $service = Wait-ServiceStatus -Name $ServiceName -Status Running -TimeoutSeconds 60
-        $service | Format-List Name,Status,StartType
-        $marker = Read-LifecycleMarker -Path $markerPath
-        Assert-RunningMarker -Marker $marker -Context 'post-reboot' -PreviousSessionId '' -PreviousCleanExpected $true
-        $marker | ConvertTo-Json -Depth 4 | Add-Content -Path $markerEvidencePath
-        Stop-Service -Name $ServiceName
-        Wait-ServiceStatus -Name $ServiceName -Status Stopped -TimeoutSeconds 30 | Out-Null
-        sc.exe delete $ServiceName | Out-Null
-        Write-Host 'Reboot verification phase 2 complete and service cleanup finished.'
+        $marker = Wait-LifecycleMarker -Path $markerPath -Context 'prepare-reboot' -PreviousCleanExpected $true
+        $marker | ConvertTo-Json -Depth 6 | Add-Content -Path $markerEvidencePath
+        Write-Host 'Reboot verification phase 1 complete. Reboot the host, then run this script with -VerifyRebootAndCleanup. Manual cleanup if interrupted:'
+        Write-Host "Unregister-ScheduledTask -TaskName '$ScheduledTaskName' -Confirm:`$false; Stop-Service -Name '$ServiceName' -ErrorAction SilentlyContinue; sc.exe delete '$ServiceName'"
         return
     }
 
     Install-AgentService
     Start-Service -Name $ServiceName
     Wait-ServiceStatus -Name $ServiceName -Status Running -TimeoutSeconds 30 | Format-List Name,Status,StartType
-    $marker = Read-LifecycleMarker -Path $markerPath
-    Assert-RunningMarker -Marker $marker -Context 'initial-start' -PreviousSessionId '' -PreviousCleanExpected $true
-    $marker | ConvertTo-Json -Depth 4 | Add-Content -Path $markerEvidencePath
+    $marker = Wait-LifecycleMarker -Path $markerPath -Context 'initial-start' -PreviousCleanExpected $true
+    $marker | ConvertTo-Json -Depth 6 | Add-Content -Path $markerEvidencePath
     $previousSessionId = [string]$marker.session_id
 
     for ($i = 1; $i -le $RestartCount; $i++) {
         Restart-Service -Name $ServiceName -Force
         Wait-ServiceStatus -Name $ServiceName -Status Running -TimeoutSeconds 30 | Out-Null
-        $marker = Read-LifecycleMarker -Path $markerPath
-        Assert-RunningMarker -Marker $marker -Context "restart-$i" -PreviousSessionId $previousSessionId -PreviousCleanExpected $true
-        if ([string]$marker.session_id -eq $previousSessionId) {
-            throw "restart-$i did not create a new session_id."
-        }
-        $marker | ConvertTo-Json -Depth 4 | Add-Content -Path $markerEvidencePath
+        $marker = Wait-LifecycleMarker -Path $markerPath -Context "restart-$i" -PreviousSessionId $previousSessionId -PreviousCleanExpected $true -RequireNewSession $true
+        $marker | ConvertTo-Json -Depth 6 | Add-Content -Path $markerEvidencePath
         $previousSessionId = [string]$marker.session_id
         Write-Host "Restart $i/$RestartCount completed with new session $previousSessionId."
     }
@@ -175,18 +282,15 @@ try {
     Wait-ServiceStatus -Name $ServiceName -Status Stopped -TimeoutSeconds 30 | Out-Null
     Start-Service -Name $ServiceName
     Wait-ServiceStatus -Name $ServiceName -Status Running -TimeoutSeconds 30 | Out-Null
-    $marker = Read-LifecycleMarker -Path $markerPath
-    Assert-RunningMarker -Marker $marker -Context 'forced-termination-restart' -PreviousSessionId $previousSessionId -PreviousCleanExpected $false
-    if ([string]$marker.session_id -eq $previousSessionId) {
-        throw 'Forced termination restart did not create a new session_id.'
-    }
-    $marker | ConvertTo-Json -Depth 4 | Add-Content -Path $markerEvidencePath
+    $marker = Wait-LifecycleMarker -Path $markerPath -Context 'forced-termination-restart' -PreviousSessionId $previousSessionId -PreviousCleanExpected $false -RequireNewSession $true
+    $marker | ConvertTo-Json -Depth 6 | Add-Content -Path $markerEvidencePath
 
     Stop-Service -Name $ServiceName
     Wait-ServiceStatus -Name $ServiceName -Status Stopped -TimeoutSeconds 30 | Out-Null
     $marker = Read-LifecycleMarker -Path $markerPath
     Assert-StoppedMarker -Marker $marker
-    $marker | ConvertTo-Json -Depth 4 | Add-Content -Path $markerEvidencePath
+    $marker | ConvertTo-Json -Depth 6 | Add-Content -Path $markerEvidencePath
+    Remove-AcceptanceScheduledTask
     sc.exe delete $ServiceName | Out-Null
 
     Write-Host "R0-003 Windows lifecycle validation passed. Transcript: $transcriptPath"

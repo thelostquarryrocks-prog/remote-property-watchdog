@@ -18,6 +18,7 @@ public static class Program
                     .Validate(options => options.ReadinessTimeout > TimeSpan.Zero, "Readiness timeout must be positive.")
                     .Validate(options => options.ReadinessTimeout <= TimeSpan.FromSeconds(60), "Readiness timeout must not exceed 60 seconds.")
                     .Validate(options => options.CleanShutdownWriteTimeout > TimeSpan.Zero, "Clean shutdown write timeout must be positive.")
+                    .Validate(options => options.CleanShutdownWriteTimeout <= TimeSpan.FromSeconds(30), "Clean shutdown write timeout must not exceed 30 seconds.")
                     .ValidateOnStart();
 
                 services.AddSingleton(TimeProvider.System);

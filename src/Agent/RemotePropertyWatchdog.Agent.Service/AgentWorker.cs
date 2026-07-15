@@ -24,9 +24,16 @@ public sealed partial class AgentWorker(
 
         if (lifecycleCoordinator.CurrentState is not null)
         {
-            using CancellationTokenSource writeTimeout = new(options.Value.CleanShutdownWriteTimeout);
-            AgentLifecycleState stopped = await lifecycleCoordinator.StopAsync(writeTimeout.Token);
-            LogAgentHostStopped(logger, stopped.SessionId, stopped.StoppedAtUtc!.Value);
+            try
+            {
+                using CancellationTokenSource writeTimeout = new(options.Value.CleanShutdownWriteTimeout);
+                AgentLifecycleState stopped = await lifecycleCoordinator.StopAsync(writeTimeout.Token);
+                LogAgentHostStopped(logger, stopped.SessionId, stopped.StoppedAtUtc!.Value);
+            }
+            catch (Exception ex) when (ex is OperationCanceledException or IOException or UnauthorizedAccessException or InvalidOperationException)
+            {
+                LogCleanShutdownMarkerFailed(logger, ex);
+            }
         }
     }
 
@@ -38,4 +45,7 @@ public sealed partial class AgentWorker(
 
     [LoggerMessage(EventId = 3, Level = LogLevel.Information, Message = "Remote Property Watchdog agent host planned shutdown recorded. SessionId={SessionId} StoppedAtUtc={StoppedAtUtc}")]
     private static partial void LogAgentHostStopped(ILogger logger, Guid sessionId, DateTimeOffset stoppedAtUtc);
+
+    [LoggerMessage(EventId = 4, Level = LogLevel.Warning, Message = "Remote Property Watchdog agent host could not record planned shutdown; previous session will remain unclean on next start.")]
+    private static partial void LogCleanShutdownMarkerFailed(ILogger logger, Exception exception);
 }
