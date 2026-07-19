@@ -22,6 +22,7 @@ public static class Program
                     .ValidateOnStart();
 
                 services.AddSingleton(TimeProvider.System);
+                services.AddSingleton<IAgentLifecycleFileSystem, DefaultAgentLifecycleFileSystem>();
                 services.AddSingleton<IAgentLifecycleStore, FileAgentLifecycleStore>();
                 services.AddSingleton<IAgentLifecycleCoordinator, AgentLifecycleCoordinator>();
                 services.AddHostedService<AgentWorker>();

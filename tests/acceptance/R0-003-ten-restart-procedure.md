@@ -10,7 +10,11 @@ Run from an elevated PowerShell session on a Windows test host:
 pwsh ./scripts/windows-service-lifecycle.ps1 -RestartCount 10
 ```
 
-The script writes a timestamped transcript and JSONL lifecycle marker evidence under `artifacts/r0-003/<timestamp>/`. It polls the lifecycle marker after SCM reaches `Running` and does not treat SCM state alone as readiness evidence.
+The script writes a timestamped transcript and JSONL lifecycle marker evidence under `artifacts/r0-003/<timestamp>/`. It polls the lifecycle marker after SCM reaches `Running` and does not treat SCM state alone as readiness evidence. At the beginning of a standard run, the expected test service and scheduled task must be absent; if the known R0-003 ProgramData marker exists, the script copies it to `pre-run-lifecycle-marker.json` in the timestamped evidence directory and removes only that known marker before installing the test service.
+
+## Failure evidence
+
+If a planned restart stops before readiness, the script captures `artifacts/r0-003/<timestamp>/failure/failure-evidence.json` before cleanup. The failure evidence includes failed restart number, previous/replacement session IDs when available, current lifecycle marker, UTC capture time, bounded marker polling details, `Get-Service` output, selected `Win32_Service` fields, relevant Service Control Manager events, and relevant `.NET Runtime`/`Application Error` events from the acceptance window.
 
 ## Two-phase reboot verification
 

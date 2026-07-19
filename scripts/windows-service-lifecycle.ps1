@@ -49,7 +49,30 @@ function Read-LifecycleMarker {
         return $null
     }
 
-    Get-Content -Path $Path -Raw | ConvertFrom-Json
+    $stream = $null
+    $reader = $null
+    try {
+        $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
+        $stream = [System.IO.FileStream]::new($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $share)
+        $reader = [System.IO.StreamReader]::new($stream, [System.Text.Encoding]::UTF8, $true)
+        $content = $reader.ReadToEnd()
+    }
+    catch [System.IO.IOException] {
+        return $null
+    }
+    catch [System.UnauthorizedAccessException] {
+        return $null
+    }
+    finally {
+        if ($reader) { $reader.Dispose() }
+        elseif ($stream) { $stream.Dispose() }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($content)) {
+        return $null
+    }
+
+    try { $content | ConvertFrom-Json } catch { $null }
 }
 
 function Test-LifecycleMarker {
@@ -92,22 +115,16 @@ function Wait-LifecycleMarker {
     } while ((Get-Date) -lt $deadline)
 
     $lastMarker = Read-LifecycleMarker -Path $Path
-    $lastJson = if ($null -eq $lastMarker) { '<missing>' } else { $lastMarker | ConvertTo-Json -Depth 6 -Compress }
+    $lastJson = if ($null -eq $lastMarker) { '<missing-or-transiently-unreadable>' } else { $lastMarker | ConvertTo-Json -Depth 6 -Compress }
     throw "$Context lifecycle marker did not reach the expected state within $TimeoutSeconds seconds. Last marker: $lastJson"
 }
 
 function Assert-StoppedMarker {
     param([object]$Marker)
 
-    if ($null -eq $Marker) {
-        throw 'Planned stop marker was not found.'
-    }
-    if ($Marker.planned_shutdown -ne $true) {
-        throw 'Planned stop marker did not record planned_shutdown=true.'
-    }
-    if ($null -eq $Marker.stopped_at_utc) {
-        throw 'Planned stop marker did not record stopped_at_utc.'
-    }
+    if ($null -eq $Marker) { throw 'Planned stop marker was not found.' }
+    if ($Marker.planned_shutdown -ne $true) { throw 'Planned stop marker did not record planned_shutdown=true.' }
+    if ($null -eq $Marker.stopped_at_utc) { throw 'Planned stop marker did not record stopped_at_utc.' }
 }
 
 function Remove-AcceptanceScheduledTask {
@@ -116,15 +133,85 @@ function Remove-AcceptanceScheduledTask {
     }
 }
 
-function Install-AgentService {
+function Cleanup-TestArtifacts {
+    Stop-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    try { Wait-ServiceStatus -Name $ServiceName -Status Stopped -TimeoutSeconds 30 | Out-Null } catch { }
+    Remove-AcceptanceScheduledTask
     if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
-        Stop-Service -Name $ServiceName -ErrorAction SilentlyContinue
-        try { Wait-ServiceStatus -Name $ServiceName -Status Stopped -TimeoutSeconds 30 | Out-Null } catch { }
         sc.exe delete $ServiceName | Out-Null
-        Start-Sleep -Seconds 2
     }
+}
 
+function Assert-TestArtifactsAbsent {
+    if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
+        throw "Expected test service '$ServiceName' to be absent before standard acceptance run. Run the documented cleanup command first."
+    }
+    if (Get-ScheduledTask -TaskName $ScheduledTaskName -ErrorAction SilentlyContinue) {
+        throw "Expected test scheduled task '$ScheduledTaskName' to be absent before standard acceptance run. Run the documented cleanup command first."
+    }
+}
+
+function Archive-AndRemoveStaleMarker {
+    if (Test-Path -Path $markerPath) {
+        Copy-Item -Path $markerPath -Destination (Join-Path $evidenceDir 'pre-run-lifecycle-marker.json') -Force
+        Remove-Item -Path $markerPath -Force
+    }
+}
+
+function Install-AgentService {
     New-Service -Name $ServiceName -BinaryPathName $binaryPath -DisplayName $DisplayName -StartupType Automatic | Out-Null
+}
+
+function ConvertTo-JsonFile {
+    param(
+        [object]$InputObject,
+        [string]$Path,
+        [int]$Depth = 8
+    )
+
+    $InputObject | ConvertTo-Json -Depth $Depth | Set-Content -Path $Path -Encoding utf8
+}
+
+function Capture-FailureEvidence {
+    param(
+        [string]$Reason,
+        [int]$FailedRestartNumber,
+        [string]$PreviousSessionId,
+        [string]$ReplacementSessionId,
+        [string]$PollingDetails,
+        [DateTime]$WindowStartUtc
+    )
+
+    $failureDir = Join-Path $evidenceDir 'failure'
+    New-Item -ItemType Directory -Force -Path $failureDir | Out-Null
+    $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    $win32Service = Get-CimInstance Win32_Service -Filter "Name='$ServiceName'" -ErrorAction SilentlyContinue |
+        Select-Object State,ExitCode,ServiceSpecificExitCode,ProcessId,StartMode,PathName
+    $marker = Read-LifecycleMarker -Path $markerPath
+    $serviceProcessId = if ($win32Service) { $win32Service.ProcessId } else { $null }
+    $systemEvents = Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Service Control Manager'; StartTime = $WindowStartUtc } -ErrorAction SilentlyContinue |
+        Where-Object { $_.Message -like "*$ServiceName*" } |
+        Select-Object -First 25 TimeCreated,ProviderName,Id,LevelDisplayName,Message
+    $applicationEvents = Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = @('.NET Runtime','Application Error'); StartTime = $WindowStartUtc } -ErrorAction SilentlyContinue |
+        Where-Object { $_.Message -like '*RemotePropertyWatchdog.Agent.Service*' -or ($serviceProcessId -and $_.Message -like "*$serviceProcessId*") } |
+        Select-Object -First 25 TimeCreated,ProviderName,Id,LevelDisplayName,Message
+
+    $evidence = [ordered]@{
+        captured_at_utc = (Get-Date).ToUniversalTime().ToString('o')
+        reason = $Reason
+        failed_restart_number = $FailedRestartNumber
+        previous_session_id = $PreviousSessionId
+        replacement_session_id = $ReplacementSessionId
+        marker_polling_failure_details = $PollingDetails
+        lifecycle_marker = $marker
+        service = $service | Select-Object Name,Status,StartType,ServiceType
+        win32_service = $win32Service
+        service_control_manager_events = $systemEvents
+        dotnet_runtime_and_application_error_events = $applicationEvents
+        transcript_path = $transcriptPath
+    }
+    ConvertTo-JsonFile -InputObject $evidence -Path (Join-Path $failureDir 'failure-evidence.json') -Depth 10
+    Write-Host "Captured failure evidence under $failureDir"
 }
 
 function Install-RebootEvidenceTask {
@@ -137,14 +224,31 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+function Read-MarkerShared {
+    param([string]$Path)
+    if (-not (Test-Path -Path $Path)) { return $null }
+    $stream = $null
+    $reader = $null
+    try {
+        $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
+        $stream = [System.IO.FileStream]::new($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $share)
+        $reader = [System.IO.StreamReader]::new($stream, [System.Text.Encoding]::UTF8, $true)
+        $content = $reader.ReadToEnd()
+    }
+    catch { return $null }
+    finally {
+        if ($reader) { $reader.Dispose() }
+        elseif ($stream) { $stream.Dispose() }
+    }
+    if ([string]::IsNullOrWhiteSpace($content)) { return $null }
+    try { $content | ConvertFrom-Json } catch { $null }
+}
 $deadline = (Get-Date).AddSeconds(120)
 do {
     $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-    if ($service -and $service.Status -eq 'Running' -and (Test-Path -Path $MarkerPath)) {
-        $marker = Get-Content -Path $MarkerPath -Raw | ConvertFrom-Json
-        if ($marker.session_id -and $marker.ready_at_utc -and $null -ne $marker.readiness_elapsed_milliseconds -and $marker.planned_shutdown -eq $false) {
-            break
-        }
+    if ($service -and $service.Status -eq 'Running') {
+        $marker = Read-MarkerShared -Path $MarkerPath
+        if ($null -ne $marker -and $marker.session_id -and $marker.ready_at_utc -and $null -ne $marker.readiness_elapsed_milliseconds -and $marker.planned_shutdown -eq $false) { break }
     }
     Start-Sleep -Seconds 1
 } while ((Get-Date) -lt $deadline)
@@ -153,7 +257,7 @@ $service = Get-Service -Name $ServiceName -ErrorAction Stop
 $serviceCim = Get-CimInstance Win32_Service -Filter "Name='$ServiceName'"
 $process = if ($serviceCim.ProcessId) { Get-Process -Id $serviceCim.ProcessId -ErrorAction SilentlyContinue } else { $null }
 $bootTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
-$markerJson = if (Test-Path -Path $MarkerPath) { Get-Content -Path $MarkerPath -Raw } else { $null }
+$marker = Read-MarkerShared -Path $MarkerPath
 $evidence = [ordered]@{
     generated_at_utc = (Get-Date).ToUniversalTime().ToString('o')
     os_boot_time_utc = $bootTime.ToUniversalTime().ToString('o')
@@ -162,7 +266,7 @@ $evidence = [ordered]@{
     service_start_type = [string]$service.StartType
     service_process_id = $serviceCim.ProcessId
     service_process_start_time_utc = if ($process) { $process.StartTime.ToUniversalTime().ToString('o') } else { $null }
-    marker = if ($markerJson) { $markerJson | ConvertFrom-Json } else { $null }
+    marker = $marker
 }
 New-Item -ItemType Directory -Force -Path $EvidenceDir | Out-Null
 $path = Join-Path $EvidenceDir ('reboot-evidence-{0}.json' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
@@ -180,25 +284,15 @@ $evidence | ConvertTo-Json -Depth 8 | Set-Content -Path $path -Encoding utf8
 
 function Assert-RebootEvidence {
     $evidenceFile = Get-ChildItem -Path $rebootEvidenceDir -Filter 'reboot-evidence-*.json' -ErrorAction Stop | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
-    if ($null -eq $evidenceFile) {
-        throw "No reboot evidence file was found in $rebootEvidenceDir."
-    }
+    if ($null -eq $evidenceFile) { throw "No reboot evidence file was found in $rebootEvidenceDir." }
 
     $evidence = Get-Content -Path $evidenceFile.FullName -Raw | ConvertFrom-Json
     $bootTime = [DateTimeOffset]::Parse([string]$evidence.os_boot_time_utc)
     $generatedAt = [DateTimeOffset]::Parse([string]$evidence.generated_at_utc)
-    if ($generatedAt -lt $bootTime) {
-        throw "Reboot evidence $($evidenceFile.FullName) was not generated during the current startup."
-    }
-    if ([string]$evidence.service_status -ne 'Running') {
-        throw "Reboot evidence service_status is $($evidence.service_status), expected Running."
-    }
-    if ([string]$evidence.service_start_type -ne 'Automatic') {
-        throw "Reboot evidence service_start_type is $($evidence.service_start_type), expected Automatic."
-    }
-    if ($null -eq $evidence.service_process_start_time_utc) {
-        throw 'Reboot evidence did not include service process start time.'
-    }
+    if ($generatedAt -lt $bootTime) { throw "Reboot evidence $($evidenceFile.FullName) was not generated during the current startup." }
+    if ([string]$evidence.service_status -ne 'Running') { throw "Reboot evidence service_status is $($evidence.service_status), expected Running." }
+    if ([string]$evidence.service_start_type -ne 'Automatic') { throw "Reboot evidence service_start_type is $($evidence.service_start_type), expected Automatic." }
+    if ($null -eq $evidence.service_process_start_time_utc) { throw 'Reboot evidence did not include service process start time.' }
     if (-not (Test-LifecycleMarker -Marker $evidence.marker -PreviousSessionId '' -PreviousCleanExpected $true -RequireNewSession $false)) {
         throw "Reboot evidence marker is incomplete or not ready: $($evidence.marker | ConvertTo-Json -Depth 6 -Compress)"
     }
@@ -225,6 +319,7 @@ New-Item -ItemType Directory -Force -Path $rebootEvidenceDir | Out-Null
 New-Item -ItemType Directory -Force -Path (Split-Path $markerPath -Parent) | Out-Null
 
 Start-Transcript -Path $transcriptPath -Force | Out-Null
+$acceptanceStartUtc = (Get-Date).ToUniversalTime()
 try {
     if ($VerifyRebootAndCleanup) {
         $service = Wait-ServiceStatus -Name $ServiceName -Status Running -TimeoutSeconds 60
@@ -258,6 +353,8 @@ try {
         return
     }
 
+    Assert-TestArtifactsAbsent
+    Archive-AndRemoveStaleMarker
     Install-AgentService
     Start-Service -Name $ServiceName
     Wait-ServiceStatus -Name $ServiceName -Status Running -TimeoutSeconds 30 | Format-List Name,Status,StartType
@@ -266,18 +363,24 @@ try {
     $previousSessionId = [string]$marker.session_id
 
     for ($i = 1; $i -le $RestartCount; $i++) {
-        Restart-Service -Name $ServiceName -Force
-        Wait-ServiceStatus -Name $ServiceName -Status Running -TimeoutSeconds 30 | Out-Null
-        $marker = Wait-LifecycleMarker -Path $markerPath -Context "restart-$i" -PreviousSessionId $previousSessionId -PreviousCleanExpected $true -RequireNewSession $true
-        $marker | ConvertTo-Json -Depth 6 | Add-Content -Path $markerEvidencePath
-        $previousSessionId = [string]$marker.session_id
-        Write-Host "Restart $i/$RestartCount completed with new session $previousSessionId."
+        try {
+            Restart-Service -Name $ServiceName -Force
+            Wait-ServiceStatus -Name $ServiceName -Status Running -TimeoutSeconds 30 | Out-Null
+            $marker = Wait-LifecycleMarker -Path $markerPath -Context "restart-$i" -PreviousSessionId $previousSessionId -PreviousCleanExpected $true -RequireNewSession $true
+            $marker | ConvertTo-Json -Depth 6 | Add-Content -Path $markerEvidencePath
+            $previousSessionId = [string]$marker.session_id
+            Write-Host "Restart $i/$RestartCount completed with new session $previousSessionId."
+        }
+        catch {
+            $replacement = Read-LifecycleMarker -Path $markerPath
+            Capture-FailureEvidence -Reason 'planned-restart-failed-before-readiness' -FailedRestartNumber $i -PreviousSessionId $previousSessionId -ReplacementSessionId ([string]$replacement.session_id) -PollingDetails $_.Exception.Message -WindowStartUtc $acceptanceStartUtc
+            Cleanup-TestArtifacts
+            throw
+        }
     }
 
     $processId = (Get-CimInstance Win32_Service -Filter "Name='$ServiceName'").ProcessId
-    if (-not $processId) {
-        throw 'Unable to locate service process for forced termination validation.'
-    }
+    if (-not $processId) { throw 'Unable to locate service process for forced termination validation.' }
     Stop-Process -Id $processId -Force
     Wait-ServiceStatus -Name $ServiceName -Status Stopped -TimeoutSeconds 30 | Out-Null
     Start-Service -Name $ServiceName

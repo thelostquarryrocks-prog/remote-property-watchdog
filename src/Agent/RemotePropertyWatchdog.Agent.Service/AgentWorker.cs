@@ -7,33 +7,56 @@ public sealed partial class AgentWorker(
     IOptions<AgentLifecycleOptions> options,
     ILogger<AgentWorker> logger) : BackgroundService
 {
+    private int executionFaulted;
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        AgentLifecycleState started = await lifecycleCoordinator.StartAsync(stoppingToken);
-        LogAgentHostStarted(logger, started.SessionId, started.StartedAtUtc, started.PreviousSessionId, started.PreviousSessionEndedCleanly);
+        try
+        {
+            AgentLifecycleState started = await lifecycleCoordinator.StartAsync(stoppingToken);
+            LogAgentHostStarted(logger, started.SessionId, started.StartedAtUtc, started.PreviousSessionId, started.PreviousSessionEndedCleanly);
 
-        AgentLifecycleState ready = await lifecycleCoordinator.MarkReadyAsync(stoppingToken);
-        LogAgentHostReady(logger, ready.SessionId, ready.ReadyAtUtc!.Value, ready.ReadinessElapsed!.Value.TotalMilliseconds, options.Value.ReadinessTimeout.TotalSeconds);
+            AgentLifecycleState ready = await lifecycleCoordinator.MarkReadyAsync(stoppingToken);
+            LogAgentHostReady(logger, ready.SessionId, ready.ReadyAtUtc!.Value, ready.ReadinessElapsed!.Value.TotalMilliseconds, options.Value.ReadinessTimeout.TotalSeconds);
 
-        await Task.Delay(Timeout.InfiniteTimeSpan, stoppingToken);
+            await Task.Delay(Timeout.InfiniteTimeSpan, stoppingToken);
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+            LogAgentHostCancellation(logger, lifecycleCoordinator.CurrentState?.SessionId);
+        }
+        catch (Exception ex)
+        {
+            Interlocked.Exchange(ref executionFaulted, 1);
+            LogAgentHostExecutionFaulted(logger, lifecycleCoordinator.CurrentState?.SessionId, ex);
+            throw;
+        }
     }
 
     public override async Task StopAsync(CancellationToken cancellationToken)
     {
         await base.StopAsync(cancellationToken);
 
-        if (lifecycleCoordinator.CurrentState is not null)
+        if (lifecycleCoordinator.CurrentState is null)
         {
-            try
-            {
-                using CancellationTokenSource writeTimeout = new(options.Value.CleanShutdownWriteTimeout);
-                AgentLifecycleState stopped = await lifecycleCoordinator.StopAsync(writeTimeout.Token);
-                LogAgentHostStopped(logger, stopped.SessionId, stopped.StoppedAtUtc!.Value);
-            }
-            catch (Exception ex) when (ex is OperationCanceledException or IOException or UnauthorizedAccessException or InvalidOperationException)
-            {
-                LogCleanShutdownMarkerFailed(logger, ex);
-            }
+            return;
+        }
+
+        if (Volatile.Read(ref executionFaulted) != 0)
+        {
+            LogAgentHostFaultedSessionLeftUnclean(logger, lifecycleCoordinator.CurrentState.SessionId);
+            return;
+        }
+
+        try
+        {
+            using CancellationTokenSource writeTimeout = new(options.Value.CleanShutdownWriteTimeout);
+            AgentLifecycleState stopped = await lifecycleCoordinator.StopAsync(writeTimeout.Token);
+            LogAgentHostStopped(logger, stopped.SessionId, stopped.StoppedAtUtc!.Value);
+        }
+        catch (Exception ex) when (ex is OperationCanceledException or IOException or UnauthorizedAccessException or InvalidOperationException)
+        {
+            LogCleanShutdownMarkerFailed(logger, ex);
         }
     }
 
@@ -48,4 +71,13 @@ public sealed partial class AgentWorker(
 
     [LoggerMessage(EventId = 4, Level = LogLevel.Warning, Message = "Remote Property Watchdog agent host could not record planned shutdown; previous session will remain unclean on next start.")]
     private static partial void LogCleanShutdownMarkerFailed(ILogger logger, Exception exception);
+
+    [LoggerMessage(EventId = 5, Level = LogLevel.Error, Message = "Remote Property Watchdog agent host execution faulted. SessionId={SessionId}")]
+    private static partial void LogAgentHostExecutionFaulted(ILogger logger, Guid? sessionId, Exception exception);
+
+    [LoggerMessage(EventId = 6, Level = LogLevel.Warning, Message = "Remote Property Watchdog agent host session remains unclean because worker execution faulted. SessionId={SessionId}")]
+    private static partial void LogAgentHostFaultedSessionLeftUnclean(ILogger logger, Guid sessionId);
+
+    [LoggerMessage(EventId = 7, Level = LogLevel.Debug, Message = "Remote Property Watchdog agent host execution canceled by host. SessionId={SessionId}")]
+    private static partial void LogAgentHostCancellation(ILogger logger, Guid? sessionId);
 }
