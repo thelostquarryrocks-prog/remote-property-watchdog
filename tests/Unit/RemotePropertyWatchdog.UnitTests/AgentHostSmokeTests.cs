@@ -19,6 +19,8 @@ public sealed class AgentHostSmokeTests
         Assert.Contains(hostedServices, service => service.GetType() == typeof(AgentWorker));
         Assert.IsType<AgentLifecycleCoordinator>(host.Services.GetRequiredService<IAgentLifecycleCoordinator>());
         Assert.IsType<FileAgentLifecycleStore>(host.Services.GetRequiredService<IAgentLifecycleStore>());
+        Assert.IsType<SqliteAgentJournal>(host.Services.GetRequiredService<IAgentJournal>());
+        Assert.IsType<NoOpAgentJournalFaultInjector>(host.Services.GetRequiredService<IAgentJournalFaultInjector>());
     }
 
     [Fact]
