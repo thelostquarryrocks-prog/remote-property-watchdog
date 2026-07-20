@@ -51,6 +51,7 @@ public sealed class AgentHostSmokeTests
         }
 
         Assert.NotNull(started);
+        Assert.Null(started.PreviousSessionId);
         await WaitUntilJournalSessionReadyAsync(databasePath, started.SessionId);
         await host.StopAsync(CancellationToken.None);
 
@@ -68,7 +69,57 @@ public sealed class AgentHostSmokeTests
         Assert.True(persisted.PlannedShutdown);
         Assert.True(File.Exists(markerPath));
         Assert.True(File.Exists(databasePath));
-        Assert.Equal(AgentJournalHealthState.Healthy, host.Services.GetRequiredService<IAgentJournal>().Health.State);
+        AgentJournalHealth health = host.Services.GetRequiredService<IAgentJournal>().Health;
+        Assert.Equal(AgentJournalHealthState.Healthy, health.State);
+        Assert.Equal(SqliteJournalSchema.CurrentVersion, health.SchemaVersion);
+    }
+
+    [Fact]
+    public async Task MissingJournalOnLaterRealHostStartDegradesWithoutRecreatingArtifacts()
+    {
+        string markerPath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.json");
+        string databasePath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.db");
+        Guid firstSessionId;
+        using (IHost firstHost = Program.CreateHostBuilder([
+            "--AgentLifecycle:MarkerPath", markerPath,
+            "--AgentLifecycle:ReadinessTimeout", "00:01:00",
+            "--AgentJournal:DatabasePath", databasePath
+        ]).Build())
+        {
+            await firstHost.StartAsync(CancellationToken.None);
+            IAgentLifecycleCoordinator firstCoordinator = firstHost.Services.GetRequiredService<IAgentLifecycleCoordinator>();
+            await WaitUntilReadyAsync(firstCoordinator);
+            firstSessionId = firstCoordinator.CurrentState!.SessionId;
+            await firstHost.StopAsync(CancellationToken.None);
+        }
+
+        Assert.True(File.Exists(markerPath));
+        Assert.True(File.Exists(databasePath));
+        File.Delete(databasePath);
+        File.Delete($"{databasePath}-wal");
+        File.Delete($"{databasePath}-shm");
+        AssertJournalFilesAbsent(databasePath);
+
+        using IHost restartedHost = Program.CreateHostBuilder([
+            "--AgentLifecycle:MarkerPath", markerPath,
+            "--AgentLifecycle:ReadinessTimeout", "00:01:00",
+            "--AgentJournal:DatabasePath", databasePath
+        ]).Build();
+        await restartedHost.StartAsync(CancellationToken.None);
+        IAgentJournal restartedJournal = restartedHost.Services.GetRequiredService<IAgentJournal>();
+        IAgentLifecycleCoordinator restartedCoordinator = restartedHost.Services.GetRequiredService<IAgentLifecycleCoordinator>();
+        await WaitUntilJournalStateAsync(restartedJournal, AgentJournalHealthState.Degraded);
+
+        Assert.Equal("database_missing", restartedJournal.Health.ReasonCode);
+        Assert.Equal("not_run", restartedJournal.Health.IntegrityResult);
+        Assert.Equal(firstSessionId, restartedCoordinator.CurrentState?.PreviousSessionId);
+        Assert.False(restartedCoordinator.CurrentState?.IsReady);
+        AssertJournalFilesAbsent(databasePath);
+
+        await restartedHost.StopAsync(CancellationToken.None);
+
+        Assert.False(restartedCoordinator.CurrentState?.IsReady);
+        AssertJournalFilesAbsent(databasePath);
     }
 
     [Fact]
@@ -180,6 +231,9 @@ public sealed class AgentHostSmokeTests
         await journal.Initialized.Task;
         await WaitUntilMarkReadyCalledAsync(coordinator);
 
+        Assert.Equal(
+            AgentJournalInitializationMode.CreateIfMissingForFreshLifecycle,
+            journal.InitializationMode);
         Assert.Equal(
             ["lifecycle_start", "journal_initialize", "journal_session_started", "lifecycle_ready", "journal_session_ready"],
             operations);
@@ -342,6 +396,21 @@ public sealed class AgentHostSmokeTests
         throw new InvalidOperationException("Worker did not start within the test timeout.");
     }
 
+    private static async Task WaitUntilReadyAsync(IAgentLifecycleCoordinator coordinator)
+    {
+        for (int i = 0; i < 40; i++)
+        {
+            if (coordinator.CurrentState?.IsReady == true)
+            {
+                return;
+            }
+
+            await Task.Delay(TimeSpan.FromMilliseconds(25), CancellationToken.None);
+        }
+
+        throw new InvalidOperationException("Agent did not become monitoring-ready within the test timeout.");
+    }
+
     private static async Task WaitUntilJournalSessionReadyAsync(string databasePath, Guid sessionId)
     {
         for (int i = 0; i < 40; i++)
@@ -425,7 +494,9 @@ public sealed class AgentHostSmokeTests
         throw new FileNotFoundException("Repository file was not found.", Path.Combine(relativeParts));
     }
 
-    private sealed class RecordingLifecycleCoordinator(List<string>? operations = null) : IAgentLifecycleCoordinator
+    private sealed class RecordingLifecycleCoordinator(
+        List<string>? operations = null,
+        Guid? previousSessionId = null) : IAgentLifecycleCoordinator
     {
         private readonly AgentLifecycleState state = new(
             Guid.NewGuid(),
@@ -434,7 +505,7 @@ public sealed class AgentHostSmokeTests
             ReadinessElapsed: null,
             StoppedAtUtc: null,
             PlannedShutdown: false,
-            PreviousSessionId: null,
+            PreviousSessionId: previousSessionId,
             PreviousSessionEndedCleanly: true);
 
         public bool StopCalled { get; private set; }
@@ -492,9 +563,14 @@ public sealed class AgentHostSmokeTests
 
         public AgentJournalHealth Health { get; private set; } = AgentJournalHealth.NotInitialized;
 
-        public Task<AgentJournalHealth> InitializeAsync(CancellationToken cancellationToken)
+        public AgentJournalInitializationMode? InitializationMode { get; private set; }
+
+        public Task<AgentJournalHealth> InitializeAsync(
+            AgentJournalInitializationMode mode,
+            CancellationToken cancellationToken)
         {
             operations?.Add("journal_initialize");
+            InitializationMode = mode;
             Health = health;
             Initialized.SetResult();
             return Task.FromResult(health);
@@ -519,6 +595,13 @@ public sealed class AgentHostSmokeTests
         public Task<MaterialEventCommit> AppendMaterialEventAsync(MaterialEventWrite materialEvent, CancellationToken cancellationToken) => throw new NotSupportedException();
 
         public Task<IReadOnlyList<PendingOutboxItem>> ReadPendingOutboxAsync(string agentId, int maximumCount, CancellationToken cancellationToken) => throw new NotSupportedException();
+    }
+
+    private static void AssertJournalFilesAbsent(string databasePath)
+    {
+        Assert.False(File.Exists(databasePath));
+        Assert.False(File.Exists($"{databasePath}-wal"));
+        Assert.False(File.Exists($"{databasePath}-shm"));
     }
 
     private sealed class ListLogger<T> : ILogger<T>

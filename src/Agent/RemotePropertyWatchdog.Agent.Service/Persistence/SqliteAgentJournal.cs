@@ -46,8 +46,15 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
 
     public AgentJournalHealth Health => Volatile.Read(ref health);
 
-    public async Task<AgentJournalHealth> InitializeAsync(CancellationToken cancellationToken)
+    public async Task<AgentJournalHealth> InitializeAsync(
+        AgentJournalInitializationMode mode,
+        CancellationToken cancellationToken)
     {
+        if (!Enum.IsDefined(mode))
+        {
+            throw new ArgumentOutOfRangeException(nameof(mode));
+        }
+
         await initializationGate.WaitAsync(cancellationToken);
         try
         {
@@ -58,8 +65,14 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
 
             try
             {
+                bool databaseExists = File.Exists(databasePath);
+                if (!databaseExists && mode == AgentJournalInitializationMode.RequireExistingForPriorLifecycle)
+                {
+                    return SetDegraded(null, "database_missing", "not_run", sqliteErrorCode: null);
+                }
+
                 await using SqliteConnection connection = await OpenConnectionAsync(
-                    allowCreate: true,
+                    allowCreate: !databaseExists,
                     includeJournalMode: true,
                     cancellationToken);
                 int schemaVersion = await MigrateToCurrentVersionAsync(connection, cancellationToken);
@@ -91,12 +104,17 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
             }
             catch (SqliteException ex)
             {
-                string reason = ex.SqliteErrorCode == 26 ? "database_invalid" : "initialization_failed";
+                string reason = !File.Exists(databasePath)
+                    ? "database_missing"
+                    : ex.SqliteErrorCode == 26
+                        ? "database_invalid"
+                        : "initialization_failed";
                 return SetDegraded(null, reason, "failed", ex.SqliteErrorCode);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
             {
-                return SetDegraded(null, "initialization_failed", "failed", sqliteErrorCode: null);
+                string reason = !File.Exists(databasePath) ? "database_missing" : "initialization_failed";
+                return SetDegraded(null, reason, "failed", sqliteErrorCode: null);
             }
         }
         finally
@@ -298,20 +316,16 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
 
     public void Dispose() => initializationGate.Dispose();
 
-    private async Task<AgentJournalHealth> EnsureHealthyAsync(CancellationToken cancellationToken)
+    private Task<AgentJournalHealth> EnsureHealthyAsync(CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         AgentJournalHealth current = Health;
-        if (current.State == AgentJournalHealthState.NotInitialized)
-        {
-            current = await InitializeAsync(cancellationToken);
-        }
-
         if (current.State != AgentJournalHealthState.Healthy)
         {
             throw new AgentJournalDegradedException(current);
         }
 
-        return current;
+        return Task.FromResult(current);
     }
 
     private async Task<SqliteConnection> OpenExistingOperationalConnectionAsync(CancellationToken cancellationToken)

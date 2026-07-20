@@ -18,7 +18,7 @@ public sealed class SqliteAgentJournalTests
         using TestDatabase database = new();
         using SqliteAgentJournal journal = CreateJournal(database.Path);
 
-        AgentJournalHealth health = await journal.InitializeAsync(CancellationToken.None);
+        AgentJournalHealth health = await InitializeFreshAsync(journal);
 
         Assert.Equal(AgentJournalHealthState.Healthy, health.State);
         Assert.Equal(SqliteJournalSchema.CurrentVersion, health.SchemaVersion);
@@ -39,14 +39,14 @@ public sealed class SqliteAgentJournalTests
         using TestDatabase database = new();
         using (SqliteAgentJournal first = CreateJournal(database.Path))
         {
-            AgentJournalHealth once = await first.InitializeAsync(CancellationToken.None);
-            AgentJournalHealth twice = await first.InitializeAsync(CancellationToken.None);
+            AgentJournalHealth once = await InitializeFreshAsync(first);
+            AgentJournalHealth twice = await InitializeFreshAsync(first);
             Assert.Equal(once, twice);
         }
 
         using (SqliteAgentJournal restarted = CreateJournal(database.Path))
         {
-            Assert.Equal(AgentJournalHealthState.Healthy, (await restarted.InitializeAsync(CancellationToken.None)).State);
+            Assert.Equal(AgentJournalHealthState.Healthy, (await InitializeExistingAsync(restarted)).State);
         }
 
         await using SqliteConnection connection = await database.OpenAsync();
@@ -64,7 +64,7 @@ public sealed class SqliteAgentJournalTests
             .Select(journal => Task.Run(async () =>
             {
                 await start.Task;
-                return await journal.InitializeAsync(CancellationToken.None);
+                return await InitializeFreshAsync(journal);
             }))
             .ToArray();
         start.SetResult();
@@ -92,7 +92,7 @@ public sealed class SqliteAgentJournalTests
 
         using (SqliteAgentJournal journal = CreateJournal(versionZero.Path))
         {
-            Assert.Equal(1, (await journal.InitializeAsync(CancellationToken.None)).SchemaVersion);
+            Assert.Equal(1, (await InitializeExistingAsync(journal)).SchemaVersion);
         }
 
         using TestDatabase future = new();
@@ -103,7 +103,7 @@ public sealed class SqliteAgentJournalTests
 
         using (SqliteAgentJournal journal = CreateJournal(future.Path))
         {
-            AgentJournalHealth health = await journal.InitializeAsync(CancellationToken.None);
+            AgentJournalHealth health = await InitializeExistingAsync(journal);
             Assert.Equal(AgentJournalHealthState.Degraded, health.State);
             Assert.Equal("schema_too_new", health.ReasonCode);
         }
@@ -135,6 +135,7 @@ public sealed class SqliteAgentJournalTests
     {
         using TestDatabase database = new();
         using SqliteAgentJournal journal = CreateJournal(database.Path);
+        await InitializeFreshAsync(journal);
         AgentSessionRecord completed = Session(
             readyAtUtc: Now.AddMinutes(1),
             endedAtUtc: Now.AddMinutes(2),
@@ -154,6 +155,7 @@ public sealed class SqliteAgentJournalTests
     {
         using TestDatabase database = new();
         using SqliteAgentJournal journal = CreateJournal(database.Path);
+        await InitializeFreshAsync(journal);
         await journal.RecordSessionAsync(Session(), CancellationToken.None);
         await journal.RecordSessionAsync(Session(readyAtUtc: Now.AddMinutes(1)), CancellationToken.None);
         AgentSessionRecord completed = Session(
@@ -171,6 +173,7 @@ public sealed class SqliteAgentJournalTests
     {
         using TestDatabase database = new();
         using SqliteAgentJournal journal = CreateJournal(database.Path);
+        await InitializeFreshAsync(journal);
         AgentSessionRecord stored = Session(
             readyAtUtc: Now.AddMinutes(1),
             endedAtUtc: Now.AddMinutes(2),
@@ -215,6 +218,7 @@ public sealed class SqliteAgentJournalTests
         using SqliteAgentJournal setup = CreateJournal(database.Path);
         await AddSessionAsync(setup);
         using SqliteAgentJournal faulted = CreateJournal(database.Path, new ThrowingFaultInjector(beforeCommit: true));
+        await InitializeExistingAsync(faulted);
 
         await Assert.ThrowsAsync<SyntheticJournalFaultException>(
             () => faulted.AppendMaterialEventAsync(Event("event-before-fault"), CancellationToken.None));
@@ -231,6 +235,7 @@ public sealed class SqliteAgentJournalTests
         using SqliteAgentJournal setup = CreateJournal(database.Path);
         await AddSessionAsync(setup);
         using SqliteAgentJournal faulted = CreateJournal(database.Path, new ThrowingFaultInjector(afterCommit: true));
+        await InitializeExistingAsync(faulted);
 
         await Assert.ThrowsAsync<SyntheticJournalFaultException>(
             () => faulted.AppendMaterialEventAsync(Event("event-after-fault"), CancellationToken.None));
@@ -250,6 +255,7 @@ public sealed class SqliteAgentJournalTests
         }
 
         using SqliteAgentJournal restarted = CreateJournal(database.Path);
+        Assert.Equal(AgentJournalHealthState.Healthy, (await InitializeExistingAsync(restarted)).State);
         Assert.Equal(2, (await restarted.AppendMaterialEventAsync(Event("event-two"), CancellationToken.None)).AgentSequence);
     }
 
@@ -297,6 +303,7 @@ public sealed class SqliteAgentJournalTests
         TaskCompletionSource start = new(TaskCreationOptions.RunContinuationsAsynchronously);
         try
         {
+            await Task.WhenAll(journals.Select(InitializeExistingAsync));
             Task<MaterialEventCommit>[] writes = Enumerable.Range(0, writerCount)
                 .Select(index => Task.Run(async () =>
                 {
@@ -331,7 +338,7 @@ public sealed class SqliteAgentJournalTests
         await File.WriteAllBytesAsync(database.Path, original);
         using SqliteAgentJournal journal = CreateJournal(database.Path);
 
-        AgentJournalHealth health = await journal.InitializeAsync(CancellationToken.None);
+        AgentJournalHealth health = await InitializeExistingAsync(journal);
 
         Assert.Equal(AgentJournalHealthState.Degraded, health.State);
         Assert.NotEqual("healthy", health.ReasonCode);
@@ -360,7 +367,7 @@ public sealed class SqliteAgentJournalTests
     {
         using TestDatabase database = new();
         using SqliteAgentJournal journal = CreateJournal(database.Path);
-        Assert.Equal(AgentJournalHealthState.Healthy, (await journal.InitializeAsync(CancellationToken.None)).State);
+        Assert.Equal(AgentJournalHealthState.Healthy, (await InitializeFreshAsync(journal)).State);
         File.Delete(database.Path);
 
         AgentJournalHealth health = await journal.VerifyIntegrityAsync(CancellationToken.None);
@@ -372,11 +379,43 @@ public sealed class SqliteAgentJournalTests
     }
 
     [Fact]
+    public async Task PriorLifecycleInitializationWithMissingDatabaseDegradesWithoutCreatingArtifacts()
+    {
+        using TestDatabase database = new();
+        using SqliteAgentJournal journal = CreateJournal(database.Path);
+
+        AgentJournalHealth health = await InitializeExistingAsync(journal);
+
+        Assert.Equal(AgentJournalHealthState.Degraded, health.State);
+        Assert.Equal("database_missing", health.ReasonCode);
+        Assert.Equal("not_run", health.IntegrityResult);
+        AssertJournalFilesAbsent(database.Path);
+    }
+
+    [Fact]
+    public async Task VerificationAndOperationsOnUninitializedMissingJournalDoNotCreateArtifacts()
+    {
+        using TestDatabase verificationDatabase = new();
+        using SqliteAgentJournal verificationJournal = CreateJournal(verificationDatabase.Path);
+        AgentJournalDegradedException verificationError = await Assert.ThrowsAsync<AgentJournalDegradedException>(
+            () => verificationJournal.VerifyIntegrityAsync(CancellationToken.None));
+        Assert.Equal("not_initialized", verificationError.Health.ReasonCode);
+        AssertJournalFilesAbsent(verificationDatabase.Path);
+
+        using TestDatabase operationalDatabase = new();
+        using SqliteAgentJournal operationalJournal = CreateJournal(operationalDatabase.Path);
+        AgentJournalDegradedException operationalError = await Assert.ThrowsAsync<AgentJournalDegradedException>(
+            () => operationalJournal.ReadPendingOutboxAsync("agent-synthetic", 1, CancellationToken.None));
+        Assert.Equal("not_initialized", operationalError.Health.ReasonCode);
+        AssertJournalFilesAbsent(operationalDatabase.Path);
+    }
+
+    [Fact]
     public async Task OperationalAccessDoesNotRecreateDeletedInitializedDatabase()
     {
         using TestDatabase database = new();
         using SqliteAgentJournal journal = CreateJournal(database.Path);
-        await journal.InitializeAsync(CancellationToken.None);
+        await InitializeFreshAsync(journal);
         File.Delete(database.Path);
 
         AgentJournalDegradedException error = await Assert.ThrowsAsync<AgentJournalDegradedException>(
@@ -392,7 +431,7 @@ public sealed class SqliteAgentJournalTests
     {
         using TestDatabase database = new();
         using SqliteAgentJournal journal = CreateJournal(database.Path);
-        await journal.InitializeAsync(CancellationToken.None);
+        await InitializeFreshAsync(journal);
         File.Delete(database.Path);
         await using (SqliteConnection replacement = await database.OpenAsync())
         {
@@ -414,7 +453,7 @@ public sealed class SqliteAgentJournalTests
     {
         using TestDatabase database = new();
         using SqliteAgentJournal journal = CreateJournal(database.Path);
-        await journal.InitializeAsync(CancellationToken.None);
+        await InitializeFreshAsync(journal);
         await using (SqliteConnection connection = await database.OpenAsync())
         {
             await ExecuteAsync(connection, "DROP TABLE probe_samples;");
@@ -433,7 +472,7 @@ public sealed class SqliteAgentJournalTests
     {
         using TestDatabase database = new();
         using SqliteAgentJournal journal = CreateJournal(database.Path);
-        await journal.InitializeAsync(CancellationToken.None);
+        await InitializeFreshAsync(journal);
         await using (SqliteConnection connection = await database.OpenAsync())
         {
             await ExecuteAsync(connection, "DROP INDEX idx_outbox_agent_sequence;");
@@ -452,7 +491,7 @@ public sealed class SqliteAgentJournalTests
     {
         using TestDatabase database = new();
         using SqliteAgentJournal journal = CreateJournal(database.Path);
-        await journal.InitializeAsync(CancellationToken.None);
+        await InitializeFreshAsync(journal);
         await using (SqliteConnection connection = await database.OpenAsync())
         {
             await ExecuteAsync(connection, "DELETE FROM schema_migrations WHERE version = 1;");
@@ -471,6 +510,7 @@ public sealed class SqliteAgentJournalTests
     {
         using TestDatabase database = new();
         using SqliteAgentJournal journal = CreateJournal(database.Path);
+        await InitializeFreshAsync(journal);
         await journal.RecordSessionAsync(Session(), CancellationToken.None);
 
         await journal.AppendProbeSampleAsync(
@@ -534,9 +574,10 @@ public sealed class SqliteAgentJournalTests
         using CancellationTokenSource canceled = new();
         canceled.Cancel();
 
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => journal.InitializeAsync(canceled.Token));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => journal.InitializeAsync(AgentJournalInitializationMode.CreateIfMissingForFreshLifecycle, canceled.Token));
         Assert.Equal(AgentJournalHealthState.NotInitialized, journal.Health.State);
-        await journal.InitializeAsync(CancellationToken.None);
+        await InitializeFreshAsync(journal);
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
             () => journal.ReadPendingOutboxAsync("agent-synthetic", 1, canceled.Token));
         Assert.Equal(AgentJournalHealthState.Healthy, journal.Health.State);
@@ -549,10 +590,30 @@ public sealed class SqliteAgentJournalTests
             faultInjector ?? NoOpAgentJournalFaultInjector.Instance,
             NullLogger<SqliteAgentJournal>.Instance);
 
-    private static async Task AddSessionAsync(SqliteAgentJournal journal) =>
+    private static async Task AddSessionAsync(SqliteAgentJournal journal)
+    {
+        await InitializeFreshAsync(journal);
         await journal.RecordSessionAsync(
             new AgentSessionRecord("session-synthetic", Now),
             CancellationToken.None);
+    }
+
+    private static Task<AgentJournalHealth> InitializeFreshAsync(SqliteAgentJournal journal) =>
+        journal.InitializeAsync(
+            AgentJournalInitializationMode.CreateIfMissingForFreshLifecycle,
+            CancellationToken.None);
+
+    private static Task<AgentJournalHealth> InitializeExistingAsync(SqliteAgentJournal journal) =>
+        journal.InitializeAsync(
+            AgentJournalInitializationMode.RequireExistingForPriorLifecycle,
+            CancellationToken.None);
+
+    private static void AssertJournalFilesAbsent(string databasePath)
+    {
+        Assert.False(File.Exists(databasePath));
+        Assert.False(File.Exists($"{databasePath}-wal"));
+        Assert.False(File.Exists($"{databasePath}-shm"));
+    }
 
     private static AgentSessionRecord Session(
         DateTimeOffset? readyAtUtc = null,

@@ -18,7 +18,10 @@ public sealed partial class AgentWorker(
             AgentLifecycleState started = await lifecycleCoordinator.StartAsync(stoppingToken);
             LogAgentHostStarted(logger, started.SessionId, started.StartedAtUtc, started.PreviousSessionId, started.PreviousSessionEndedCleanly);
 
-            AgentJournalHealth journalHealth = await agentJournal.InitializeAsync(stoppingToken);
+            AgentJournalInitializationMode initializationMode = started.PreviousSessionId is null
+                ? AgentJournalInitializationMode.CreateIfMissingForFreshLifecycle
+                : AgentJournalInitializationMode.RequireExistingForPriorLifecycle;
+            AgentJournalHealth journalHealth = await agentJournal.InitializeAsync(initializationMode, stoppingToken);
             if (journalHealth.State != AgentJournalHealthState.Healthy)
             {
                 LogAgentJournalDegraded(logger, journalHealth.ReasonCode, journalHealth.SchemaVersion, journalHealth.IntegrityResult);

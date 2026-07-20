@@ -4,7 +4,9 @@ public interface IAgentJournal
 {
     AgentJournalHealth Health { get; }
 
-    Task<AgentJournalHealth> InitializeAsync(CancellationToken cancellationToken);
+    Task<AgentJournalHealth> InitializeAsync(
+        AgentJournalInitializationMode mode,
+        CancellationToken cancellationToken);
 
     Task<AgentJournalHealth> VerifyIntegrityAsync(CancellationToken cancellationToken);
 

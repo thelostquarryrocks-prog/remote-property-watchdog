@@ -9,6 +9,12 @@ public enum AgentJournalHealthState
     Degraded
 }
 
+public enum AgentJournalInitializationMode
+{
+    CreateIfMissingForFreshLifecycle,
+    RequireExistingForPriorLifecycle
+}
+
 public sealed record AgentJournalHealth(
     AgentJournalHealthState State,
     int? SchemaVersion,
