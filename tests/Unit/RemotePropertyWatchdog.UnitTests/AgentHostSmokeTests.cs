@@ -128,6 +128,7 @@ public sealed class AgentHostSmokeTests
         string markerPath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.json");
         string databasePath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.db");
         byte[] corruptBytes = "not-a-sqlite-database"u8.ToArray();
+        Directory.CreateDirectory(Path.GetDirectoryName(databasePath)!);
         await File.WriteAllBytesAsync(databasePath, corruptBytes);
         using IHost host = Program.CreateHostBuilder([
             "--AgentLifecycle:MarkerPath", markerPath,
