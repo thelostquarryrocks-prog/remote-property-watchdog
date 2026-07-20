@@ -58,7 +58,10 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
 
             try
             {
-                await using SqliteConnection connection = await OpenConnectionAsync(includeJournalMode: true, cancellationToken);
+                await using SqliteConnection connection = await OpenConnectionAsync(
+                    allowCreate: true,
+                    includeJournalMode: true,
+                    cancellationToken);
                 int schemaVersion = await MigrateToCurrentVersionAsync(connection, cancellationToken);
 
                 bool schemaIsValid = await ValidateSchemaAsync(connection, cancellationToken);
@@ -105,18 +108,41 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
     public async Task<AgentJournalHealth> VerifyIntegrityAsync(CancellationToken cancellationToken)
     {
         AgentJournalHealth current = await EnsureHealthyAsync(cancellationToken);
+        if (!File.Exists(databasePath))
+        {
+            return SetDegraded(current.SchemaVersion, "database_missing", "not_run", sqliteErrorCode: null);
+        }
+
+        JournalVerificationStage stage = JournalVerificationStage.Opening;
         try
         {
-            await using SqliteConnection connection = await OpenConnectionAsync(includeJournalMode: false, cancellationToken);
+            await using SqliteConnection connection = await OpenConnectionAsync(
+                allowCreate: false,
+                includeJournalMode: false,
+                cancellationToken);
+            stage = JournalVerificationStage.Integrity;
             string result = await RunIntegrityCheckAsync(connection, cancellationToken);
             if (!StringComparer.Ordinal.Equals(result, "ok"))
             {
                 return SetDegraded(current.SchemaVersion, "integrity_check_failed", "failed", sqliteErrorCode: null);
             }
 
-            AgentJournalHealth verified = current with { IntegrityResult = "ok" };
+            stage = JournalVerificationStage.Schema;
+            int schemaVersion = await ReadSchemaVersionAsync(connection, transaction: null, cancellationToken);
+            bool schemaIsValid =
+                schemaVersion == SqliteJournalSchema.CurrentVersion &&
+                await ValidateSchemaAsync(connection, cancellationToken);
+            if (!schemaIsValid)
+            {
+                return SetDegraded(schemaVersion, "schema_validation_failed", "ok", sqliteErrorCode: null);
+            }
+
+            AgentJournalHealth verified = new(
+                AgentJournalHealthState.Healthy,
+                schemaVersion,
+                "healthy",
+                "ok");
             Volatile.Write(ref health, verified);
-            int schemaVersion = current.SchemaVersion.GetValueOrDefault();
             LogIntegrityVerified(logger, schemaVersion, "ok");
             return verified;
         }
@@ -126,7 +152,29 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
         }
         catch (SqliteException ex)
         {
-            return SetDegraded(current.SchemaVersion, "integrity_check_failed", "failed", ex.SqliteErrorCode);
+            string reasonCode = !File.Exists(databasePath)
+                ? "database_missing"
+                : stage switch
+                {
+                    JournalVerificationStage.Opening => "database_open_failed",
+                    JournalVerificationStage.Integrity => "integrity_check_failed",
+                    _ => "schema_validation_failed"
+                };
+            string integrityResult = stage == JournalVerificationStage.Schema ? "ok" : "failed";
+            return SetDegraded(current.SchemaVersion, reasonCode, integrityResult, ex.SqliteErrorCode);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
+        {
+            string reasonCode = !File.Exists(databasePath)
+                ? "database_missing"
+                : stage switch
+                {
+                    JournalVerificationStage.Opening => "database_open_failed",
+                    JournalVerificationStage.Integrity => "integrity_check_failed",
+                    _ => "schema_validation_failed"
+                };
+            string integrityResult = stage == JournalVerificationStage.Schema ? "ok" : "failed";
+            return SetDegraded(current.SchemaVersion, reasonCode, integrityResult, sqliteErrorCode: null);
         }
     }
 
@@ -134,7 +182,7 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
     {
         ValidateSession(session);
         await EnsureHealthyAsync(cancellationToken);
-        await using SqliteConnection connection = await OpenConnectionAsync(includeJournalMode: false, cancellationToken);
+        await using SqliteConnection connection = await OpenExistingOperationalConnectionAsync(cancellationToken);
         cancellationToken.ThrowIfCancellationRequested();
         await using SqliteTransaction transaction = connection.BeginTransaction(deferred: false);
         AgentSessionRecord? stored = await ReadSessionAsync(connection, transaction, session.SessionId, cancellationToken);
@@ -158,7 +206,7 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
     {
         ValidateProbeSample(sample);
         await EnsureHealthyAsync(cancellationToken);
-        await using SqliteConnection connection = await OpenConnectionAsync(includeJournalMode: false, cancellationToken);
+        await using SqliteConnection connection = await OpenExistingOperationalConnectionAsync(cancellationToken);
         await using SqliteCommand command = connection.CreateCommand();
         command.CommandText = """
             INSERT INTO probe_samples (
@@ -183,7 +231,7 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
     {
         ValidateMaterialEvent(materialEvent);
         await EnsureHealthyAsync(cancellationToken);
-        await using SqliteConnection connection = await OpenConnectionAsync(includeJournalMode: false, cancellationToken);
+        await using SqliteConnection connection = await OpenExistingOperationalConnectionAsync(cancellationToken);
         cancellationToken.ThrowIfCancellationRequested();
         await using SqliteTransaction transaction = connection.BeginTransaction(deferred: false);
 
@@ -220,7 +268,7 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
         }
 
         await EnsureHealthyAsync(cancellationToken);
-        await using SqliteConnection connection = await OpenConnectionAsync(includeJournalMode: false, cancellationToken);
+        await using SqliteConnection connection = await OpenExistingOperationalConnectionAsync(cancellationToken);
         await using SqliteCommand command = connection.CreateCommand();
         command.CommandText = """
             SELECT outbox_id, event_id, agent_id, agent_sequence, payload_json, created_at_utc
@@ -266,19 +314,70 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
         return current;
     }
 
-    private async Task<SqliteConnection> OpenConnectionAsync(bool includeJournalMode, CancellationToken cancellationToken)
+    private async Task<SqliteConnection> OpenExistingOperationalConnectionAsync(CancellationToken cancellationToken)
+    {
+        if (!File.Exists(databasePath))
+        {
+            AgentJournalHealth missing = SetDegraded(
+                Health.SchemaVersion,
+                "database_missing",
+                "not_run",
+                sqliteErrorCode: null);
+            throw new AgentJournalDegradedException(missing);
+        }
+
+        try
+        {
+            return await OpenConnectionAsync(
+                allowCreate: false,
+                includeJournalMode: false,
+                cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (SqliteException ex)
+        {
+            string reasonCode = !File.Exists(databasePath) ? "database_missing" : "database_open_failed";
+            AgentJournalHealth degraded = SetDegraded(
+                Health.SchemaVersion,
+                reasonCode,
+                "failed",
+                ex.SqliteErrorCode);
+            throw new AgentJournalDegradedException(degraded);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
+        {
+            string reasonCode = !File.Exists(databasePath) ? "database_missing" : "database_open_failed";
+            AgentJournalHealth degraded = SetDegraded(
+                Health.SchemaVersion,
+                reasonCode,
+                "failed",
+                sqliteErrorCode: null);
+            throw new AgentJournalDegradedException(degraded);
+        }
+    }
+
+    private async Task<SqliteConnection> OpenConnectionAsync(
+        bool allowCreate,
+        bool includeJournalMode,
+        CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        string? directory = Path.GetDirectoryName(databasePath);
-        if (!string.IsNullOrWhiteSpace(directory))
+        if (allowCreate)
         {
-            Directory.CreateDirectory(directory);
+            string? directory = Path.GetDirectoryName(databasePath);
+            if (!string.IsNullOrWhiteSpace(directory))
+            {
+                Directory.CreateDirectory(directory);
+            }
         }
 
         SqliteConnectionStringBuilder builder = new()
         {
             DataSource = databasePath,
-            Mode = SqliteOpenMode.ReadWriteCreate,
+            Mode = allowCreate ? SqliteOpenMode.ReadWriteCreate : SqliteOpenMode.ReadWrite,
             Cache = SqliteCacheMode.Default,
             Pooling = false,
             DefaultTimeout = Convert.ToInt32(Math.Ceiling(options.BusyTimeout.TotalSeconds))
@@ -350,7 +449,7 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
 
     private static async Task<int> ReadSchemaVersionAsync(
         SqliteConnection connection,
-        SqliteTransaction transaction,
+        SqliteTransaction? transaction,
         CancellationToken cancellationToken)
     {
         await using SqliteCommand command = connection.CreateCommand();
@@ -528,7 +627,7 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
         await using SqliteCommand command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = """
-            SELECT session_id, agent_id, started_at_utc, ready_at_utc, ended_at_utc, planned_shutdown
+            SELECT session_id, started_at_utc, ready_at_utc, ended_at_utc, planned_shutdown
             FROM agent_sessions
             WHERE session_id = $session_id;
             """;
@@ -541,11 +640,10 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
 
         return new AgentSessionRecord(
             reader.GetString(0),
-            reader.GetString(1),
-            ParseUtcText(reader.GetString(2)),
+            ParseUtcText(reader.GetString(1)),
+            reader.IsDBNull(2) ? null : ParseUtcText(reader.GetString(2)),
             reader.IsDBNull(3) ? null : ParseUtcText(reader.GetString(3)),
-            reader.IsDBNull(4) ? null : ParseUtcText(reader.GetString(4)),
-            reader.GetInt64(5) != 0);
+            reader.GetInt64(4) != 0);
     }
 
     private static async Task InsertSessionAsync(
@@ -558,9 +656,9 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
         command.Transaction = transaction;
         command.CommandText = """
             INSERT INTO agent_sessions (
-                session_id, agent_id, started_at_utc, ready_at_utc, ended_at_utc, planned_shutdown)
+                session_id, started_at_utc, ready_at_utc, ended_at_utc, planned_shutdown)
             VALUES (
-                $session_id, $agent_id, $started_at_utc, $ready_at_utc, $ended_at_utc, $planned_shutdown);
+                $session_id, $started_at_utc, $ready_at_utc, $ended_at_utc, $planned_shutdown);
             """;
         AddSessionParameters(command, session);
         await command.ExecuteNonQueryAsync(cancellationToken);
@@ -580,21 +678,19 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
                 ended_at_utc = $ended_at_utc,
                 planned_shutdown = $planned_shutdown
             WHERE session_id = $session_id
-              AND agent_id = $agent_id
               AND started_at_utc = $started_at_utc;
             """;
         AddSessionParameters(command, session);
         int affected = await command.ExecuteNonQueryAsync(cancellationToken);
         if (affected != 1)
         {
-            throw new AgentSessionConflictException("immutable_identity_conflict");
+            throw new AgentSessionConflictException("immutable_start_conflict");
         }
     }
 
     private static void AddSessionParameters(SqliteCommand command, AgentSessionRecord session)
     {
         command.Parameters.AddWithValue("$session_id", session.SessionId);
-        command.Parameters.AddWithValue("$agent_id", session.AgentId);
         command.Parameters.AddWithValue("$started_at_utc", ToUtcText(session.StartedAtUtc));
         command.Parameters.AddWithValue("$ready_at_utc", DbValue(session.ReadyAtUtc));
         command.Parameters.AddWithValue("$ended_at_utc", DbValue(session.EndedAtUtc));
@@ -603,9 +699,9 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
 
     private static AgentSessionRecord MergeSession(AgentSessionRecord stored, AgentSessionRecord incoming)
     {
-        if (!StringComparer.Ordinal.Equals(stored.AgentId, incoming.AgentId) || stored.StartedAtUtc != incoming.StartedAtUtc)
+        if (stored.StartedAtUtc != incoming.StartedAtUtc)
         {
-            throw new AgentSessionConflictException("immutable_identity_conflict");
+            throw new AgentSessionConflictException("immutable_start_conflict");
         }
 
         AgentSessionRecord merged = stored with
@@ -631,11 +727,10 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
     private static void ValidateSession(AgentSessionRecord session)
     {
         ValidateIdentifier(nameof(session.SessionId), session.SessionId);
-        ValidateIdentifier(nameof(session.AgentId), session.AgentId);
         ValidateUtc(nameof(session.StartedAtUtc), session.StartedAtUtc);
         ValidateOptionalUtc(nameof(session.ReadyAtUtc), session.ReadyAtUtc);
         ValidateOptionalUtc(nameof(session.EndedAtUtc), session.EndedAtUtc);
-        RejectSecrets([session.SessionId, session.AgentId]);
+        RejectSecrets([session.SessionId]);
         ValidateSessionChronology(session);
     }
 
@@ -792,4 +887,11 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
 
     [LoggerMessage(EventId = 103, Level = LogLevel.Information, Message = "Agent journal integrity verification completed. SchemaVersion={SchemaVersion} IntegrityResult={IntegrityResult}")]
     private static partial void LogIntegrityVerified(ILogger logger, int schemaVersion, string integrityResult);
+
+    private enum JournalVerificationStage
+    {
+        Opening,
+        Integrity,
+        Schema
+    }
 }

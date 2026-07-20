@@ -1,3 +1,4 @@
+using System.Data.Common;
 using Microsoft.Extensions.Options;
 
 namespace RemotePropertyWatchdog.Agent.Service;
@@ -25,7 +26,9 @@ public sealed partial class AgentWorker(
                 return;
             }
 
+            await agentJournal.RecordSessionAsync(ToJournalSession(started), stoppingToken);
             AgentLifecycleState ready = await lifecycleCoordinator.MarkReadyAsync(stoppingToken);
+            await agentJournal.RecordSessionAsync(ToJournalSession(ready), stoppingToken);
             LogAgentHostReady(logger, ready.SessionId, ready.ReadyAtUtc!.Value, ready.ReadinessElapsed!.Value.TotalMilliseconds, options.Value.ReadinessTimeout.TotalSeconds);
 
             await Task.Delay(Timeout.InfiniteTimeSpan, stoppingToken);
@@ -34,10 +37,10 @@ public sealed partial class AgentWorker(
         {
             LogAgentHostCancellation(logger, lifecycleCoordinator.CurrentState?.SessionId);
         }
-        catch (Exception ex)
+        catch (Exception)
         {
             Interlocked.Exchange(ref executionFaulted, 1);
-            LogAgentHostExecutionFaulted(logger, lifecycleCoordinator.CurrentState?.SessionId, ex);
+            LogAgentHostExecutionFaulted(logger, lifecycleCoordinator.CurrentState?.SessionId);
             throw;
         }
     }
@@ -57,17 +60,43 @@ public sealed partial class AgentWorker(
             return;
         }
 
+        AgentLifecycleState stopped;
+        using CancellationTokenSource writeTimeout = new(options.Value.CleanShutdownWriteTimeout);
         try
         {
-            using CancellationTokenSource writeTimeout = new(options.Value.CleanShutdownWriteTimeout);
-            AgentLifecycleState stopped = await lifecycleCoordinator.StopAsync(writeTimeout.Token);
-            LogAgentHostStopped(logger, stopped.SessionId, stopped.StoppedAtUtc!.Value);
+            stopped = await lifecycleCoordinator.StopAsync(writeTimeout.Token);
         }
         catch (Exception ex) when (ex is OperationCanceledException or IOException or UnauthorizedAccessException or InvalidOperationException)
         {
-            LogCleanShutdownMarkerFailed(logger, ex);
+            LogCleanShutdownMarkerFailed(logger);
+            return;
         }
+
+        if (agentJournal.Health.State == AgentJournalHealthState.Healthy)
+        {
+            try
+            {
+                await agentJournal.RecordSessionAsync(ToJournalSession(stopped), writeTimeout.Token);
+            }
+            catch (Exception ex) when (ex is OperationCanceledException or IOException or UnauthorizedAccessException or InvalidOperationException or DbException)
+            {
+                string reasonCode = ex is OperationCanceledException
+                    ? "session_persistence_timeout"
+                    : "session_persistence_failed";
+                LogJournalShutdownPersistenceFailed(logger, reasonCode);
+            }
+        }
+
+        LogAgentHostStopped(logger, stopped.SessionId, stopped.StoppedAtUtc!.Value);
     }
+
+    private static AgentSessionRecord ToJournalSession(AgentLifecycleState state) =>
+        new(
+            state.SessionId.ToString("D"),
+            state.StartedAtUtc,
+            state.ReadyAtUtc,
+            state.StoppedAtUtc,
+            state.PlannedShutdown);
 
     [LoggerMessage(EventId = 1, Level = LogLevel.Information, Message = "Remote Property Watchdog agent host started. SessionId={SessionId} StartedAtUtc={StartedAtUtc} PreviousSessionId={PreviousSessionId} PreviousSessionEndedCleanly={PreviousSessionEndedCleanly}")]
     private static partial void LogAgentHostStarted(ILogger logger, Guid sessionId, DateTimeOffset startedAtUtc, Guid? previousSessionId, bool previousSessionEndedCleanly);
@@ -79,10 +108,10 @@ public sealed partial class AgentWorker(
     private static partial void LogAgentHostStopped(ILogger logger, Guid sessionId, DateTimeOffset stoppedAtUtc);
 
     [LoggerMessage(EventId = 4, Level = LogLevel.Warning, Message = "Remote Property Watchdog agent host could not record planned shutdown; previous session will remain unclean on next start.")]
-    private static partial void LogCleanShutdownMarkerFailed(ILogger logger, Exception exception);
+    private static partial void LogCleanShutdownMarkerFailed(ILogger logger);
 
     [LoggerMessage(EventId = 5, Level = LogLevel.Error, Message = "Remote Property Watchdog agent host execution faulted. SessionId={SessionId}")]
-    private static partial void LogAgentHostExecutionFaulted(ILogger logger, Guid? sessionId, Exception exception);
+    private static partial void LogAgentHostExecutionFaulted(ILogger logger, Guid? sessionId);
 
     [LoggerMessage(EventId = 6, Level = LogLevel.Warning, Message = "Remote Property Watchdog agent host session remains unclean because worker execution faulted. SessionId={SessionId}")]
     private static partial void LogAgentHostFaultedSessionLeftUnclean(ILogger logger, Guid sessionId);
@@ -92,4 +121,7 @@ public sealed partial class AgentWorker(
 
     [LoggerMessage(EventId = 8, Level = LogLevel.Error, Message = "Agent journal is degraded; monitoring-ready is blocked. ReasonCode={ReasonCode} SchemaVersion={SchemaVersion} IntegrityResult={IntegrityResult}")]
     private static partial void LogAgentJournalDegraded(ILogger logger, string reasonCode, int? schemaVersion, string integrityResult);
+
+    [LoggerMessage(EventId = 9, Level = LogLevel.Warning, Message = "Agent journal could not persist the planned shutdown session milestone. ReasonCode={ReasonCode}")]
+    private static partial void LogJournalShutdownPersistenceFailed(ILogger logger, string reasonCode);
 }

@@ -16,11 +16,10 @@ public static class SqliteJournalSchema
 
     public static IReadOnlyList<string> Indexes { get; } =
     [
-        "idx_agent_sessions_agent_started",
+        "idx_agent_sessions_started",
         "idx_material_events_session_observed",
         "idx_outbox_agent_sequence",
         "idx_probe_samples_agent_observed",
-        "ux_agent_sessions_session_agent",
         "ux_material_events_agent_sequence",
         "ux_outbox_event",
         "ux_outbox_sequence"
@@ -35,17 +34,14 @@ public static class SqliteJournalSchema
 
         CREATE TABLE agent_sessions (
             session_id TEXT NOT NULL PRIMARY KEY CHECK (length(session_id) BETWEEN 1 AND 128),
-            agent_id TEXT NOT NULL CHECK (length(agent_id) BETWEEN 1 AND 128),
             started_at_utc TEXT NOT NULL,
             ready_at_utc TEXT NULL,
             ended_at_utc TEXT NULL,
             planned_shutdown INTEGER NOT NULL DEFAULT 0 CHECK (planned_shutdown IN (0, 1))
         ) STRICT;
 
-        CREATE UNIQUE INDEX ux_agent_sessions_session_agent
-            ON agent_sessions(session_id, agent_id);
-        CREATE INDEX idx_agent_sessions_agent_started
-            ON agent_sessions(agent_id, started_at_utc, session_id);
+        CREATE INDEX idx_agent_sessions_started
+            ON agent_sessions(started_at_utc, session_id);
 
         CREATE TABLE local_state (
             agent_id TEXT NOT NULL PRIMARY KEY CHECK (length(agent_id) BETWEEN 1 AND 128),
@@ -64,8 +60,8 @@ public static class SqliteJournalSchema
             probe_state TEXT NOT NULL CHECK (length(probe_state) BETWEEN 1 AND 32),
             target_id TEXT NULL CHECK (target_id IS NULL OR length(target_id) BETWEEN 1 AND 128),
             evidence_json TEXT NOT NULL CHECK (json_valid(evidence_json)),
-            FOREIGN KEY (session_id, agent_id)
-                REFERENCES agent_sessions(session_id, agent_id) ON UPDATE RESTRICT ON DELETE RESTRICT
+            FOREIGN KEY (session_id)
+                REFERENCES agent_sessions(session_id) ON UPDATE RESTRICT ON DELETE RESTRICT
         ) STRICT;
 
         CREATE INDEX idx_probe_samples_agent_observed
@@ -88,8 +84,8 @@ public static class SqliteJournalSchema
             gateway_state TEXT NULL,
             internet_state TEXT NULL,
             created_at_utc TEXT NOT NULL,
-            FOREIGN KEY (session_id, agent_id)
-                REFERENCES agent_sessions(session_id, agent_id) ON UPDATE RESTRICT ON DELETE RESTRICT
+            FOREIGN KEY (session_id)
+                REFERENCES agent_sessions(session_id) ON UPDATE RESTRICT ON DELETE RESTRICT
         ) STRICT;
 
         CREATE UNIQUE INDEX ux_material_events_agent_sequence

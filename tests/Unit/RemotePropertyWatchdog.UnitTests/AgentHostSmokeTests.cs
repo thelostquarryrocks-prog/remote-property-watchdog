@@ -1,3 +1,5 @@
+using System.Globalization;
+using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -48,14 +50,22 @@ public sealed class AgentHostSmokeTests
             await Task.Delay(TimeSpan.FromMilliseconds(25), CancellationToken.None);
         }
 
+        Assert.NotNull(started);
+        await WaitUntilJournalSessionReadyAsync(databasePath, started.SessionId);
         await host.StopAsync(CancellationToken.None);
 
         AgentLifecycleState? stopped = coordinator.CurrentState;
+        AgentSessionRecord? persisted = await ReadJournalSessionAsync(databasePath, started.SessionId);
 
-        Assert.NotNull(started);
         Assert.True(started.IsReady);
         Assert.NotNull(stopped);
         Assert.True(stopped.PlannedShutdown);
+        Assert.NotNull(persisted);
+        Assert.Equal(started.SessionId.ToString("D"), persisted.SessionId);
+        Assert.Equal(started.StartedAtUtc, persisted.StartedAtUtc);
+        Assert.Equal(started.ReadyAtUtc, persisted.ReadyAtUtc);
+        Assert.Equal(stopped.StoppedAtUtc, persisted.EndedAtUtc);
+        Assert.True(persisted.PlannedShutdown);
         Assert.True(File.Exists(markerPath));
         Assert.True(File.Exists(databasePath));
         Assert.Equal(AgentJournalHealthState.Healthy, host.Services.GetRequiredService<IAgentJournal>().Health.State);
@@ -170,9 +180,25 @@ public sealed class AgentHostSmokeTests
         await journal.Initialized.Task;
         await WaitUntilMarkReadyCalledAsync(coordinator);
 
-        Assert.Equal(["lifecycle_start", "journal_initialize", "lifecycle_ready"], operations);
+        Assert.Equal(
+            ["lifecycle_start", "journal_initialize", "journal_session_started", "lifecycle_ready", "journal_session_ready"],
+            operations);
 
         await worker.StopAsync(CancellationToken.None);
+
+        Assert.Equal(
+            [
+                "lifecycle_start",
+                "journal_initialize",
+                "journal_session_started",
+                "lifecycle_ready",
+                "journal_session_ready",
+                "lifecycle_stop",
+                "journal_session_stopped"
+            ],
+            operations);
+        AgentSessionRecord stopped = Assert.Single(journal.Sessions, session => session.PlannedShutdown);
+        Assert.NotNull(stopped.EndedAtUtc);
     }
 
     [Fact]
@@ -190,6 +216,7 @@ public sealed class AgentHostSmokeTests
 
         Assert.Equal(degraded, journal.Health);
         Assert.False(coordinator.MarkReadyCalled);
+        Assert.Empty(journal.Sessions);
         LogEntry entry = Assert.Single(logger.Entries, candidate => candidate.EventId == 8);
         Assert.Equal(LogLevel.Error, entry.LogLevel);
         Assert.Null(entry.Exception);
@@ -214,7 +241,7 @@ public sealed class AgentHostSmokeTests
         await WaitUntilLoggedAsync(logger, eventId: 5);
         await worker.StopAsync(CancellationToken.None);
         Assert.False(coordinator.StopCalled);
-        Assert.Contains(logger.Entries, entry => entry.EventId == 5 && entry.LogLevel == LogLevel.Error && ReferenceEquals(entry.Exception, expected));
+        Assert.Contains(logger.Entries, entry => entry.EventId == 5 && entry.LogLevel == LogLevel.Error && entry.Exception is null);
         Assert.Contains(logger.Entries, entry => entry.EventId == 6 && entry.LogLevel == LogLevel.Warning);
     }
 
@@ -222,7 +249,8 @@ public sealed class AgentHostSmokeTests
     public async Task AgentWorkerFaultDrivenStopDoesNotRecordPlannedShutdown()
     {
         RecordingLifecycleCoordinator coordinator = new() { MarkReadyException = new InvalidOperationException("readiness failed") };
-        AgentWorker worker = CreateWorker(coordinator);
+        RecordingJournal journal = new(HealthyJournal());
+        AgentWorker worker = CreateWorker(coordinator, journal: journal);
 
         await worker.StartAsync(CancellationToken.None);
         await WaitUntilFaultedAsync(coordinator);
@@ -230,6 +258,9 @@ public sealed class AgentHostSmokeTests
 
         Assert.False(coordinator.StopCalled);
         Assert.False(coordinator.CleanShutdownRecorded);
+        AgentSessionRecord session = Assert.Single(journal.Sessions);
+        Assert.False(session.PlannedShutdown);
+        Assert.Null(session.EndedAtUtc);
     }
 
     [Fact]
@@ -311,6 +342,58 @@ public sealed class AgentHostSmokeTests
         throw new InvalidOperationException("Worker did not start within the test timeout.");
     }
 
+    private static async Task WaitUntilJournalSessionReadyAsync(string databasePath, Guid sessionId)
+    {
+        for (int i = 0; i < 40; i++)
+        {
+            AgentSessionRecord? session = await ReadJournalSessionAsync(databasePath, sessionId);
+            if (session?.ReadyAtUtc is not null)
+            {
+                return;
+            }
+
+            await Task.Delay(TimeSpan.FromMilliseconds(25), CancellationToken.None);
+        }
+
+        throw new InvalidOperationException("Journal did not persist the ready lifecycle session within the test timeout.");
+    }
+
+    private static async Task<AgentSessionRecord?> ReadJournalSessionAsync(string databasePath, Guid sessionId)
+    {
+        if (!File.Exists(databasePath))
+        {
+            return null;
+        }
+
+        SqliteConnectionStringBuilder builder = new()
+        {
+            DataSource = databasePath,
+            Mode = SqliteOpenMode.ReadWrite,
+            Pooling = false
+        };
+        await using SqliteConnection connection = new(builder.ToString());
+        await connection.OpenAsync();
+        await using SqliteCommand command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT session_id, started_at_utc, ready_at_utc, ended_at_utc, planned_shutdown
+            FROM agent_sessions
+            WHERE session_id = $session_id;
+            """;
+        command.Parameters.AddWithValue("$session_id", sessionId.ToString("D"));
+        await using SqliteDataReader reader = await command.ExecuteReaderAsync();
+        if (!await reader.ReadAsync())
+        {
+            return null;
+        }
+
+        return new AgentSessionRecord(
+            reader.GetString(0),
+            DateTimeOffset.Parse(reader.GetString(1), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
+            reader.IsDBNull(2) ? null : DateTimeOffset.Parse(reader.GetString(2), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
+            reader.IsDBNull(3) ? null : DateTimeOffset.Parse(reader.GetString(3), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
+            reader.GetInt64(4) != 0);
+    }
+
     private static AgentWorker CreateWorker(
         RecordingLifecycleCoordinator coordinator,
         TimeSpan? cleanShutdownWriteTimeout = null,
@@ -347,8 +430,8 @@ public sealed class AgentHostSmokeTests
         private readonly AgentLifecycleState state = new(
             Guid.NewGuid(),
             DateTimeOffset.UtcNow,
-            DateTimeOffset.UtcNow,
-            TimeSpan.Zero,
+            ReadyAtUtc: null,
+            ReadinessElapsed: null,
             StoppedAtUtc: null,
             PlannedShutdown: false,
             PreviousSessionId: null,
@@ -382,12 +465,13 @@ public sealed class AgentHostSmokeTests
                 return Task.FromException<AgentLifecycleState>(MarkReadyException);
             }
 
-            CurrentState = state;
-            return Task.FromResult(state);
+            CurrentState = state with { ReadyAtUtc = state.StartedAtUtc, ReadinessElapsed = TimeSpan.Zero };
+            return Task.FromResult(CurrentState);
         }
 
         public async Task<AgentLifecycleState> StopAsync(CancellationToken cancellationToken)
         {
+            operations?.Add("lifecycle_stop");
             StopCalled = true;
             if (DelayStopUntilCancelled)
             {
@@ -395,7 +479,7 @@ public sealed class AgentHostSmokeTests
             }
 
             CleanShutdownRecorded = true;
-            CurrentState = state with { PlannedShutdown = true, StoppedAtUtc = DateTimeOffset.UtcNow };
+            CurrentState = CurrentState! with { PlannedShutdown = true, StoppedAtUtc = DateTimeOffset.UtcNow };
             return CurrentState;
         }
     }
@@ -403,6 +487,8 @@ public sealed class AgentHostSmokeTests
     private sealed class RecordingJournal(AgentJournalHealth health, List<string>? operations = null) : IAgentJournal
     {
         public TaskCompletionSource Initialized { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public List<AgentSessionRecord> Sessions { get; } = [];
 
         public AgentJournalHealth Health { get; private set; } = AgentJournalHealth.NotInitialized;
 
@@ -416,7 +502,17 @@ public sealed class AgentHostSmokeTests
 
         public Task<AgentJournalHealth> VerifyIntegrityAsync(CancellationToken cancellationToken) => Task.FromResult(Health);
 
-        public Task RecordSessionAsync(AgentSessionRecord session, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task RecordSessionAsync(AgentSessionRecord session, CancellationToken cancellationToken)
+        {
+            Sessions.Add(session);
+            operations?.Add(
+                session.PlannedShutdown
+                    ? "journal_session_stopped"
+                    : session.ReadyAtUtc is not null
+                        ? "journal_session_ready"
+                        : "journal_session_started");
+            return Task.CompletedTask;
+        }
 
         public Task AppendProbeSampleAsync(ProbeSampleWrite sample, CancellationToken cancellationToken) => throw new NotSupportedException();
 

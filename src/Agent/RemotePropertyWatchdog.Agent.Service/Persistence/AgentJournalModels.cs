@@ -21,7 +21,6 @@ public sealed record AgentJournalHealth(
 
 public sealed record AgentSessionRecord(
     string SessionId,
-    string AgentId,
     DateTimeOffset StartedAtUtc,
     DateTimeOffset? ReadyAtUtc = null,
     DateTimeOffset? EndedAtUtc = null,

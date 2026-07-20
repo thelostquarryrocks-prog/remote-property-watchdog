@@ -167,7 +167,7 @@ public sealed class SqliteAgentJournalTests
     }
 
     [Fact]
-    public async Task SessionConflictingIdentityAndMilestonesAreRejectedWithoutRewritingHistory()
+    public async Task SessionConflictingStartAndMilestonesAreRejectedWithoutRewritingHistory()
     {
         using TestDatabase database = new();
         using SqliteAgentJournal journal = CreateJournal(database.Path);
@@ -177,14 +177,14 @@ public sealed class SqliteAgentJournalTests
             plannedShutdown: true);
         await journal.RecordSessionAsync(stored, CancellationToken.None);
 
-        AgentSessionConflictException identity = await Assert.ThrowsAsync<AgentSessionConflictException>(
-            () => journal.RecordSessionAsync(stored with { AgentId = "agent-conflicting" }, CancellationToken.None));
+        AgentSessionConflictException start = await Assert.ThrowsAsync<AgentSessionConflictException>(
+            () => journal.RecordSessionAsync(stored with { StartedAtUtc = Now.AddSeconds(1) }, CancellationToken.None));
         AgentSessionConflictException ready = await Assert.ThrowsAsync<AgentSessionConflictException>(
             () => journal.RecordSessionAsync(stored with { ReadyAtUtc = Now.AddSeconds(30) }, CancellationToken.None));
         AgentSessionConflictException ended = await Assert.ThrowsAsync<AgentSessionConflictException>(
             () => journal.RecordSessionAsync(stored with { EndedAtUtc = Now.AddMinutes(3) }, CancellationToken.None));
 
-        Assert.Equal("immutable_identity_conflict", identity.ReasonCode);
+        Assert.Equal("immutable_start_conflict", start.ReasonCode);
         Assert.Equal("ready_timestamp_conflict", ready.ReasonCode);
         Assert.Equal("ended_timestamp_conflict", ended.ReasonCode);
         Assert.Equal(stored, await ReadSessionAsync(database));
@@ -356,6 +356,156 @@ public sealed class SqliteAgentJournalTests
     }
 
     [Fact]
+    public async Task DeletedInitializedDatabaseDegradesWithoutRecreation()
+    {
+        using TestDatabase database = new();
+        using SqliteAgentJournal journal = CreateJournal(database.Path);
+        Assert.Equal(AgentJournalHealthState.Healthy, (await journal.InitializeAsync(CancellationToken.None)).State);
+        File.Delete(database.Path);
+
+        AgentJournalHealth health = await journal.VerifyIntegrityAsync(CancellationToken.None);
+
+        Assert.Equal(AgentJournalHealthState.Degraded, health.State);
+        Assert.Equal("database_missing", health.ReasonCode);
+        Assert.Equal("not_run", health.IntegrityResult);
+        Assert.False(File.Exists(database.Path));
+    }
+
+    [Fact]
+    public async Task OperationalAccessDoesNotRecreateDeletedInitializedDatabase()
+    {
+        using TestDatabase database = new();
+        using SqliteAgentJournal journal = CreateJournal(database.Path);
+        await journal.InitializeAsync(CancellationToken.None);
+        File.Delete(database.Path);
+
+        AgentJournalDegradedException error = await Assert.ThrowsAsync<AgentJournalDegradedException>(
+            () => journal.ReadPendingOutboxAsync("agent-synthetic", 1, CancellationToken.None));
+
+        Assert.Equal("database_missing", error.Health.ReasonCode);
+        Assert.Equal(AgentJournalHealthState.Degraded, journal.Health.State);
+        Assert.False(File.Exists(database.Path));
+    }
+
+    [Fact]
+    public async Task EmptyReplacementDatabaseDegradesWithoutMigration()
+    {
+        using TestDatabase database = new();
+        using SqliteAgentJournal journal = CreateJournal(database.Path);
+        await journal.InitializeAsync(CancellationToken.None);
+        File.Delete(database.Path);
+        await using (SqliteConnection replacement = await database.OpenAsync())
+        {
+            Assert.Equal("ok", await ScalarStringAsync(replacement, "PRAGMA integrity_check;"));
+        }
+
+        AgentJournalHealth health = await journal.VerifyIntegrityAsync(CancellationToken.None);
+
+        Assert.Equal(AgentJournalHealthState.Degraded, health.State);
+        Assert.Equal("schema_validation_failed", health.ReasonCode);
+        Assert.Equal("ok", health.IntegrityResult);
+        await using SqliteConnection preserved = await database.OpenAsync();
+        Assert.Equal(0L, await ScalarInt64Async(preserved, "PRAGMA user_version;"));
+        Assert.Empty(await NamesAsync(preserved, "table"));
+    }
+
+    [Fact]
+    public async Task DroppedRequiredTableDegradesEvenWhenIntegrityCheckIsOk()
+    {
+        using TestDatabase database = new();
+        using SqliteAgentJournal journal = CreateJournal(database.Path);
+        await journal.InitializeAsync(CancellationToken.None);
+        await using (SqliteConnection connection = await database.OpenAsync())
+        {
+            await ExecuteAsync(connection, "DROP TABLE probe_samples;");
+            Assert.Equal("ok", await ScalarStringAsync(connection, "PRAGMA integrity_check;"));
+        }
+
+        AgentJournalHealth health = await journal.VerifyIntegrityAsync(CancellationToken.None);
+
+        Assert.Equal(AgentJournalHealthState.Degraded, health.State);
+        Assert.Equal("schema_validation_failed", health.ReasonCode);
+        Assert.Equal("ok", health.IntegrityResult);
+    }
+
+    [Fact]
+    public async Task MissingRequiredIndexDegradesEvenWhenIntegrityCheckIsOk()
+    {
+        using TestDatabase database = new();
+        using SqliteAgentJournal journal = CreateJournal(database.Path);
+        await journal.InitializeAsync(CancellationToken.None);
+        await using (SqliteConnection connection = await database.OpenAsync())
+        {
+            await ExecuteAsync(connection, "DROP INDEX idx_outbox_agent_sequence;");
+            Assert.Equal("ok", await ScalarStringAsync(connection, "PRAGMA integrity_check;"));
+        }
+
+        AgentJournalHealth health = await journal.VerifyIntegrityAsync(CancellationToken.None);
+
+        Assert.Equal(AgentJournalHealthState.Degraded, health.State);
+        Assert.Equal("schema_validation_failed", health.ReasonCode);
+        Assert.Equal("ok", health.IntegrityResult);
+    }
+
+    [Fact]
+    public async Task MissingMigrationRecordDegradesEvenWhenIntegrityCheckIsOk()
+    {
+        using TestDatabase database = new();
+        using SqliteAgentJournal journal = CreateJournal(database.Path);
+        await journal.InitializeAsync(CancellationToken.None);
+        await using (SqliteConnection connection = await database.OpenAsync())
+        {
+            await ExecuteAsync(connection, "DELETE FROM schema_migrations WHERE version = 1;");
+            Assert.Equal("ok", await ScalarStringAsync(connection, "PRAGMA integrity_check;"));
+        }
+
+        AgentJournalHealth health = await journal.VerifyIntegrityAsync(CancellationToken.None);
+
+        Assert.Equal(AgentJournalHealthState.Degraded, health.State);
+        Assert.Equal("schema_validation_failed", health.ReasonCode);
+        Assert.Equal("ok", health.IntegrityResult);
+    }
+
+    [Fact]
+    public async Task FirstProbeAndMaterialEventReferencePreRegistrationLocalSession()
+    {
+        using TestDatabase database = new();
+        using SqliteAgentJournal journal = CreateJournal(database.Path);
+        await journal.RecordSessionAsync(Session(), CancellationToken.None);
+
+        await journal.AppendProbeSampleAsync(
+            new ProbeSampleWrite(
+                "sample-first",
+                "agent-contract-synthetic",
+                "session-synthetic",
+                Now,
+                "tcp",
+                "reachable",
+                "target-synthetic",
+                ["probe_succeeded"]),
+            CancellationToken.None);
+        MaterialEventCommit committed = await journal.AppendMaterialEventAsync(
+            Event("event-first") with { AgentId = "agent-contract-synthetic" },
+            CancellationToken.None);
+
+        Assert.Equal(1, committed.AgentSequence);
+        await using SqliteConnection connection = await database.OpenAsync();
+        Assert.Equal(1L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM probe_samples WHERE session_id = 'session-synthetic';"));
+        Assert.Equal(1L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM material_events WHERE session_id = 'session-synthetic';"));
+        Assert.Equal(0L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM pragma_foreign_key_check;"));
+        Assert.Equal(
+            1L,
+            await ScalarInt64Async(
+                connection,
+                "SELECT COUNT(*) FROM pragma_foreign_key_list('probe_samples') WHERE [table] = 'agent_sessions' AND [from] = 'session_id' AND [to] = 'session_id';"));
+        Assert.Equal(
+            1L,
+            await ScalarInt64Async(
+                connection,
+                "SELECT COUNT(*) FROM pragma_foreign_key_list('material_events') WHERE [table] = 'agent_sessions' AND [from] = 'session_id' AND [to] = 'session_id';"));
+    }
+
+    [Fact]
     public async Task SecretBearingInputIsRejectedAndAbsentFromDatabaseArtifacts()
     {
         using TestDatabase database = new();
@@ -401,14 +551,14 @@ public sealed class SqliteAgentJournalTests
 
     private static async Task AddSessionAsync(SqliteAgentJournal journal) =>
         await journal.RecordSessionAsync(
-            new AgentSessionRecord("session-synthetic", "agent-synthetic", Now),
+            new AgentSessionRecord("session-synthetic", Now),
             CancellationToken.None);
 
     private static AgentSessionRecord Session(
         DateTimeOffset? readyAtUtc = null,
         DateTimeOffset? endedAtUtc = null,
         bool plannedShutdown = false) =>
-        new("session-synthetic", "agent-synthetic", Now, readyAtUtc, endedAtUtc, plannedShutdown);
+        new("session-synthetic", Now, readyAtUtc, endedAtUtc, plannedShutdown);
 
     private static MaterialEventWrite Event(string eventId) =>
         new(
@@ -438,7 +588,7 @@ public sealed class SqliteAgentJournalTests
         await using SqliteConnection connection = await database.OpenAsync();
         await using SqliteCommand command = connection.CreateCommand();
         command.CommandText = """
-            SELECT session_id, agent_id, started_at_utc, ready_at_utc, ended_at_utc, planned_shutdown
+            SELECT session_id, started_at_utc, ready_at_utc, ended_at_utc, planned_shutdown
             FROM agent_sessions
             WHERE session_id = 'session-synthetic';
             """;
@@ -446,11 +596,10 @@ public sealed class SqliteAgentJournalTests
         Assert.True(await reader.ReadAsync());
         return new AgentSessionRecord(
             reader.GetString(0),
-            reader.GetString(1),
-            DateTimeOffset.Parse(reader.GetString(2), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
+            DateTimeOffset.Parse(reader.GetString(1), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
+            reader.IsDBNull(2) ? null : DateTimeOffset.Parse(reader.GetString(2), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
             reader.IsDBNull(3) ? null : DateTimeOffset.Parse(reader.GetString(3), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
-            reader.IsDBNull(4) ? null : DateTimeOffset.Parse(reader.GetString(4), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
-            reader.GetInt64(5) != 0);
+            reader.GetInt64(4) != 0);
     }
 
     private static async Task<IReadOnlyList<string>> NamesAsync(SqliteConnection connection, string type)
