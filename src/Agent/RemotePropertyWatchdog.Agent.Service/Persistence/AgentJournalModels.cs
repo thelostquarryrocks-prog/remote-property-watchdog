@@ -74,6 +74,12 @@ public sealed class AgentJournalDegradedException(AgentJournalHealth health)
     public AgentJournalHealth Health { get; } = health;
 }
 
+public sealed class AgentSessionConflictException(string reasonCode)
+    : InvalidOperationException($"Agent session evidence conflicts with stored history ({reasonCode}).")
+{
+    public string ReasonCode { get; } = reasonCode;
+}
+
 public sealed class UnsupportedAgentJournalSchemaException(int actualVersion, int supportedVersion)
     : InvalidOperationException($"Agent journal schema version {actualVersion} is newer than supported version {supportedVersion}.")
 {

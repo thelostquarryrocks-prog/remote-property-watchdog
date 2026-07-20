@@ -54,6 +54,34 @@ public sealed class SqliteAgentJournalTests
     }
 
     [Fact]
+    public async Task ConcurrentFreshInitializationAppliesMigrationExactlyOnce()
+    {
+        using TestDatabase database = new();
+        using SqliteAgentJournal first = CreateJournal(database.Path);
+        using SqliteAgentJournal second = CreateJournal(database.Path);
+        TaskCompletionSource start = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task<AgentJournalHealth>[] initializations = new[] { first, second }
+            .Select(journal => Task.Run(async () =>
+            {
+                await start.Task;
+                return await journal.InitializeAsync(CancellationToken.None);
+            }))
+            .ToArray();
+        start.SetResult();
+
+        AgentJournalHealth[] results = await Task.WhenAll(initializations);
+
+        Assert.All(results, result =>
+        {
+            Assert.Equal(AgentJournalHealthState.Healthy, result.State);
+            Assert.Equal(SqliteJournalSchema.CurrentVersion, result.SchemaVersion);
+        });
+        await using SqliteConnection connection = await database.OpenAsync();
+        Assert.Equal(1L, await ScalarInt64Async(connection, "PRAGMA user_version;"));
+        Assert.Equal(1L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM schema_migrations WHERE version = 1;"));
+    }
+
+    [Fact]
     public async Task VersionZeroDatabaseUpgradesAndFutureVersionIsNotModified()
     {
         using TestDatabase versionZero = new();
@@ -100,6 +128,84 @@ public sealed class SqliteAgentJournalTests
         MaterialEventDto payload = Assert.IsType<MaterialEventDto>(ContractJson.Deserialize<MaterialEventDto>(item.PayloadJson));
         Assert.Equal(commit.AgentSequence, payload.EventSequence);
         Assert.Equal(commit.EventId, payload.MessageId);
+    }
+
+    [Fact]
+    public async Task SessionExactAndStaleRetriesCannotRegressStoredMilestones()
+    {
+        using TestDatabase database = new();
+        using SqliteAgentJournal journal = CreateJournal(database.Path);
+        AgentSessionRecord completed = Session(
+            readyAtUtc: Now.AddMinutes(1),
+            endedAtUtc: Now.AddMinutes(2),
+            plannedShutdown: true);
+        await journal.RecordSessionAsync(completed, CancellationToken.None);
+
+        await journal.RecordSessionAsync(completed, CancellationToken.None);
+        await journal.RecordSessionAsync(Session(), CancellationToken.None);
+
+        Assert.Equal(completed, await ReadSessionAsync(database));
+        await using SqliteConnection connection = await database.OpenAsync();
+        Assert.Equal(1L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM agent_sessions;"));
+    }
+
+    [Fact]
+    public async Task SessionMilestonesProgressForwardMonotonically()
+    {
+        using TestDatabase database = new();
+        using SqliteAgentJournal journal = CreateJournal(database.Path);
+        await journal.RecordSessionAsync(Session(), CancellationToken.None);
+        await journal.RecordSessionAsync(Session(readyAtUtc: Now.AddMinutes(1)), CancellationToken.None);
+        AgentSessionRecord completed = Session(
+            readyAtUtc: Now.AddMinutes(1),
+            endedAtUtc: Now.AddMinutes(2),
+            plannedShutdown: true);
+
+        await journal.RecordSessionAsync(completed, CancellationToken.None);
+
+        Assert.Equal(completed, await ReadSessionAsync(database));
+    }
+
+    [Fact]
+    public async Task SessionConflictingIdentityAndMilestonesAreRejectedWithoutRewritingHistory()
+    {
+        using TestDatabase database = new();
+        using SqliteAgentJournal journal = CreateJournal(database.Path);
+        AgentSessionRecord stored = Session(
+            readyAtUtc: Now.AddMinutes(1),
+            endedAtUtc: Now.AddMinutes(2),
+            plannedShutdown: true);
+        await journal.RecordSessionAsync(stored, CancellationToken.None);
+
+        AgentSessionConflictException identity = await Assert.ThrowsAsync<AgentSessionConflictException>(
+            () => journal.RecordSessionAsync(stored with { AgentId = "agent-conflicting" }, CancellationToken.None));
+        AgentSessionConflictException ready = await Assert.ThrowsAsync<AgentSessionConflictException>(
+            () => journal.RecordSessionAsync(stored with { ReadyAtUtc = Now.AddSeconds(30) }, CancellationToken.None));
+        AgentSessionConflictException ended = await Assert.ThrowsAsync<AgentSessionConflictException>(
+            () => journal.RecordSessionAsync(stored with { EndedAtUtc = Now.AddMinutes(3) }, CancellationToken.None));
+
+        Assert.Equal("immutable_identity_conflict", identity.ReasonCode);
+        Assert.Equal("ready_timestamp_conflict", ready.ReasonCode);
+        Assert.Equal("ended_timestamp_conflict", ended.ReasonCode);
+        Assert.Equal(stored, await ReadSessionAsync(database));
+    }
+
+    [Fact]
+    public async Task SessionInvalidChronologyIsRejectedBeforePersistence()
+    {
+        using TestDatabase database = new();
+        using SqliteAgentJournal journal = CreateJournal(database.Path);
+
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => journal.RecordSessionAsync(Session(readyAtUtc: Now.AddSeconds(-1)), CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => journal.RecordSessionAsync(Session(endedAtUtc: Now.AddSeconds(-1)), CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => journal.RecordSessionAsync(
+                Session(readyAtUtc: Now.AddMinutes(2), endedAtUtc: Now.AddMinutes(1)),
+                CancellationToken.None));
+
+        Assert.False(File.Exists(database.Path));
     }
 
     [Fact]
@@ -298,6 +404,12 @@ public sealed class SqliteAgentJournalTests
             new AgentSessionRecord("session-synthetic", "agent-synthetic", Now),
             CancellationToken.None);
 
+    private static AgentSessionRecord Session(
+        DateTimeOffset? readyAtUtc = null,
+        DateTimeOffset? endedAtUtc = null,
+        bool plannedShutdown = false) =>
+        new("session-synthetic", "agent-synthetic", Now, readyAtUtc, endedAtUtc, plannedShutdown);
+
     private static MaterialEventWrite Event(string eventId) =>
         new(
             eventId,
@@ -319,6 +431,26 @@ public sealed class SqliteAgentJournalTests
         await using SqliteConnection connection = await database.OpenAsync();
         Assert.Equal(materialEvents, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM material_events;"));
         Assert.Equal(outbox, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM outbox;"));
+    }
+
+    private static async Task<AgentSessionRecord> ReadSessionAsync(TestDatabase database)
+    {
+        await using SqliteConnection connection = await database.OpenAsync();
+        await using SqliteCommand command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT session_id, agent_id, started_at_utc, ready_at_utc, ended_at_utc, planned_shutdown
+            FROM agent_sessions
+            WHERE session_id = 'session-synthetic';
+            """;
+        await using SqliteDataReader reader = await command.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        return new AgentSessionRecord(
+            reader.GetString(0),
+            reader.GetString(1),
+            DateTimeOffset.Parse(reader.GetString(2), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
+            reader.IsDBNull(3) ? null : DateTimeOffset.Parse(reader.GetString(3), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
+            reader.IsDBNull(4) ? null : DateTimeOffset.Parse(reader.GetString(4), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind),
+            reader.GetInt64(5) != 0);
     }
 
     private static async Task<IReadOnlyList<string>> NamesAsync(SqliteConnection connection, string type)

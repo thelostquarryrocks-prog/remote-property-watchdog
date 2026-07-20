@@ -4,6 +4,7 @@ namespace RemotePropertyWatchdog.Agent.Service;
 
 public sealed partial class AgentWorker(
     IAgentLifecycleCoordinator lifecycleCoordinator,
+    IAgentJournal agentJournal,
     IOptions<AgentLifecycleOptions> options,
     ILogger<AgentWorker> logger) : BackgroundService
 {
@@ -15,6 +16,14 @@ public sealed partial class AgentWorker(
         {
             AgentLifecycleState started = await lifecycleCoordinator.StartAsync(stoppingToken);
             LogAgentHostStarted(logger, started.SessionId, started.StartedAtUtc, started.PreviousSessionId, started.PreviousSessionEndedCleanly);
+
+            AgentJournalHealth journalHealth = await agentJournal.InitializeAsync(stoppingToken);
+            if (journalHealth.State != AgentJournalHealthState.Healthy)
+            {
+                LogAgentJournalDegraded(logger, journalHealth.ReasonCode, journalHealth.SchemaVersion, journalHealth.IntegrityResult);
+                await Task.Delay(Timeout.InfiniteTimeSpan, stoppingToken);
+                return;
+            }
 
             AgentLifecycleState ready = await lifecycleCoordinator.MarkReadyAsync(stoppingToken);
             LogAgentHostReady(logger, ready.SessionId, ready.ReadyAtUtc!.Value, ready.ReadinessElapsed!.Value.TotalMilliseconds, options.Value.ReadinessTimeout.TotalSeconds);
@@ -80,4 +89,7 @@ public sealed partial class AgentWorker(
 
     [LoggerMessage(EventId = 7, Level = LogLevel.Debug, Message = "Remote Property Watchdog agent host execution canceled by host. SessionId={SessionId}")]
     private static partial void LogAgentHostCancellation(ILogger logger, Guid? sessionId);
+
+    [LoggerMessage(EventId = 8, Level = LogLevel.Error, Message = "Agent journal is degraded; monitoring-ready is blocked. ReasonCode={ReasonCode} SchemaVersion={SchemaVersion} IntegrityResult={IntegrityResult}")]
+    private static partial void LogAgentJournalDegraded(ILogger logger, string reasonCode, int? schemaVersion, string integrityResult);
 }

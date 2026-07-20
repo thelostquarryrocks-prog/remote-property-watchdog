@@ -59,17 +59,7 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
             try
             {
                 await using SqliteConnection connection = await OpenConnectionAsync(includeJournalMode: true, cancellationToken);
-                int schemaVersion = await ReadSchemaVersionAsync(connection, cancellationToken);
-                if (schemaVersion > SqliteJournalSchema.CurrentVersion)
-                {
-                    throw new UnsupportedAgentJournalSchemaException(schemaVersion, SqliteJournalSchema.CurrentVersion);
-                }
-
-                if (schemaVersion == 0)
-                {
-                    await ApplyVersion1MigrationAsync(connection, cancellationToken);
-                    schemaVersion = SqliteJournalSchema.CurrentVersion;
-                }
+                int schemaVersion = await MigrateToCurrentVersionAsync(connection, cancellationToken);
 
                 bool schemaIsValid = await ValidateSchemaAsync(connection, cancellationToken);
                 if (!schemaIsValid)
@@ -145,30 +135,23 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
         ValidateSession(session);
         await EnsureHealthyAsync(cancellationToken);
         await using SqliteConnection connection = await OpenConnectionAsync(includeJournalMode: false, cancellationToken);
-        await using SqliteCommand command = connection.CreateCommand();
-        command.CommandText = """
-            INSERT INTO agent_sessions (
-                session_id, agent_id, started_at_utc, ready_at_utc, ended_at_utc, planned_shutdown)
-            VALUES (
-                $session_id, $agent_id, $started_at_utc, $ready_at_utc, $ended_at_utc, $planned_shutdown)
-            ON CONFLICT(session_id) DO UPDATE SET
-                ready_at_utc = excluded.ready_at_utc,
-                ended_at_utc = excluded.ended_at_utc,
-                planned_shutdown = excluded.planned_shutdown
-            WHERE agent_sessions.agent_id = excluded.agent_id
-              AND agent_sessions.started_at_utc = excluded.started_at_utc;
-            """;
-        command.Parameters.AddWithValue("$session_id", session.SessionId);
-        command.Parameters.AddWithValue("$agent_id", session.AgentId);
-        command.Parameters.AddWithValue("$started_at_utc", ToUtcText(session.StartedAtUtc));
-        command.Parameters.AddWithValue("$ready_at_utc", DbValue(session.ReadyAtUtc));
-        command.Parameters.AddWithValue("$ended_at_utc", DbValue(session.EndedAtUtc));
-        command.Parameters.AddWithValue("$planned_shutdown", session.PlannedShutdown ? 1 : 0);
-        int affected = await command.ExecuteNonQueryAsync(cancellationToken);
-        if (affected != 1)
+        cancellationToken.ThrowIfCancellationRequested();
+        await using SqliteTransaction transaction = connection.BeginTransaction(deferred: false);
+        AgentSessionRecord? stored = await ReadSessionAsync(connection, transaction, session.SessionId, cancellationToken);
+        if (stored is null)
         {
-            throw new InvalidOperationException("Session ID is already associated with different immutable session data.");
+            await InsertSessionAsync(connection, transaction, session, cancellationToken);
         }
+        else
+        {
+            AgentSessionRecord merged = MergeSession(stored, session);
+            if (merged != stored)
+            {
+                await UpdateSessionAsync(connection, transaction, merged, cancellationToken);
+            }
+        }
+
+        await transaction.CommitAsync(cancellationToken);
     }
 
     public async Task AppendProbeSampleAsync(ProbeSampleWrite sample, CancellationToken cancellationToken)
@@ -327,35 +310,51 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
         }
     }
 
-    private async Task ApplyVersion1MigrationAsync(SqliteConnection connection, CancellationToken cancellationToken)
+    private async Task<int> MigrateToCurrentVersionAsync(SqliteConnection connection, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         await using SqliteTransaction transaction = connection.BeginTransaction(deferred: false);
-        await using (SqliteCommand schemaCommand = connection.CreateCommand())
+        int schemaVersion = await ReadSchemaVersionAsync(connection, transaction, cancellationToken);
+        if (schemaVersion > SqliteJournalSchema.CurrentVersion)
         {
-            schemaCommand.Transaction = transaction;
-            schemaCommand.CommandText = SqliteJournalSchema.MigrationVersion1;
-            await schemaCommand.ExecuteNonQueryAsync(cancellationToken);
+            throw new UnsupportedAgentJournalSchemaException(schemaVersion, SqliteJournalSchema.CurrentVersion);
         }
 
-        await using (SqliteCommand recordCommand = connection.CreateCommand())
+        if (schemaVersion == 0)
         {
-            recordCommand.Transaction = transaction;
-            recordCommand.CommandText = """
-                INSERT INTO schema_migrations(version, name, applied_at_utc)
-                VALUES (1, 'R0-004-initial-journal-outbox', $applied_at_utc);
-                PRAGMA user_version = 1;
-                """;
-            recordCommand.Parameters.AddWithValue("$applied_at_utc", ToUtcText(timeProvider.GetUtcNow()));
-            await recordCommand.ExecuteNonQueryAsync(cancellationToken);
+            await using (SqliteCommand schemaCommand = connection.CreateCommand())
+            {
+                schemaCommand.Transaction = transaction;
+                schemaCommand.CommandText = SqliteJournalSchema.MigrationVersion1;
+                await schemaCommand.ExecuteNonQueryAsync(cancellationToken);
+            }
+
+            await using (SqliteCommand recordCommand = connection.CreateCommand())
+            {
+                recordCommand.Transaction = transaction;
+                recordCommand.CommandText = """
+                    INSERT INTO schema_migrations(version, name, applied_at_utc)
+                    VALUES (1, 'R0-004-initial-journal-outbox', $applied_at_utc);
+                    PRAGMA user_version = 1;
+                    """;
+                recordCommand.Parameters.AddWithValue("$applied_at_utc", ToUtcText(timeProvider.GetUtcNow()));
+                await recordCommand.ExecuteNonQueryAsync(cancellationToken);
+            }
+
+            schemaVersion = SqliteJournalSchema.CurrentVersion;
         }
 
         await transaction.CommitAsync(cancellationToken);
+        return schemaVersion;
     }
 
-    private static async Task<int> ReadSchemaVersionAsync(SqliteConnection connection, CancellationToken cancellationToken)
+    private static async Task<int> ReadSchemaVersionAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        CancellationToken cancellationToken)
     {
         await using SqliteCommand command = connection.CreateCommand();
+        command.Transaction = transaction;
         command.CommandText = "PRAGMA user_version;";
         object? result = await command.ExecuteScalarAsync(cancellationToken);
         return Convert.ToInt32(result, CultureInfo.InvariantCulture);
@@ -520,6 +519,115 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
         return degraded;
     }
 
+    private static async Task<AgentSessionRecord?> ReadSessionAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        string sessionId,
+        CancellationToken cancellationToken)
+    {
+        await using SqliteCommand command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT session_id, agent_id, started_at_utc, ready_at_utc, ended_at_utc, planned_shutdown
+            FROM agent_sessions
+            WHERE session_id = $session_id;
+            """;
+        command.Parameters.AddWithValue("$session_id", sessionId);
+        await using SqliteDataReader reader = await command.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken))
+        {
+            return null;
+        }
+
+        return new AgentSessionRecord(
+            reader.GetString(0),
+            reader.GetString(1),
+            ParseUtcText(reader.GetString(2)),
+            reader.IsDBNull(3) ? null : ParseUtcText(reader.GetString(3)),
+            reader.IsDBNull(4) ? null : ParseUtcText(reader.GetString(4)),
+            reader.GetInt64(5) != 0);
+    }
+
+    private static async Task InsertSessionAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        AgentSessionRecord session,
+        CancellationToken cancellationToken)
+    {
+        await using SqliteCommand command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            INSERT INTO agent_sessions (
+                session_id, agent_id, started_at_utc, ready_at_utc, ended_at_utc, planned_shutdown)
+            VALUES (
+                $session_id, $agent_id, $started_at_utc, $ready_at_utc, $ended_at_utc, $planned_shutdown);
+            """;
+        AddSessionParameters(command, session);
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static async Task UpdateSessionAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        AgentSessionRecord session,
+        CancellationToken cancellationToken)
+    {
+        await using SqliteCommand command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            UPDATE agent_sessions
+            SET ready_at_utc = $ready_at_utc,
+                ended_at_utc = $ended_at_utc,
+                planned_shutdown = $planned_shutdown
+            WHERE session_id = $session_id
+              AND agent_id = $agent_id
+              AND started_at_utc = $started_at_utc;
+            """;
+        AddSessionParameters(command, session);
+        int affected = await command.ExecuteNonQueryAsync(cancellationToken);
+        if (affected != 1)
+        {
+            throw new AgentSessionConflictException("immutable_identity_conflict");
+        }
+    }
+
+    private static void AddSessionParameters(SqliteCommand command, AgentSessionRecord session)
+    {
+        command.Parameters.AddWithValue("$session_id", session.SessionId);
+        command.Parameters.AddWithValue("$agent_id", session.AgentId);
+        command.Parameters.AddWithValue("$started_at_utc", ToUtcText(session.StartedAtUtc));
+        command.Parameters.AddWithValue("$ready_at_utc", DbValue(session.ReadyAtUtc));
+        command.Parameters.AddWithValue("$ended_at_utc", DbValue(session.EndedAtUtc));
+        command.Parameters.AddWithValue("$planned_shutdown", session.PlannedShutdown ? 1 : 0);
+    }
+
+    private static AgentSessionRecord MergeSession(AgentSessionRecord stored, AgentSessionRecord incoming)
+    {
+        if (!StringComparer.Ordinal.Equals(stored.AgentId, incoming.AgentId) || stored.StartedAtUtc != incoming.StartedAtUtc)
+        {
+            throw new AgentSessionConflictException("immutable_identity_conflict");
+        }
+
+        AgentSessionRecord merged = stored with
+        {
+            ReadyAtUtc = MergeMilestone(stored.ReadyAtUtc, incoming.ReadyAtUtc, "ready_timestamp_conflict"),
+            EndedAtUtc = MergeMilestone(stored.EndedAtUtc, incoming.EndedAtUtc, "ended_timestamp_conflict"),
+            PlannedShutdown = stored.PlannedShutdown || incoming.PlannedShutdown
+        };
+        ValidateSessionChronology(merged);
+        return merged;
+    }
+
+    private static DateTimeOffset? MergeMilestone(DateTimeOffset? stored, DateTimeOffset? incoming, string conflictReason)
+    {
+        if (stored.HasValue && incoming.HasValue && stored.Value != incoming.Value)
+        {
+            throw new AgentSessionConflictException(conflictReason);
+        }
+
+        return stored ?? incoming;
+    }
+
     private static void ValidateSession(AgentSessionRecord session)
     {
         ValidateIdentifier(nameof(session.SessionId), session.SessionId);
@@ -528,6 +636,25 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
         ValidateOptionalUtc(nameof(session.ReadyAtUtc), session.ReadyAtUtc);
         ValidateOptionalUtc(nameof(session.EndedAtUtc), session.EndedAtUtc);
         RejectSecrets([session.SessionId, session.AgentId]);
+        ValidateSessionChronology(session);
+    }
+
+    private static void ValidateSessionChronology(AgentSessionRecord session)
+    {
+        if (session.ReadyAtUtc < session.StartedAtUtc)
+        {
+            throw new ArgumentException("Session readiness cannot precede session start.", nameof(session));
+        }
+
+        if (session.EndedAtUtc < session.StartedAtUtc)
+        {
+            throw new ArgumentException("Session end cannot precede session start.", nameof(session));
+        }
+
+        if (session.ReadyAtUtc.HasValue && session.EndedAtUtc < session.ReadyAtUtc)
+        {
+            throw new ArgumentException("Session end cannot precede session readiness.", nameof(session));
+        }
     }
 
     private static void ValidateProbeSample(ProbeSampleWrite sample)
@@ -630,6 +757,9 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
 
     private static string ToUtcText(DateTimeOffset value) =>
         value.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture);
+
+    private static DateTimeOffset ParseUtcText(string value) =>
+        DateTimeOffset.Parse(value, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind);
 
     private static object DbValue(string? value) => value is null ? DBNull.Value : value;
 
