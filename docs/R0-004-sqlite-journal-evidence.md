@@ -19,12 +19,12 @@ The configured database path must be absolute. The default is `RemotePropertyWat
 - Version 0 is adopted only when the file has no application-defined tables, indexes, views, or triggers. That ownership check and the version 0-to-1 migration share one immediate transaction, so an unrelated SQLite file is preserved at the schema/data level and enters `database_not_owned` without a migration or WAL mode change. A genuinely empty version 0 journal upgrades to version 1, and concurrent journal instances either apply the migration once or observe the already-supported version.
 - `InitializeAsync` requires an `AgentJournalInitializationMode`. Only `CreateIfMissingForFreshLifecycle` may create the database and parent directory, preserving a genuine first lifecycle start by opening a missing path with `ReadWriteCreate`.
 - `RequireExistingForPriorLifecycle` checks for the existing journal before opening it. A missing journal becomes degraded with `database_missing` and `integrity_result=not_run`; no connection is opened, no migration runs, and the database, WAL, and SHM remain absent.
-- An existing journal opens with `ReadWrite` in either startup mode, applies a supported migration when needed, validates schema and migration inventory, and runs integrity checking normally.
+- An existing journal opens with `ReadWrite` in either startup mode, applies a supported migration when needed, validates the exact schema-v1 definitions and migration inventory, and runs integrity checking normally.
 - Verification and all operational journal access require prior successful initialization and open only with `ReadWrite`. An uninitialized call fails with `not_initialized`; a journal deleted after initialization fails with `database_missing`. Neither case creates a database or parent directory, and no runtime path runs migrations.
-- Explicit runtime verification never runs migrations. A deleted database becomes `database_missing`; a valid empty replacement, missing inventory, wrong runtime schema version, or missing migration record becomes `schema_validation_failed` and is preserved for diagnosis.
+- Explicit runtime verification never runs migrations. A deleted database becomes `database_missing`; a valid empty replacement, missing or unexpected inventory, wrong runtime schema version, altered object definitions, or incorrect/additional migration evidence becomes `schema_validation_failed` and is preserved for diagnosis.
 - Repeated initialization validates the same schema and never reapplies the migration.
 - A version greater than 1 enters `schema_too_new` degraded state without schema or file replacement.
-- Missing required tables, indexes, or the migration record enter `schema_validation_failed` degraded state.
+- Missing or unexpected application objects, altered table/index definitions, or incorrect/additional migration records enter `schema_validation_failed` degraded state.
 - No migration deletes, renames, or rewrites existing evidence.
 
 ## Table and key inventory
@@ -73,7 +73,9 @@ A pre-commit exception rolls back the sequence, event, and outbox together. A po
 
 Every connection enables foreign keys, uses a bounded busy timeout, and sets `PRAGMA synchronous=FULL`. Initialization enables and verifies WAL only after ownership/migration, schema validation, and integrity checks succeed. The migration, session, and event/outbox writes use explicit immediate transactions where monotonic merge or atomic allocation requires them. Database pooling is disabled so test/process boundaries do not retain hidden handles.
 
-Initialization and explicit verification run `PRAGMA integrity_check`. Runtime verification opens only the existing file, requires the exact schema version, table/index inventory, and migration record, and requires exactly one integrity row equal to:
+Initialization and explicit verification use the same definition-level validator and run `PRAGMA integrity_check`. The validator creates an isolated in-memory reference schema directly from the exact `MigrationVersion1` SQL and shared migration identity, then compares it with the candidate. Structured `table_list`, `table_xinfo`, `foreign_key_list`, `index_list`, and `index_xinfo` metadata verifies exact application-object inventory; table column count/order, names, declared types, nullability, defaults, primary-key ordering, hidden-column kind, STRICT and WITHOUT ROWID status; foreign-key source/target columns, referenced tables, match mode, and update/delete actions; and index membership/order, uniqueness, origin, partial status, sort direction, collation, and key-column status. A strict `sqlite_schema.sql` comparison, normalizing only whitespace outside quoted values/identifiers, additionally binds required CHECK constraints and complete DDL token/literal/constraint ordering to that same migration source. The migration inventory must contain exactly version 1 and `R0-004-initial-journal-outbox`, while `PRAGMA user_version` must be exactly 1.
+
+Runtime verification opens only the existing file and requires exactly one integrity row equal to:
 
 ```text
 ok
@@ -101,7 +103,8 @@ The automated test suite demonstrates:
 - deterministic duplicate-ID rejection without an outbox row or sequence gap;
 - stable outbox order and 20 coordinated concurrent writers with unique contiguous sequences;
 - visible degraded state for synthetic corrupt/truncated/non-database files without replacement;
-- healthy schema-plus-integrity verification, uninitialized missing verification/operations remaining non-creating, deleted-database preservation without recreation, empty-replacement preservation without migration, and detection of dropped tables, indexes, and migration records even when `integrity_check` returns `ok`;
+- healthy definition-level schema-plus-integrity verification, uninitialized missing verification/operations remaining non-creating, deleted-database preservation without recreation, empty-replacement preservation without migration, and detection of dropped tables, indexes, and migration records even when `integrity_check` returns `ok`;
+- initialization and explicit verification rejection of integrity-clean look-alike databases with altered columns/types/order/nullability/defaults/primary keys, missing STRICT, altered identifier/sequence/JSON/Boolean CHECK constraints, missing or redirected foreign keys and actions, wrong index columns/order/uniqueness/partial predicates/sort/collation, unexpected application objects, or incorrect/additional migration evidence; invalid startup candidates retain their definitions, data, version, and journal mode without repair or WAL conversion;
 - runtime session, probe, material-event/outbox, and pending-outbox-read storage failures entering bounded `runtime_write_failed` or `runtime_read_failed` degradation and blocking later operations, while cancellation, validation, duplicate/session conflicts, and synthetic pre/post-commit faults do not spuriously degrade health;
 - defense-in-depth rejection of known credential-like synthetic input and byte-level absence checks across database/WAL/SHM artifacts;
 - cancellation propagation.

@@ -12,6 +12,171 @@ public sealed class SqliteAgentJournalTests
 {
     private static readonly DateTimeOffset Now = new(2026, 7, 19, 12, 0, 0, TimeSpan.Zero);
 
+    public static TheoryData<string, string, string, string, string, string> SchemaTamperingCases { get; } =
+        new()
+        {
+            {
+                "missing_column",
+                "replace",
+                "table",
+                "agent_sessions",
+                "ready_at_utc TEXT NULL,",
+                ""
+            },
+            {
+                "incorrect_column",
+                "replace",
+                "table",
+                "agent_sessions",
+                "ready_at_utc TEXT NULL",
+                "ready_at_epoch INTEGER NULL"
+            },
+            {
+                "incorrect_nullability",
+                "replace",
+                "table",
+                "agent_sessions",
+                "ready_at_utc TEXT NULL",
+                "ready_at_utc TEXT NOT NULL"
+            },
+            {
+                "incorrect_default",
+                "replace",
+                "table",
+                "agent_sessions",
+                "DEFAULT 0 CHECK (planned_shutdown IN (0, 1))",
+                "DEFAULT 1 CHECK (planned_shutdown IN (0, 1))"
+            },
+            {
+                "incorrect_primary_key",
+                "replace",
+                "table",
+                "agent_sessions",
+                "session_id TEXT NOT NULL PRIMARY KEY",
+                "session_id TEXT NOT NULL UNIQUE"
+            },
+            {
+                "missing_strict",
+                "replace",
+                "table",
+                "agent_sessions",
+                ") STRICT",
+                ")"
+            },
+            {
+                "altered_identifier_bound",
+                "replace",
+                "table",
+                "agent_sessions",
+                "CHECK (length(session_id) BETWEEN 1 AND 128)",
+                "CHECK (length(session_id) BETWEEN 1 AND 129)"
+            },
+            {
+                "altered_nonnegative_sequence_check",
+                "replace",
+                "table",
+                "local_state",
+                "CHECK (last_event_sequence >= 0)",
+                "CHECK (last_event_sequence > 0)"
+            },
+            {
+                "altered_positive_sequence_check",
+                "replace",
+                "table",
+                "material_events",
+                "CHECK (agent_sequence > 0)",
+                "CHECK (agent_sequence >= 0)"
+            },
+            {
+                "altered_json_check",
+                "replace",
+                "table",
+                "outbox",
+                "CHECK (json_valid(payload_json))",
+                "CHECK (length(payload_json) > 0)"
+            },
+            {
+                "altered_boolean_check",
+                "replace",
+                "table",
+                "agent_sessions",
+                "CHECK (planned_shutdown IN (0, 1))",
+                "CHECK (planned_shutdown IN (0, 1, 2))"
+            },
+            {
+                "missing_foreign_key",
+                "replace",
+                "table",
+                "outbox",
+                "FOREIGN KEY (event_id) REFERENCES material_events(event_id) ON UPDATE RESTRICT ON DELETE RESTRICT",
+                "CHECK (event_id IS NOT NULL)"
+            },
+            {
+                "altered_foreign_key_target_and_actions",
+                "replace",
+                "table",
+                "probe_samples",
+                "REFERENCES agent_sessions(session_id) ON UPDATE RESTRICT ON DELETE RESTRICT",
+                "REFERENCES local_state(agent_id) ON UPDATE CASCADE ON DELETE CASCADE"
+            },
+            {
+                "wrong_index_columns",
+                "replace",
+                "index",
+                "idx_outbox_agent_sequence",
+                "ON outbox(agent_id, agent_sequence, outbox_id)",
+                "ON outbox(agent_sequence, agent_id, outbox_id)"
+            },
+            {
+                "wrong_index_uniqueness",
+                "replace",
+                "index",
+                "ux_outbox_event",
+                "CREATE UNIQUE INDEX ux_outbox_event",
+                "CREATE INDEX ux_outbox_event"
+            },
+            {
+                "unexpected_partial_index",
+                "replace",
+                "index",
+                "ux_outbox_event",
+                "ON outbox(event_id)",
+                "ON outbox(event_id) WHERE event_id <> ''"
+            },
+            {
+                "wrong_index_direction_and_collation",
+                "replace",
+                "index",
+                "idx_agent_sessions_started",
+                "ON agent_sessions(started_at_utc, session_id)",
+                "ON agent_sessions(started_at_utc COLLATE NOCASE DESC, session_id)"
+            },
+            {
+                "unexpected_application_objects",
+                "sql",
+                "",
+                "",
+                "",
+                "CREATE TABLE unexpected_evidence(value TEXT) STRICT; CREATE INDEX unexpected_evidence_index ON unexpected_evidence(value);"
+            },
+            {
+                "incorrect_migration_evidence",
+                "sql",
+                "",
+                "",
+                "",
+                "UPDATE schema_migrations SET name = 'unexpected-migration' WHERE version = 1;"
+            },
+            {
+                "additional_migration_evidence",
+                "sql",
+                "",
+                "",
+                "",
+                "INSERT INTO schema_migrations(version, name, applied_at_utc) VALUES (2, 'unexpected-migration', '2026-07-19T12:00:00.0000000+00:00');"
+            }
+        };
+
     [Fact]
     public async Task FreshDatabaseMigratesToExpectedSchemaAndCrashSafetySettings()
     {
@@ -616,6 +781,96 @@ public sealed class SqliteAgentJournalTests
         Assert.Equal("ok", health.IntegrityResult);
     }
 
+    [Theory]
+    [MemberData(nameof(SchemaTamperingCases))]
+    public async Task InitializationRejectsAndPreservesDefinitionLevelSchemaTampering(
+        string caseName,
+        string tamperingKind,
+        string objectType,
+        string objectName,
+        string originalFragment,
+        string replacement)
+    {
+        Assert.False(string.IsNullOrWhiteSpace(caseName));
+        using TestDatabase database = new();
+        await CreateValidDeleteModeDatabaseAsync(database);
+        await ApplySchemaTamperingAsync(
+            database,
+            tamperingKind,
+            objectType,
+            objectName,
+            originalFragment,
+            replacement);
+        string before = await ReadDiagnosticSignatureAsync(database);
+        Assert.Equal("ok", await ReadIntegrityResultAsync(database));
+
+        using SqliteAgentJournal journal = CreateJournal(database.Path);
+        AgentJournalHealth health = await InitializeExistingAsync(journal);
+
+        Assert.Equal(AgentJournalHealthState.Degraded, health.State);
+        Assert.Equal("schema_validation_failed", health.ReasonCode);
+        Assert.Equal("not_run", health.IntegrityResult);
+        Assert.Equal(before, await ReadDiagnosticSignatureAsync(database));
+        Assert.Equal("ok", await ReadIntegrityResultAsync(database));
+        Assert.False(File.Exists($"{database.Path}-wal"));
+        Assert.False(File.Exists($"{database.Path}-shm"));
+    }
+
+    [Theory]
+    [MemberData(nameof(SchemaTamperingCases))]
+    public async Task ExplicitVerificationRejectsAndPreservesDefinitionLevelSchemaTampering(
+        string caseName,
+        string tamperingKind,
+        string objectType,
+        string objectName,
+        string originalFragment,
+        string replacement)
+    {
+        Assert.False(string.IsNullOrWhiteSpace(caseName));
+        using TestDatabase database = new();
+        using SqliteAgentJournal journal = CreateJournal(database.Path);
+        Assert.Equal(AgentJournalHealthState.Healthy, (await InitializeFreshAsync(journal)).State);
+        await SetDeleteJournalModeAsync(database);
+        await ApplySchemaTamperingAsync(
+            database,
+            tamperingKind,
+            objectType,
+            objectName,
+            originalFragment,
+            replacement);
+        string before = await ReadDiagnosticSignatureAsync(database);
+        Assert.Equal("ok", await ReadIntegrityResultAsync(database));
+
+        AgentJournalHealth health = await journal.VerifyIntegrityAsync(CancellationToken.None);
+
+        Assert.Equal(AgentJournalHealthState.Degraded, health.State);
+        Assert.Equal("schema_validation_failed", health.ReasonCode);
+        Assert.Equal("ok", health.IntegrityResult);
+        Assert.Equal(before, await ReadDiagnosticSignatureAsync(database));
+        Assert.Equal("ok", await ReadIntegrityResultAsync(database));
+    }
+
+    [Fact]
+    public async Task IrrelevantSchemaWhitespaceDifferencesRemainValid()
+    {
+        using TestDatabase database = new();
+        await CreateValidDeleteModeDatabaseAsync(database);
+        await ApplySchemaTamperingAsync(
+            database,
+            "replace",
+            "table",
+            "agent_sessions",
+            "CREATE TABLE agent_sessions (",
+            "CREATE   TABLE   agent_sessions   (");
+
+        using SqliteAgentJournal journal = CreateJournal(database.Path);
+        AgentJournalHealth health = await InitializeExistingAsync(journal);
+
+        Assert.Equal(AgentJournalHealthState.Healthy, health.State);
+        await using SqliteConnection connection = await database.OpenAsync();
+        Assert.Equal("wal", await ScalarStringAsync(connection, "PRAGMA journal_mode;"));
+    }
+
     [Fact]
     public async Task FirstProbeAndMaterialEventReferencePreRegistrationLocalSession()
     {
@@ -776,6 +1031,110 @@ public sealed class SqliteAgentJournalTests
     {
         await using SqliteConnection connection = await database.OpenAsync();
         await ExecuteAsync(connection, sql);
+    }
+
+    private static async Task CreateValidDeleteModeDatabaseAsync(TestDatabase database)
+    {
+        using (SqliteAgentJournal journal = CreateJournal(database.Path))
+        {
+            Assert.Equal(AgentJournalHealthState.Healthy, (await InitializeFreshAsync(journal)).State);
+        }
+
+        await SetDeleteJournalModeAsync(database);
+        Assert.False(File.Exists($"{database.Path}-wal"));
+        Assert.False(File.Exists($"{database.Path}-shm"));
+    }
+
+    private static async Task SetDeleteJournalModeAsync(TestDatabase database)
+    {
+        await using SqliteConnection connection = await database.OpenAsync();
+        await ExecuteAsync(connection, "PRAGMA wal_checkpoint(TRUNCATE);");
+        Assert.Equal("delete", await ScalarStringAsync(connection, "PRAGMA journal_mode = DELETE;"));
+    }
+
+    private static async Task ApplySchemaTamperingAsync(
+        TestDatabase database,
+        string tamperingKind,
+        string objectType,
+        string objectName,
+        string originalFragment,
+        string replacement)
+    {
+        await using SqliteConnection connection = await database.OpenAsync();
+        if (StringComparer.Ordinal.Equals(tamperingKind, "sql"))
+        {
+            await ExecuteAsync(connection, replacement);
+            return;
+        }
+
+        Assert.Equal("replace", tamperingKind);
+        await ExecuteAsync(connection, "PRAGMA writable_schema = ON;");
+        try
+        {
+            await using SqliteCommand update = connection.CreateCommand();
+            update.CommandText = """
+                UPDATE sqlite_schema
+                SET sql = replace(sql, $original_fragment, $replacement)
+                WHERE type = $object_type
+                  AND name = $object_name
+                  AND instr(sql, $original_fragment) > 0;
+                """;
+            update.Parameters.AddWithValue("$original_fragment", originalFragment);
+            update.Parameters.AddWithValue("$replacement", replacement);
+            update.Parameters.AddWithValue("$object_type", objectType);
+            update.Parameters.AddWithValue("$object_name", objectName);
+            Assert.Equal(1, await update.ExecuteNonQueryAsync());
+        }
+        finally
+        {
+            await ExecuteAsync(connection, "PRAGMA writable_schema = OFF;");
+        }
+
+        long schemaVersion = await ScalarInt64Async(connection, "PRAGMA schema_version;");
+        await ExecuteAsync(connection, $"PRAGMA schema_version = {schemaVersion + 1};");
+    }
+
+    private static async Task<string> ReadIntegrityResultAsync(TestDatabase database)
+    {
+        await using SqliteConnection connection = await database.OpenAsync();
+        return await ScalarStringAsync(connection, "PRAGMA integrity_check;");
+    }
+
+    private static async Task<string> ReadDiagnosticSignatureAsync(TestDatabase database)
+    {
+        await using SqliteConnection connection = await database.OpenAsync();
+        List<string> parts =
+        [
+            $"user_version={await ScalarInt64Async(connection, "PRAGMA user_version;")}",
+            $"journal_mode={await ScalarStringAsync(connection, "PRAGMA journal_mode;")}"
+        ];
+
+        await using (SqliteCommand command = connection.CreateCommand())
+        {
+            command.CommandText = """
+                SELECT type, name, COALESCE(sql, '<null>')
+                FROM sqlite_schema
+                WHERE name NOT LIKE 'sqlite_%'
+                ORDER BY type, name;
+                """;
+            await using SqliteDataReader reader = await command.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                parts.Add($"object={reader.GetString(0)}|{reader.GetString(1)}|{reader.GetString(2)}");
+            }
+        }
+
+        await using (SqliteCommand command = connection.CreateCommand())
+        {
+            command.CommandText = "SELECT version, name, applied_at_utc FROM schema_migrations ORDER BY version, name;";
+            await using SqliteDataReader reader = await command.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                parts.Add($"migration={reader.GetInt64(0)}|{reader.GetString(1)}|{reader.GetString(2)}");
+            }
+        }
+
+        return string.Join("\u001f", parts);
     }
 
     private static async Task AssertCountsAsync(TestDatabase database, int materialEvents, int outbox)

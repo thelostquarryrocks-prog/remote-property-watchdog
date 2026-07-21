@@ -3,6 +3,7 @@ namespace RemotePropertyWatchdog.Agent.Service;
 public static class SqliteJournalSchema
 {
     public const int CurrentVersion = 1;
+    internal const string MigrationVersion1Name = "R0-004-initial-journal-outbox";
 
     public static IReadOnlyList<string> Tables { get; } =
     [

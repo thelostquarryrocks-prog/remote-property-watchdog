@@ -501,9 +501,10 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
                 recordCommand.Transaction = transaction;
                 recordCommand.CommandText = """
                     INSERT INTO schema_migrations(version, name, applied_at_utc)
-                    VALUES (1, 'R0-004-initial-journal-outbox', $applied_at_utc);
+                    VALUES (1, $migration_name, $applied_at_utc);
                     PRAGMA user_version = 1;
                     """;
+                recordCommand.Parameters.AddWithValue("$migration_name", SqliteJournalSchema.MigrationVersion1Name);
                 recordCommand.Parameters.AddWithValue("$applied_at_utc", ToUtcText(timeProvider.GetUtcNow()));
                 await recordCommand.ExecuteNonQueryAsync(cancellationToken);
             }
@@ -561,27 +562,7 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
 
     private static async Task<bool> ValidateSchemaAsync(SqliteConnection connection, CancellationToken cancellationToken)
     {
-        HashSet<string> tables = new(StringComparer.Ordinal);
-        HashSet<string> indexes = new(StringComparer.Ordinal);
-        await using (SqliteCommand command = connection.CreateCommand())
-        {
-            command.CommandText = "SELECT type, name FROM sqlite_schema WHERE type IN ('table', 'index') AND name NOT LIKE 'sqlite_%';";
-            await using SqliteDataReader reader = await command.ExecuteReaderAsync(cancellationToken);
-            while (await reader.ReadAsync(cancellationToken))
-            {
-                (reader.GetString(0) == "table" ? tables : indexes).Add(reader.GetString(1));
-            }
-        }
-
-        if (!SqliteJournalSchema.Tables.All(tables.Contains) || !SqliteJournalSchema.Indexes.All(indexes.Contains))
-        {
-            return false;
-        }
-
-        await using SqliteCommand migrationCommand = connection.CreateCommand();
-        migrationCommand.CommandText = "SELECT COUNT(*) FROM schema_migrations WHERE version = 1 AND name = 'R0-004-initial-journal-outbox';";
-        long count = Convert.ToInt64(await migrationCommand.ExecuteScalarAsync(cancellationToken), CultureInfo.InvariantCulture);
-        return count == 1;
+        return await SqliteJournalSchemaValidator.ValidateAsync(connection, cancellationToken);
     }
 
     private static async Task<string> RunIntegrityCheckAsync(SqliteConnection connection, CancellationToken cancellationToken)
