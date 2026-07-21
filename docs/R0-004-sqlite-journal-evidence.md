@@ -16,7 +16,7 @@ The configured database path must be absolute. The default is `RemotePropertyWat
 
 - Current `PRAGMA user_version`: **1**.
 - `schema_migrations` records `R0-004-initial-journal-outbox` once.
-- Version 0 upgrades to version 1 in one immediate transaction. The version is read again after acquiring that database-wide writer transaction, so concurrent journal instances either apply the migration once or observe the already-supported version.
+- Version 0 is adopted only when the file has no application-defined tables, indexes, views, or triggers. That ownership check and the version 0-to-1 migration share one immediate transaction, so an unrelated SQLite file is preserved at the schema/data level and enters `database_not_owned` without a migration or WAL mode change. A genuinely empty version 0 journal upgrades to version 1, and concurrent journal instances either apply the migration once or observe the already-supported version.
 - `InitializeAsync` requires an `AgentJournalInitializationMode`. Only `CreateIfMissingForFreshLifecycle` may create the database and parent directory, preserving a genuine first lifecycle start by opening a missing path with `ReadWriteCreate`.
 - `RequireExistingForPriorLifecycle` checks for the existing journal before opening it. A missing journal becomes degraded with `database_missing` and `integrity_result=not_run`; no connection is opened, no migration runs, and the database, WAL, and SHM remain absent.
 - An existing journal opens with `ReadWrite` in either startup mode, applies a supported migration when needed, validates schema and migration inventory, and runs integrity checking normally.
@@ -71,7 +71,7 @@ A pre-commit exception rolls back the sequence, event, and outbox together. A po
 
 ## Crash-safety and integrity settings
 
-Every connection enables foreign keys, uses a bounded busy timeout, and sets `PRAGMA synchronous=FULL`. Initialization requires `PRAGMA journal_mode=WAL` to return `wal`. The migration, session, and event/outbox writes use explicit immediate transactions where monotonic merge or atomic allocation requires them. Database pooling is disabled so test/process boundaries do not retain hidden handles.
+Every connection enables foreign keys, uses a bounded busy timeout, and sets `PRAGMA synchronous=FULL`. Initialization enables and verifies WAL only after ownership/migration, schema validation, and integrity checks succeed. The migration, session, and event/outbox writes use explicit immediate transactions where monotonic merge or atomic allocation requires them. Database pooling is disabled so test/process boundaries do not retain hidden handles.
 
 Initialization and explicit verification run `PRAGMA integrity_check`. Runtime verification opens only the existing file, requires the exact schema version, table/index inventory, and migration record, and requires exactly one integrity row equal to:
 
@@ -79,7 +79,7 @@ Initialization and explicit verification run `PRAGMA integrity_check`. Runtime v
 ok
 ```
 
-Any other output, invalid/truncated/non-database input, missing required schema, or SQLite open/integrity error produces an observable `AgentJournalHealthState.Degraded` with a bounded reason code. Runtime codes are `database_missing`, `database_open_failed`, `schema_validation_failed`, and `integrity_check_failed`; initialization also uses `database_invalid`, `initialization_failed`, and `schema_too_new`. The implementation never deletes, replaces, renames, migrates, or silently recreates a missing, replaced, or corrupt runtime database.
+Any other output, invalid/truncated/non-database input, missing required schema, or SQLite open/integrity error produces an observable `AgentJournalHealthState.Degraded` with a bounded reason code. Initialization additionally uses `database_invalid`, `database_not_owned`, `initialization_failed`, and `schema_too_new`. Runtime opening and verification use `database_missing`, `database_open_failed`, `schema_validation_failed`, and `integrity_check_failed`; runtime persistence maps provider/I/O/access/format failures to `runtime_write_failed`, and pending-outbox reads map those failures to `runtime_read_failed`. Cancellation, validation failures, duplicate/session conflicts, and synthetic fault-injection exceptions remain their original non-degrading outcomes. The implementation never deletes, replaces, renames, migrates, or silently recreates a missing, replaced, or corrupt runtime database.
 
 `Microsoft.Data.Sqlite` exposes asynchronous ADO.NET methods but SQLite performs underlying file I/O synchronously. The boundary remains task-based and cancellation-aware: tokens are checked before initialization and immediate transactions, passed to every provider operation, and checked again before commit. Tests verify pre-canceled operations propagate cancellation without marking a healthy database degraded.
 
@@ -88,7 +88,7 @@ Any other output, invalid/truncated/non-database input, missing required schema,
 The automated test suite demonstrates:
 
 - fresh migration, table/index/foreign-key inventory, WAL, FULL synchronization, and schema version 1;
-- idempotent initialization, version 0 upgrade, and two coordinated journal instances applying exactly one migration record;
+- idempotent initialization, empty version 0 upgrade, preservation and `database_not_owned` degradation for an unrelated version 0 SQLite schema, and two coordinated journal instances applying exactly one migration record;
 - real worker startup persisting the exact file-backed session ID and started milestone before readiness, then persisting readiness before steady running;
 - a genuine first real-host lifecycle start with no marker or database selecting the explicit creation mode, creating schema version 1, and becoming ready;
 - a later real-host process start with `PreviousSessionId` present and its journal deliberately removed selecting existing-only initialization, entering `database_missing`, never becoming ready, and leaving database/WAL/SHM absent through shutdown;
@@ -102,6 +102,7 @@ The automated test suite demonstrates:
 - stable outbox order and 20 coordinated concurrent writers with unique contiguous sequences;
 - visible degraded state for synthetic corrupt/truncated/non-database files without replacement;
 - healthy schema-plus-integrity verification, uninitialized missing verification/operations remaining non-creating, deleted-database preservation without recreation, empty-replacement preservation without migration, and detection of dropped tables, indexes, and migration records even when `integrity_check` returns `ok`;
+- runtime session, probe, material-event/outbox, and pending-outbox-read storage failures entering bounded `runtime_write_failed` or `runtime_read_failed` degradation and blocking later operations, while cancellation, validation, duplicate/session conflicts, and synthetic pre/post-commit faults do not spuriously degrade health;
 - defense-in-depth rejection of known credential-like synthetic input and byte-level absence checks across database/WAL/SHM artifacts;
 - cancellation propagation.
 

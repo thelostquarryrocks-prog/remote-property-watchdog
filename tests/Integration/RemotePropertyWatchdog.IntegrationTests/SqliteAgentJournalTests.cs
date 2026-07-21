@@ -114,6 +114,48 @@ public sealed class SqliteAgentJournalTests
     }
 
     [Fact]
+    public async Task ExistingUnrelatedVersionZeroDatabaseIsRefusedAndPreserved()
+    {
+        using TestDatabase database = new();
+        string originalJournalMode;
+        await using (SqliteConnection connection = await database.OpenAsync())
+        {
+            await ExecuteAsync(
+                connection,
+                """
+                CREATE TABLE unrelated_data(value TEXT NOT NULL);
+                CREATE INDEX unrelated_index ON unrelated_data(value);
+                CREATE VIEW unrelated_view AS SELECT value FROM unrelated_data;
+                CREATE TRIGGER unrelated_trigger
+                AFTER UPDATE ON unrelated_data
+                BEGIN
+                    SELECT 1;
+                END;
+                INSERT INTO unrelated_data(value) VALUES ('retained');
+                """);
+            Assert.Equal(0L, await ScalarInt64Async(connection, "PRAGMA user_version;"));
+            originalJournalMode = await ScalarStringAsync(connection, "PRAGMA journal_mode;");
+        }
+
+        using SqliteAgentJournal journal = CreateJournal(database.Path);
+        AgentJournalHealth health = await InitializeExistingAsync(journal);
+
+        Assert.Equal(AgentJournalHealthState.Degraded, health.State);
+        Assert.Equal("database_not_owned", health.ReasonCode);
+        Assert.Equal("not_run", health.IntegrityResult);
+        await using SqliteConnection preserved = await database.OpenAsync();
+        Assert.Equal(0L, await ScalarInt64Async(preserved, "PRAGMA user_version;"));
+        Assert.Equal(originalJournalMode, await ScalarStringAsync(preserved, "PRAGMA journal_mode;"));
+        Assert.Equal("retained", await ScalarStringAsync(preserved, "SELECT value FROM unrelated_data;"));
+        Assert.Equal(["unrelated_data"], await NamesAsync(preserved, "table"));
+        Assert.Equal(["unrelated_index"], await NamesAsync(preserved, "index"));
+        Assert.Equal(["unrelated_view"], await NamesAsync(preserved, "view"));
+        Assert.Equal(["unrelated_trigger"], await NamesAsync(preserved, "trigger"));
+        Assert.False(File.Exists($"{database.Path}-wal"));
+        Assert.False(File.Exists($"{database.Path}-shm"));
+    }
+
+    [Fact]
     public async Task MaterialEventAndOutboxCommitTogether()
     {
         using TestDatabase database = new();
@@ -191,6 +233,7 @@ public sealed class SqliteAgentJournalTests
         Assert.Equal("ready_timestamp_conflict", ready.ReasonCode);
         Assert.Equal("ended_timestamp_conflict", ended.ReasonCode);
         Assert.Equal(stored, await ReadSessionAsync(database));
+        Assert.Equal(AgentJournalHealthState.Healthy, journal.Health.State);
     }
 
     [Fact]
@@ -223,6 +266,7 @@ public sealed class SqliteAgentJournalTests
         await Assert.ThrowsAsync<SyntheticJournalFaultException>(
             () => faulted.AppendMaterialEventAsync(Event("event-before-fault"), CancellationToken.None));
 
+        Assert.Equal(AgentJournalHealthState.Healthy, faulted.Health.State);
         await AssertCountsAsync(database, materialEvents: 0, outbox: 0);
         MaterialEventCommit next = await setup.AppendMaterialEventAsync(Event("event-after-rollback"), CancellationToken.None);
         Assert.Equal(1, next.AgentSequence);
@@ -240,6 +284,7 @@ public sealed class SqliteAgentJournalTests
         await Assert.ThrowsAsync<SyntheticJournalFaultException>(
             () => faulted.AppendMaterialEventAsync(Event("event-after-fault"), CancellationToken.None));
 
+        Assert.Equal(AgentJournalHealthState.Healthy, faulted.Health.State);
         await AssertCountsAsync(database, materialEvents: 1, outbox: 1);
         Assert.Single(await setup.ReadPendingOutboxAsync("agent-synthetic", 10, CancellationToken.None));
     }
@@ -270,6 +315,7 @@ public sealed class SqliteAgentJournalTests
         await Assert.ThrowsAsync<DuplicateEventIdException>(
             () => journal.AppendMaterialEventAsync(Event("event-duplicate"), CancellationToken.None));
 
+        Assert.Equal(AgentJournalHealthState.Healthy, journal.Health.State);
         await AssertCountsAsync(database, materialEvents: 1, outbox: 1);
         Assert.Equal(2, (await journal.AppendMaterialEventAsync(Event("event-next"), CancellationToken.None)).AgentSequence);
     }
@@ -427,6 +473,71 @@ public sealed class SqliteAgentJournalTests
     }
 
     [Fact]
+    public async Task SessionStorageFailureDegradesAndBlocksSubsequentOperations()
+    {
+        using TestDatabase database = new();
+        using SqliteAgentJournal journal = CreateJournal(database.Path);
+        await InitializeFreshAsync(journal);
+        await ExecuteAgainstDatabaseAsync(database, "DROP TABLE agent_sessions;");
+
+        AgentJournalDegradedException error = await Assert.ThrowsAsync<AgentJournalDegradedException>(
+            () => journal.RecordSessionAsync(Session(), CancellationToken.None));
+
+        AssertRuntimeDegraded(journal, error, "runtime_write_failed");
+        AgentJournalDegradedException subsequent = await Assert.ThrowsAsync<AgentJournalDegradedException>(
+            () => journal.ReadPendingOutboxAsync("agent-synthetic", 1, CancellationToken.None));
+        Assert.Equal(error.Health, subsequent.Health);
+    }
+
+    [Fact]
+    public async Task ProbeStorageFailureDegradesJournal()
+    {
+        using TestDatabase database = new();
+        using SqliteAgentJournal journal = CreateJournal(database.Path);
+        await AddSessionAsync(journal);
+        await ExecuteAgainstDatabaseAsync(database, "DROP TABLE probe_samples;");
+
+        AgentJournalDegradedException error = await Assert.ThrowsAsync<AgentJournalDegradedException>(
+            () => journal.AppendProbeSampleAsync(Probe("sample-runtime-failure"), CancellationToken.None));
+
+        AssertRuntimeDegraded(journal, error, "runtime_write_failed");
+    }
+
+    [Fact]
+    public async Task MaterialEventStorageFailureDegradesAndRollsBackEventAndSequence()
+    {
+        using TestDatabase database = new();
+        using SqliteAgentJournal journal = CreateJournal(database.Path);
+        await AddSessionAsync(journal);
+        await ExecuteAgainstDatabaseAsync(database, "DROP TABLE outbox;");
+
+        AgentJournalDegradedException error = await Assert.ThrowsAsync<AgentJournalDegradedException>(
+            () => journal.AppendMaterialEventAsync(Event("event-runtime-failure"), CancellationToken.None));
+
+        AssertRuntimeDegraded(journal, error, "runtime_write_failed");
+        await using SqliteConnection connection = await database.OpenAsync();
+        Assert.Equal(0L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM material_events;"));
+        Assert.Equal(0L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM local_state;"));
+        AgentJournalDegradedException subsequent = await Assert.ThrowsAsync<AgentJournalDegradedException>(
+            () => journal.AppendMaterialEventAsync(Event("event-after-runtime-failure"), CancellationToken.None));
+        Assert.Equal(error.Health, subsequent.Health);
+    }
+
+    [Fact]
+    public async Task OutboxReadStorageFailureDegradesJournal()
+    {
+        using TestDatabase database = new();
+        using SqliteAgentJournal journal = CreateJournal(database.Path);
+        await AddSessionAsync(journal);
+        await ExecuteAgainstDatabaseAsync(database, "DROP TABLE outbox;");
+
+        AgentJournalDegradedException error = await Assert.ThrowsAsync<AgentJournalDegradedException>(
+            () => journal.ReadPendingOutboxAsync("agent-synthetic", 1, CancellationToken.None));
+
+        AssertRuntimeDegraded(journal, error, "runtime_read_failed");
+    }
+
+    [Fact]
     public async Task EmptyReplacementDatabaseDegradesWithoutMigration()
     {
         using TestDatabase database = new();
@@ -556,6 +667,7 @@ public sealed class SqliteAgentJournalTests
         MaterialEventWrite prohibited = Event("event-secret") with { TargetLabel = syntheticSecret };
 
         await Assert.ThrowsAsync<ArgumentException>(() => journal.AppendMaterialEventAsync(prohibited, CancellationToken.None));
+        Assert.Equal(AgentJournalHealthState.Healthy, journal.Health.State);
         await journal.VerifyIntegrityAsync(CancellationToken.None);
 
         await AssertCountsAsync(database, materialEvents: 1, outbox: 1);
@@ -636,6 +748,35 @@ public sealed class SqliteAgentJournalTests
             ["probe_timeout"],
             "up",
             "up");
+
+    private static ProbeSampleWrite Probe(string sampleId) =>
+        new(
+            sampleId,
+            "agent-synthetic",
+            "session-synthetic",
+            Now,
+            "tcp",
+            "reachable",
+            "target-synthetic",
+            ["probe_succeeded"]);
+
+    private static void AssertRuntimeDegraded(
+        SqliteAgentJournal journal,
+        AgentJournalDegradedException error,
+        string reasonCode)
+    {
+        Assert.Equal(AgentJournalHealthState.Degraded, error.Health.State);
+        Assert.Equal(reasonCode, error.Health.ReasonCode);
+        Assert.Equal("not_run", error.Health.IntegrityResult);
+        Assert.Equal(error.Health, journal.Health);
+        Assert.InRange(error.Health.ReasonCode.Length, 1, 64);
+    }
+
+    private static async Task ExecuteAgainstDatabaseAsync(TestDatabase database, string sql)
+    {
+        await using SqliteConnection connection = await database.OpenAsync();
+        await ExecuteAsync(connection, sql);
+    }
 
     private static async Task AssertCountsAsync(TestDatabase database, int materialEvents, int outbox)
     {

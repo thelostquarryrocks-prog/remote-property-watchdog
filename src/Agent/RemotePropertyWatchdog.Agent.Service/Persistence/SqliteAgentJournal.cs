@@ -1,3 +1,4 @@
+using System.Data.Common;
 using System.Globalization;
 using System.Text.Json;
 using Microsoft.Data.Sqlite;
@@ -73,7 +74,6 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
 
                 await using SqliteConnection connection = await OpenConnectionAsync(
                     allowCreate: !databaseExists,
-                    includeJournalMode: true,
                     cancellationToken);
                 int schemaVersion = await MigrateToCurrentVersionAsync(connection, cancellationToken);
 
@@ -89,6 +89,7 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
                     return SetDegraded(schemaVersion, "integrity_check_failed", "failed", sqliteErrorCode: null);
                 }
 
+                await EnableWalAsync(connection, cancellationToken);
                 AgentJournalHealth initialized = new(AgentJournalHealthState.Healthy, schemaVersion, "healthy", "ok");
                 Volatile.Write(ref health, initialized);
                 LogInitialized(logger, schemaVersion, "wal", "full", "ok");
@@ -101,6 +102,10 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
             catch (UnsupportedAgentJournalSchemaException ex)
             {
                 return SetDegraded(ex.ActualVersion, "schema_too_new", "not_run", sqliteErrorCode: null);
+            }
+            catch (UnownedAgentJournalException)
+            {
+                return SetDegraded(0, "database_not_owned", "not_run", sqliteErrorCode: null);
             }
             catch (SqliteException ex)
             {
@@ -136,7 +141,6 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
         {
             await using SqliteConnection connection = await OpenConnectionAsync(
                 allowCreate: false,
-                includeJournalMode: false,
                 cancellationToken);
             stage = JournalVerificationStage.Integrity;
             string result = await RunIntegrityCheckAsync(connection, cancellationToken);
@@ -199,48 +203,62 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
     public async Task RecordSessionAsync(AgentSessionRecord session, CancellationToken cancellationToken)
     {
         ValidateSession(session);
-        await EnsureHealthyAsync(cancellationToken);
-        await using SqliteConnection connection = await OpenExistingOperationalConnectionAsync(cancellationToken);
-        cancellationToken.ThrowIfCancellationRequested();
-        await using SqliteTransaction transaction = connection.BeginTransaction(deferred: false);
-        AgentSessionRecord? stored = await ReadSessionAsync(connection, transaction, session.SessionId, cancellationToken);
-        if (stored is null)
-        {
-            await InsertSessionAsync(connection, transaction, session, cancellationToken);
-        }
-        else
-        {
-            AgentSessionRecord merged = MergeSession(stored, session);
-            if (merged != stored)
+        await ExecuteRuntimeOperationAsync(
+            "runtime_write_failed",
+            async () =>
             {
-                await UpdateSessionAsync(connection, transaction, merged, cancellationToken);
-            }
-        }
+                await EnsureHealthyAsync(cancellationToken);
+                await using SqliteConnection connection = await OpenExistingOperationalConnectionAsync(cancellationToken);
+                cancellationToken.ThrowIfCancellationRequested();
+                await using SqliteTransaction transaction = connection.BeginTransaction(deferred: false);
+                AgentSessionRecord? stored = await ReadSessionAsync(connection, transaction, session.SessionId, cancellationToken);
+                if (stored is null)
+                {
+                    await InsertSessionAsync(connection, transaction, session, cancellationToken);
+                }
+                else
+                {
+                    AgentSessionRecord merged = MergeSession(stored, session);
+                    if (merged != stored)
+                    {
+                        await UpdateSessionAsync(connection, transaction, merged, cancellationToken);
+                    }
+                }
 
-        await transaction.CommitAsync(cancellationToken);
+                await transaction.CommitAsync(cancellationToken);
+                return true;
+            },
+            cancellationToken);
     }
 
     public async Task AppendProbeSampleAsync(ProbeSampleWrite sample, CancellationToken cancellationToken)
     {
         ValidateProbeSample(sample);
-        await EnsureHealthyAsync(cancellationToken);
-        await using SqliteConnection connection = await OpenExistingOperationalConnectionAsync(cancellationToken);
-        await using SqliteCommand command = connection.CreateCommand();
-        command.CommandText = """
-            INSERT INTO probe_samples (
-                sample_id, agent_id, session_id, observed_at_utc, probe_kind, probe_state, target_id, evidence_json)
-            VALUES (
-                $sample_id, $agent_id, $session_id, $observed_at_utc, $probe_kind, $probe_state, $target_id, $evidence_json);
-            """;
-        command.Parameters.AddWithValue("$sample_id", sample.SampleId);
-        command.Parameters.AddWithValue("$agent_id", sample.AgentId);
-        command.Parameters.AddWithValue("$session_id", sample.SessionId);
-        command.Parameters.AddWithValue("$observed_at_utc", ToUtcText(sample.ObservedAtUtc));
-        command.Parameters.AddWithValue("$probe_kind", sample.ProbeKind);
-        command.Parameters.AddWithValue("$probe_state", sample.ProbeState);
-        command.Parameters.AddWithValue("$target_id", DbValue(sample.TargetId));
-        command.Parameters.AddWithValue("$evidence_json", JsonSerializer.Serialize(sample.Evidence, ContractJson.Options));
-        await command.ExecuteNonQueryAsync(cancellationToken);
+        await ExecuteRuntimeOperationAsync(
+            "runtime_write_failed",
+            async () =>
+            {
+                await EnsureHealthyAsync(cancellationToken);
+                await using SqliteConnection connection = await OpenExistingOperationalConnectionAsync(cancellationToken);
+                await using SqliteCommand command = connection.CreateCommand();
+                command.CommandText = """
+                    INSERT INTO probe_samples (
+                        sample_id, agent_id, session_id, observed_at_utc, probe_kind, probe_state, target_id, evidence_json)
+                    VALUES (
+                        $sample_id, $agent_id, $session_id, $observed_at_utc, $probe_kind, $probe_state, $target_id, $evidence_json);
+                    """;
+                command.Parameters.AddWithValue("$sample_id", sample.SampleId);
+                command.Parameters.AddWithValue("$agent_id", sample.AgentId);
+                command.Parameters.AddWithValue("$session_id", sample.SessionId);
+                command.Parameters.AddWithValue("$observed_at_utc", ToUtcText(sample.ObservedAtUtc));
+                command.Parameters.AddWithValue("$probe_kind", sample.ProbeKind);
+                command.Parameters.AddWithValue("$probe_state", sample.ProbeState);
+                command.Parameters.AddWithValue("$target_id", DbValue(sample.TargetId));
+                command.Parameters.AddWithValue("$evidence_json", JsonSerializer.Serialize(sample.Evidence, ContractJson.Options));
+                await command.ExecuteNonQueryAsync(cancellationToken);
+                return true;
+            },
+            cancellationToken);
     }
 
     public async Task<MaterialEventCommit> AppendMaterialEventAsync(
@@ -248,30 +266,36 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
         CancellationToken cancellationToken)
     {
         ValidateMaterialEvent(materialEvent);
-        await EnsureHealthyAsync(cancellationToken);
-        await using SqliteConnection connection = await OpenExistingOperationalConnectionAsync(cancellationToken);
-        cancellationToken.ThrowIfCancellationRequested();
-        await using SqliteTransaction transaction = connection.BeginTransaction(deferred: false);
+        return await ExecuteRuntimeOperationAsync(
+            "runtime_write_failed",
+            async () =>
+            {
+                await EnsureHealthyAsync(cancellationToken);
+                await using SqliteConnection connection = await OpenExistingOperationalConnectionAsync(cancellationToken);
+                cancellationToken.ThrowIfCancellationRequested();
+                await using SqliteTransaction transaction = connection.BeginTransaction(deferred: false);
 
-        long sequence = await AllocateSequenceAsync(connection, transaction, materialEvent.AgentId, cancellationToken);
-        DateTimeOffset createdAtUtc = timeProvider.GetUtcNow();
-        MaterialEventDto dto = ToContract(materialEvent, sequence);
-        string payloadJson = ContractJson.Serialize(dto);
+                long sequence = await AllocateSequenceAsync(connection, transaction, materialEvent.AgentId, cancellationToken);
+                DateTimeOffset createdAtUtc = timeProvider.GetUtcNow();
+                MaterialEventDto dto = ToContract(materialEvent, sequence);
+                string payloadJson = ContractJson.Serialize(dto);
 
-        bool inserted = await InsertMaterialEventAsync(connection, transaction, materialEvent, dto, createdAtUtc, cancellationToken);
-        if (!inserted)
-        {
-            throw new DuplicateEventIdException(materialEvent.EventId);
-        }
+                bool inserted = await InsertMaterialEventAsync(connection, transaction, materialEvent, dto, createdAtUtc, cancellationToken);
+                if (!inserted)
+                {
+                    throw new DuplicateEventIdException(materialEvent.EventId);
+                }
 
-        await InsertOutboxAsync(connection, transaction, materialEvent, sequence, payloadJson, createdAtUtc, cancellationToken);
-        await faultInjector.BeforeMaterialEventCommitAsync(cancellationToken);
-        cancellationToken.ThrowIfCancellationRequested();
-        await transaction.CommitAsync(cancellationToken);
-        LogMaterialEventCommitted(logger, sequence);
-        await faultInjector.AfterMaterialEventCommitAsync(cancellationToken);
+                await InsertOutboxAsync(connection, transaction, materialEvent, sequence, payloadJson, createdAtUtc, cancellationToken);
+                await faultInjector.BeforeMaterialEventCommitAsync(cancellationToken);
+                cancellationToken.ThrowIfCancellationRequested();
+                await transaction.CommitAsync(cancellationToken);
+                LogMaterialEventCommitted(logger, sequence);
+                await faultInjector.AfterMaterialEventCommitAsync(cancellationToken);
 
-        return new MaterialEventCommit(materialEvent.EventId, materialEvent.EventId, sequence);
+                return new MaterialEventCommit(materialEvent.EventId, materialEvent.EventId, sequence);
+            },
+            cancellationToken);
     }
 
     public async Task<IReadOnlyList<PendingOutboxItem>> ReadPendingOutboxAsync(
@@ -285,36 +309,73 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
             throw new ArgumentOutOfRangeException(nameof(maximumCount), "Outbox read count must be between 1 and 500.");
         }
 
-        await EnsureHealthyAsync(cancellationToken);
-        await using SqliteConnection connection = await OpenExistingOperationalConnectionAsync(cancellationToken);
-        await using SqliteCommand command = connection.CreateCommand();
-        command.CommandText = """
-            SELECT outbox_id, event_id, agent_id, agent_sequence, payload_json, created_at_utc
-            FROM outbox
-            WHERE agent_id = $agent_id
-            ORDER BY agent_sequence ASC, outbox_id ASC
-            LIMIT $maximum_count;
-            """;
-        command.Parameters.AddWithValue("$agent_id", agentId);
-        command.Parameters.AddWithValue("$maximum_count", maximumCount);
+        return await ExecuteRuntimeOperationAsync(
+            "runtime_read_failed",
+            async () =>
+            {
+                await EnsureHealthyAsync(cancellationToken);
+                await using SqliteConnection connection = await OpenExistingOperationalConnectionAsync(cancellationToken);
+                await using SqliteCommand command = connection.CreateCommand();
+                command.CommandText = """
+                    SELECT outbox_id, event_id, agent_id, agent_sequence, payload_json, created_at_utc
+                    FROM outbox
+                    WHERE agent_id = $agent_id
+                    ORDER BY agent_sequence ASC, outbox_id ASC
+                    LIMIT $maximum_count;
+                    """;
+                command.Parameters.AddWithValue("$agent_id", agentId);
+                command.Parameters.AddWithValue("$maximum_count", maximumCount);
 
-        List<PendingOutboxItem> items = [];
-        await using SqliteDataReader reader = await command.ExecuteReaderAsync(cancellationToken);
-        while (await reader.ReadAsync(cancellationToken))
-        {
-            items.Add(new PendingOutboxItem(
-                reader.GetString(0),
-                reader.GetString(1),
-                reader.GetString(2),
-                reader.GetInt64(3),
-                reader.GetString(4),
-                DateTimeOffset.Parse(reader.GetString(5), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind)));
-        }
+                List<PendingOutboxItem> items = [];
+                await using SqliteDataReader reader = await command.ExecuteReaderAsync(cancellationToken);
+                while (await reader.ReadAsync(cancellationToken))
+                {
+                    items.Add(new PendingOutboxItem(
+                        reader.GetString(0),
+                        reader.GetString(1),
+                        reader.GetString(2),
+                        reader.GetInt64(3),
+                        reader.GetString(4),
+                        DateTimeOffset.Parse(reader.GetString(5), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind)));
+                }
 
-        return items;
+                return (IReadOnlyList<PendingOutboxItem>)items;
+            },
+            cancellationToken);
     }
 
     public void Dispose() => initializationGate.Dispose();
+
+    private async Task<T> ExecuteRuntimeOperationAsync<T>(
+        string failureReasonCode,
+        Func<Task<T>> operation,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await operation();
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (AgentJournalDegradedException)
+        {
+            throw;
+        }
+        catch (Exception ex) when (
+            ex is DbException or IOException or UnauthorizedAccessException or FormatException)
+        {
+            string reasonCode = !File.Exists(databasePath) ? "database_missing" : failureReasonCode;
+            int? sqliteErrorCode = ex is SqliteException sqliteException ? sqliteException.SqliteErrorCode : null;
+            AgentJournalHealth degraded = SetDegraded(
+                Health.SchemaVersion,
+                reasonCode,
+                "not_run",
+                sqliteErrorCode);
+            throw new AgentJournalDegradedException(degraded);
+        }
+    }
 
     private Task<AgentJournalHealth> EnsureHealthyAsync(CancellationToken cancellationToken)
     {
@@ -344,7 +405,6 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
         {
             return await OpenConnectionAsync(
                 allowCreate: false,
-                includeJournalMode: false,
                 cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -375,7 +435,6 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
 
     private async Task<SqliteConnection> OpenConnectionAsync(
         bool allowCreate,
-        bool includeJournalMode,
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -400,17 +459,6 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
         try
         {
             await connection.OpenAsync(cancellationToken);
-            if (includeJournalMode)
-            {
-                await using SqliteCommand journalCommand = connection.CreateCommand();
-                journalCommand.CommandText = "PRAGMA journal_mode = WAL;";
-                object? mode = await journalCommand.ExecuteScalarAsync(cancellationToken);
-                if (!StringComparer.OrdinalIgnoreCase.Equals(Convert.ToString(mode, CultureInfo.InvariantCulture), "wal"))
-                {
-                    throw new InvalidOperationException("SQLite did not enable WAL journal mode.");
-                }
-            }
-
             await using SqliteCommand settingsCommand = connection.CreateCommand();
             settingsCommand.CommandText = $"PRAGMA foreign_keys = ON; PRAGMA synchronous = FULL; PRAGMA busy_timeout = {Convert.ToInt64(options.BusyTimeout.TotalMilliseconds)};";
             await settingsCommand.ExecuteNonQueryAsync(cancellationToken);
@@ -435,6 +483,12 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
 
         if (schemaVersion == 0)
         {
+            bool hasApplicationSchema = await HasApplicationSchemaAsync(connection, transaction, cancellationToken);
+            if (hasApplicationSchema)
+            {
+                throw new UnownedAgentJournalException();
+            }
+
             await using (SqliteCommand schemaCommand = connection.CreateCommand())
             {
                 schemaCommand.Transaction = transaction;
@@ -459,6 +513,38 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
 
         await transaction.CommitAsync(cancellationToken);
         return schemaVersion;
+    }
+
+    private static async Task<bool> HasApplicationSchemaAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        await using SqliteCommand command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT EXISTS (
+                SELECT 1
+                FROM sqlite_schema
+                WHERE type IN ('table', 'index', 'view', 'trigger')
+                  AND name NOT LIKE 'sqlite_%'
+            );
+            """;
+        object? result = await command.ExecuteScalarAsync(cancellationToken);
+        return Convert.ToInt64(result, CultureInfo.InvariantCulture) != 0;
+    }
+
+    private static async Task EnableWalAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
+    {
+        await using SqliteCommand command = connection.CreateCommand();
+        command.CommandText = "PRAGMA journal_mode = WAL;";
+        object? mode = await command.ExecuteScalarAsync(cancellationToken);
+        if (!StringComparer.OrdinalIgnoreCase.Equals(Convert.ToString(mode, CultureInfo.InvariantCulture), "wal"))
+        {
+            throw new InvalidOperationException("SQLite did not enable WAL journal mode.");
+        }
     }
 
     private static async Task<int> ReadSchemaVersionAsync(
@@ -908,4 +994,6 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
         Integrity,
         Schema
     }
+
+    private sealed class UnownedAgentJournalException : InvalidOperationException;
 }
