@@ -225,6 +225,8 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
                     }
                 }
 
+                await faultInjector.BeforeSessionCommitAsync(cancellationToken);
+                cancellationToken.ThrowIfCancellationRequested();
                 await transaction.CommitAsync(cancellationToken);
                 return true;
             },

@@ -7,9 +7,16 @@ public sealed partial class AgentWorker(
     IAgentLifecycleCoordinator lifecycleCoordinator,
     IAgentJournal agentJournal,
     IOptions<AgentLifecycleOptions> options,
-    ILogger<AgentWorker> logger) : BackgroundService
+    ILogger<AgentWorker> logger) : BackgroundService, IAgentServiceHealth
 {
     private int executionFaulted;
+    private int monitoringReady;
+
+    public AgentJournalHealth Health => agentJournal.Health;
+
+    public bool IsReady =>
+        Volatile.Read(ref monitoringReady) != 0 &&
+        Health.State == AgentJournalHealthState.Healthy;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -24,17 +31,28 @@ public sealed partial class AgentWorker(
             AgentJournalHealth journalHealth = await agentJournal.InitializeAsync(initializationMode, stoppingToken);
             if (journalHealth.State != AgentJournalHealthState.Healthy)
             {
-                LogAgentJournalDegraded(logger, journalHealth.ReasonCode, journalHealth.SchemaVersion, journalHealth.IntegrityResult);
-                await Task.Delay(Timeout.InfiniteTimeSpan, stoppingToken);
+                await TransitionToJournalDegradedAsync(journalHealth, stoppingToken);
+                await WaitForShutdownAsync(stoppingToken);
                 return;
             }
 
-            await agentJournal.RecordSessionAsync(ToJournalSession(started), stoppingToken);
+            if (!await TryPersistSessionAsync(ToJournalSession(started), stoppingToken))
+            {
+                await WaitForShutdownAsync(stoppingToken);
+                return;
+            }
+
             AgentLifecycleState ready = await lifecycleCoordinator.MarkReadyAsync(stoppingToken);
-            await agentJournal.RecordSessionAsync(ToJournalSession(ready), stoppingToken);
+            if (!await TryPersistSessionAsync(ToJournalSession(ready), stoppingToken))
+            {
+                await WaitForShutdownAsync(stoppingToken);
+                return;
+            }
+
+            Interlocked.Exchange(ref monitoringReady, 1);
             LogAgentHostReady(logger, ready.SessionId, ready.ReadyAtUtc!.Value, ready.ReadinessElapsed!.Value.TotalMilliseconds, options.Value.ReadinessTimeout.TotalSeconds);
 
-            await Task.Delay(Timeout.InfiniteTimeSpan, stoppingToken);
+            await WaitForShutdownAsync(stoppingToken);
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
         {
@@ -43,6 +61,7 @@ public sealed partial class AgentWorker(
         catch (Exception)
         {
             Interlocked.Exchange(ref executionFaulted, 1);
+            Interlocked.Exchange(ref monitoringReady, 0);
             LogAgentHostExecutionFaulted(logger, lifecycleCoordinator.CurrentState?.SessionId);
             throw;
         }
@@ -50,6 +69,7 @@ public sealed partial class AgentWorker(
 
     public override async Task StopAsync(CancellationToken cancellationToken)
     {
+        Interlocked.Exchange(ref monitoringReady, 0);
         await base.StopAsync(cancellationToken);
 
         if (lifecycleCoordinator.CurrentState is null)
@@ -79,7 +99,10 @@ public sealed partial class AgentWorker(
         {
             try
             {
-                await agentJournal.RecordSessionAsync(ToJournalSession(stopped), writeTimeout.Token);
+                if (!await TryPersistSessionAsync(ToJournalSession(stopped), writeTimeout.Token))
+                {
+                    LogJournalShutdownPersistenceFailed(logger, agentJournal.Health.ReasonCode);
+                }
             }
             catch (Exception ex) when (ex is OperationCanceledException or IOException or UnauthorizedAccessException or InvalidOperationException or DbException)
             {
@@ -92,6 +115,52 @@ public sealed partial class AgentWorker(
 
         LogAgentHostStopped(logger, stopped.SessionId, stopped.StoppedAtUtc!.Value);
     }
+
+    private async Task<bool> TryPersistSessionAsync(
+        AgentSessionRecord session,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await agentJournal.RecordSessionAsync(session, cancellationToken);
+            return true;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception)
+        {
+            AgentJournalHealth journalHealth = agentJournal.Health;
+            if (journalHealth.State != AgentJournalHealthState.Degraded)
+            {
+                throw;
+            }
+
+            await TransitionToJournalDegradedAsync(journalHealth, cancellationToken);
+            return false;
+        }
+    }
+
+    private async Task TransitionToJournalDegradedAsync(
+        AgentJournalHealth journalHealth,
+        CancellationToken cancellationToken)
+    {
+        Interlocked.Exchange(ref monitoringReady, 0);
+        LogAgentJournalDegraded(
+            logger,
+            journalHealth.ReasonCode,
+            journalHealth.SchemaVersion,
+            journalHealth.IntegrityResult);
+
+        if (lifecycleCoordinator.CurrentState?.IsReady == true)
+        {
+            await lifecycleCoordinator.MarkNotReadyAsync(cancellationToken);
+        }
+    }
+
+    private static Task WaitForShutdownAsync(CancellationToken cancellationToken) =>
+        Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
 
     private static AgentSessionRecord ToJournalSession(AgentLifecycleState state) =>
         new(

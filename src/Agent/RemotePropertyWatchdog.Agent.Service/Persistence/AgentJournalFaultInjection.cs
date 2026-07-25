@@ -2,6 +2,8 @@ namespace RemotePropertyWatchdog.Agent.Service;
 
 public interface IAgentJournalFaultInjector
 {
+    Task BeforeSessionCommitAsync(CancellationToken cancellationToken);
+
     Task BeforeMaterialEventCommitAsync(CancellationToken cancellationToken);
 
     Task AfterMaterialEventCommitAsync(CancellationToken cancellationToken);
@@ -14,6 +16,8 @@ public sealed class NoOpAgentJournalFaultInjector : IAgentJournalFaultInjector
     private NoOpAgentJournalFaultInjector()
     {
     }
+
+    public Task BeforeSessionCommitAsync(CancellationToken cancellationToken) => Task.CompletedTask;
 
     public Task BeforeMaterialEventCommitAsync(CancellationToken cancellationToken) => Task.CompletedTask;
 

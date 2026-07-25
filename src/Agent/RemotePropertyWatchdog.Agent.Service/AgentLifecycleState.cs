@@ -10,5 +10,8 @@ public sealed record AgentLifecycleState(
     Guid? PreviousSessionId,
     bool PreviousSessionEndedCleanly)
 {
-    public bool IsReady => ReadyAtUtc is not null;
+    public bool IsReady =>
+        ReadyAtUtc is not null &&
+        StoppedAtUtc is null &&
+        !PlannedShutdown;
 }

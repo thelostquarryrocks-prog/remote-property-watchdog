@@ -8,5 +8,7 @@ public interface IAgentLifecycleCoordinator
 
     Task<AgentLifecycleState> MarkReadyAsync(CancellationToken cancellationToken);
 
+    Task<AgentLifecycleState> MarkNotReadyAsync(CancellationToken cancellationToken);
+
     Task<AgentLifecycleState> StopAsync(CancellationToken cancellationToken);
 }

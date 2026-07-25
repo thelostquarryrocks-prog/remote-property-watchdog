@@ -420,6 +420,60 @@ public sealed class SqliteAgentJournalTests
     }
 
     [Fact]
+    public async Task SessionPreCommitStorageFailureDegradesRollsBackAndBlocksFurtherWrites()
+    {
+        using TestDatabase database = new();
+        SessionFaultInjector faultInjector = new(
+            failOnCall: 1,
+            new IOException("synthetic storage failure"));
+        using SqliteAgentJournal journal = CreateJournal(database.Path, faultInjector);
+        await InitializeFreshAsync(journal);
+
+        AgentJournalDegradedException error = await Assert.ThrowsAsync<AgentJournalDegradedException>(
+            () => journal.RecordSessionAsync(Session(), CancellationToken.None));
+
+        AssertRuntimeDegraded(journal, error, "runtime_write_failed");
+        Assert.Equal(1, faultInjector.Calls);
+        await using (SqliteConnection connection = await database.OpenAsync())
+        {
+            Assert.Equal(0L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM agent_sessions;"));
+            Assert.Equal(0L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM local_state;"));
+            Assert.Equal(0L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM material_events;"));
+            Assert.Equal(0L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM outbox;"));
+        }
+
+        AgentJournalDegradedException blocked = await Assert.ThrowsAsync<AgentJournalDegradedException>(
+            () => journal.RecordSessionAsync(Session(), CancellationToken.None));
+        Assert.Equal(error.Health, blocked.Health);
+        Assert.Equal(1, faultInjector.Calls);
+    }
+
+    [Fact]
+    public async Task SessionPreCommitSyntheticFaultRollsBackWithoutDegrading()
+    {
+        using TestDatabase database = new();
+        SessionFaultInjector faultInjector = new(
+            failOnCall: 1,
+            new SyntheticJournalFaultException());
+        using SqliteAgentJournal journal = CreateJournal(database.Path, faultInjector);
+        await InitializeFreshAsync(journal);
+
+        await Assert.ThrowsAsync<SyntheticJournalFaultException>(
+            () => journal.RecordSessionAsync(Session(), CancellationToken.None));
+
+        Assert.Equal(AgentJournalHealthState.Healthy, journal.Health.State);
+        await using (SqliteConnection connection = await database.OpenAsync())
+        {
+            Assert.Equal(0L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM agent_sessions;"));
+            Assert.Equal(0L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM local_state;"));
+        }
+
+        await journal.RecordSessionAsync(Session(), CancellationToken.None);
+        Assert.Equal(2, faultInjector.Calls);
+        Assert.Equal(Session(), await ReadSessionAsync(database));
+    }
+
+    [Fact]
     public async Task FailureBeforeCommitRollsBackEventOutboxAndSequence()
     {
         using TestDatabase database = new();
@@ -1241,8 +1295,28 @@ public sealed class SqliteAgentJournalTests
         public override DateTimeOffset GetUtcNow() => value;
     }
 
+    private sealed class SessionFaultInjector(int failOnCall, Exception exception) : IAgentJournalFaultInjector
+    {
+        public int Calls { get; private set; }
+
+        public Task BeforeSessionCommitAsync(CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Calls++;
+            return Calls == failOnCall
+                ? Task.FromException(exception)
+                : Task.CompletedTask;
+        }
+
+        public Task BeforeMaterialEventCommitAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public Task AfterMaterialEventCommitAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+    }
+
     private sealed class ThrowingFaultInjector(bool beforeCommit = false, bool afterCommit = false) : IAgentJournalFaultInjector
     {
+        public Task BeforeSessionCommitAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
         public Task BeforeMaterialEventCommitAsync(CancellationToken cancellationToken) =>
             beforeCommit ? Task.FromException(new SyntheticJournalFaultException()) : Task.CompletedTask;
 

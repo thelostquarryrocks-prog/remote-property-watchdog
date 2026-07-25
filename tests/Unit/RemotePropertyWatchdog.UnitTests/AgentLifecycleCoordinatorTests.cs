@@ -96,6 +96,29 @@ public sealed class AgentLifecycleCoordinatorTests
         Assert.False(store.Marker?.PlannedShutdown);
     }
 
+    [Fact]
+    public async Task MarkNotReadyAsyncClearsActiveReadinessFromStateAndMarker()
+    {
+        InMemoryLifecycleStore store = new();
+        TestTimeProvider clock = new(new DateTimeOffset(2026, 7, 15, 1, 2, 3, TimeSpan.Zero));
+        AgentLifecycleCoordinator coordinator = new(
+            store,
+            clock,
+            Options.Create(new AgentLifecycleOptions()));
+        await coordinator.StartAsync(CancellationToken.None);
+        clock.Advance(TimeSpan.FromSeconds(1));
+        Assert.True((await coordinator.MarkReadyAsync(CancellationToken.None)).IsReady);
+
+        AgentLifecycleState notReady = await coordinator.MarkNotReadyAsync(CancellationToken.None);
+
+        Assert.False(notReady.IsReady);
+        Assert.False(coordinator.CurrentState?.IsReady);
+        Assert.Null(notReady.ReadyAtUtc);
+        Assert.Null(notReady.ReadinessElapsed);
+        Assert.Null(store.Marker?.ReadyAtUtc);
+        Assert.Null(store.Marker?.ReadinessElapsedMilliseconds);
+    }
+
     private static async Task<AgentLifecycleMarker> ReadMarkerAsync(string markerPath)
     {
         FileAgentLifecycleStore store = new(Options.Create(new AgentLifecycleOptions { MarkerPath = markerPath }));

@@ -78,6 +78,28 @@ public sealed class AgentLifecycleCoordinator(
         }
     }
 
+    public async Task<AgentLifecycleState> MarkNotReadyAsync(CancellationToken cancellationToken)
+    {
+        await gate.WaitAsync(cancellationToken);
+        try
+        {
+            AgentLifecycleState state = currentState ?? throw new InvalidOperationException("Lifecycle must be started before readiness can be cleared.");
+            if (!state.IsReady)
+            {
+                return state;
+            }
+
+            state = state with { ReadyAtUtc = null, ReadinessElapsed = null };
+            await store.WriteMarkerAsync(ToMarker(state), cancellationToken);
+            currentState = state;
+            return state;
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
     public async Task<AgentLifecycleState> StopAsync(CancellationToken cancellationToken)
     {
         await gate.WaitAsync(cancellationToken);

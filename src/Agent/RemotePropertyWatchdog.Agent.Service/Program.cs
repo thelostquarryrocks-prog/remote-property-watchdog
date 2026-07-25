@@ -33,6 +33,10 @@ public static class Program
                 services.AddSingleton<IAgentLifecycleCoordinator, AgentLifecycleCoordinator>();
                 services.AddSingleton<IAgentJournalFaultInjector>(NoOpAgentJournalFaultInjector.Instance);
                 services.AddSingleton<IAgentJournal, SqliteAgentJournal>();
-                services.AddHostedService<AgentWorker>();
+                services.AddSingleton<AgentWorker>();
+                services.AddSingleton<IAgentServiceHealth>(
+                    serviceProvider => serviceProvider.GetRequiredService<AgentWorker>());
+                services.AddHostedService<AgentWorker>(
+                    serviceProvider => serviceProvider.GetRequiredService<AgentWorker>());
             });
 }
