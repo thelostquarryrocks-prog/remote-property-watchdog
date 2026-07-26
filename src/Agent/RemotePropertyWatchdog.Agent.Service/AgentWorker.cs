@@ -150,9 +150,9 @@ public sealed partial class AgentWorker(
         }
     }
 
-    private async Task TransitionToJournalDegradedAsync(
+    private Task TransitionToJournalDegradedAsync(
         AgentJournalHealth journalHealth,
-        CancellationToken cancellationToken)
+        CancellationToken _)
     {
         Interlocked.Exchange(ref monitoringReady, 0);
         LogAgentJournalDegraded(
@@ -160,11 +160,7 @@ public sealed partial class AgentWorker(
             journalHealth.ReasonCode,
             journalHealth.SchemaVersion,
             journalHealth.IntegrityResult);
-
-        if (lifecycleCoordinator.CurrentState?.IsReady == true)
-        {
-            await lifecycleCoordinator.MarkNotReadyAsync(cancellationToken);
-        }
+        return Task.CompletedTask;
     }
 
     private static Task WaitForShutdownAsync(CancellationToken cancellationToken) =>

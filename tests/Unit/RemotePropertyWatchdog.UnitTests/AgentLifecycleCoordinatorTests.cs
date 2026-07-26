@@ -97,6 +97,47 @@ public sealed class AgentLifecycleCoordinatorTests
     }
 
     [Fact]
+    public async Task BackwardAndEqualClockStepsProduceRestartableChronologicalMarkers()
+    {
+        string markerPath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.json");
+        IOptions<AgentLifecycleOptions> options = Options.Create(new AgentLifecycleOptions { MarkerPath = markerPath });
+        DateTimeOffset initialTime = new(2026, 7, 15, 1, 2, 3, TimeSpan.Zero);
+        TestTimeProvider clock = new(initialTime);
+
+        using (AgentLifecycleCoordinator first = new(new FileAgentLifecycleStore(options), clock, options))
+        {
+            AgentLifecycleState started = await first.StartAsync(CancellationToken.None);
+            clock.Advance(TimeSpan.FromMinutes(-5));
+            AgentLifecycleState ready = await MarkReadyAsync(first);
+            clock.Advance(TimeSpan.FromMinutes(-5));
+            AgentLifecycleState stopped = await first.StopAsync(CancellationToken.None);
+
+            Assert.Equal(initialTime, started.StartedAtUtc);
+            Assert.Equal(started.StartedAtUtc, ready.ReadyAtUtc);
+            Assert.Equal(TimeSpan.Zero, ready.ReadinessElapsed);
+            Assert.Equal(ready.ReadyAtUtc, stopped.StoppedAtUtc);
+        }
+
+        AgentLifecycleMarker firstMarker = await ReadMarkerAsync(markerPath);
+        Assert.Equal(firstMarker.StartedAtUtc, firstMarker.ReadyAtUtc);
+        Assert.Equal(firstMarker.ReadyAtUtc, firstMarker.StoppedAtUtc);
+
+        using AgentLifecycleCoordinator restarted = new(new FileAgentLifecycleStore(options), clock, options);
+        AgentLifecycleState restartedState = await restarted.StartAsync(CancellationToken.None);
+        AgentLifecycleState restartedReady = await MarkReadyAsync(restarted);
+        AgentLifecycleState restartedStop = await restarted.StopAsync(CancellationToken.None);
+
+        Assert.Equal(firstMarker.StoppedAtUtc, restartedState.StartedAtUtc);
+        Assert.Equal(restartedState.StartedAtUtc, restartedReady.ReadyAtUtc);
+        Assert.Equal(TimeSpan.Zero, restartedReady.ReadinessElapsed);
+        Assert.Equal(restartedReady.ReadyAtUtc, restartedStop.StoppedAtUtc);
+
+        AgentLifecycleMarker restartedMarker = await ReadMarkerAsync(markerPath);
+        Assert.Equal(restartedMarker.StartedAtUtc, restartedMarker.ReadyAtUtc);
+        Assert.Equal(restartedMarker.ReadyAtUtc, restartedMarker.StoppedAtUtc);
+    }
+
+    [Fact]
     public async Task MarkNotReadyAsyncClearsActiveReadinessFromStateAndMarker()
     {
         InMemoryLifecycleStore store = new();
@@ -117,6 +158,30 @@ public sealed class AgentLifecycleCoordinatorTests
         Assert.Null(notReady.ReadinessElapsed);
         Assert.Null(store.Marker?.ReadyAtUtc);
         Assert.Null(store.Marker?.ReadinessElapsedMilliseconds);
+    }
+
+    [Fact]
+    public async Task JournalDegradationKeepsInMemoryStateNotReadyWhenMarkerWriteFails()
+    {
+        FailingLifecycleStore store = new();
+        TestTimeProvider clock = new(new DateTimeOffset(2026, 7, 15, 1, 2, 3, TimeSpan.Zero));
+        AgentLifecycleCoordinator coordinator = new(
+            store,
+            clock,
+            Options.Create(new AgentLifecycleOptions()));
+        await coordinator.StartAsync(CancellationToken.None);
+        await MarkReadyAsync(coordinator);
+        AgentLifecycleMarker readyMarker = Assert.IsType<AgentLifecycleMarker>(store.Marker);
+        store.FailWrites = true;
+
+        bool persisted = await coordinator.TransitionToJournalDegradedAsync(CancellationToken.None);
+
+        Assert.False(persisted);
+        Assert.False(coordinator.CurrentState?.IsReady);
+        Assert.Null(coordinator.CurrentState?.ReadyAtUtc);
+        Assert.Null(coordinator.CurrentState?.ReadinessElapsed);
+        Assert.Same(readyMarker, store.Marker);
+        Assert.NotNull(store.Marker?.ReadyAtUtc);
     }
 
     [Fact]
@@ -194,6 +259,26 @@ public sealed class AgentLifecycleCoordinatorTests
         Assert.Same(ambiguous, store.Marker);
     }
 
+    [Fact]
+    public async Task ContradictoryExternalChronologyRemainsRejected()
+    {
+        AgentLifecycleMarker contradictory = AuthenticLegacyMarker() with
+        {
+            ReadyAtUtc = new DateTimeOffset(2026, 7, 14, 22, 59, 59, TimeSpan.Zero)
+        };
+        InMemoryLifecycleStore store = new(contradictory);
+        AgentLifecycleCoordinator coordinator = new(
+            store,
+            new TestTimeProvider(new DateTimeOffset(2026, 7, 15, 2, 0, 0, TimeSpan.Zero)),
+            Options.Create(new AgentLifecycleOptions()));
+
+        await Assert.ThrowsAsync<InvalidDataException>(
+            () => coordinator.StartAsync(CancellationToken.None));
+
+        Assert.Null(coordinator.CurrentState);
+        Assert.Same(contradictory, store.Marker);
+    }
+
     private static AgentLifecycleMarker AuthenticLegacyMarker() =>
         new(
             Guid.Parse("11111111-1111-4111-8111-111111111111"),
@@ -228,6 +313,27 @@ public sealed class AgentLifecycleCoordinatorTests
 
         public Task WriteMarkerAsync(AgentLifecycleMarker marker, CancellationToken cancellationToken)
         {
+            Marker = marker;
+            return Task.CompletedTask;
+        }
+    }
+
+    private sealed class FailingLifecycleStore : IAgentLifecycleStore
+    {
+        public AgentLifecycleMarker? Marker { get; private set; }
+
+        public bool FailWrites { get; set; }
+
+        public Task<AgentLifecycleMarker?> ReadLastMarkerAsync(CancellationToken cancellationToken) =>
+            Task.FromResult(Marker);
+
+        public Task WriteMarkerAsync(AgentLifecycleMarker marker, CancellationToken cancellationToken)
+        {
+            if (FailWrites)
+            {
+                throw new IOException("synthetic lifecycle marker failure");
+            }
+
             Marker = marker;
             return Task.CompletedTask;
         }

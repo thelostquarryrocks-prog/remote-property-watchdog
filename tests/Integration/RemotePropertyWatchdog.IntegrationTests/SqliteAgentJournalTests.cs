@@ -1009,6 +1009,7 @@ public sealed class SqliteAgentJournalTests
             Options.Create(new AgentJournalOptions { DatabasePath = path, BusyTimeout = TimeSpan.FromSeconds(15) }),
             new FixedTimeProvider(Now),
             faultInjector ?? NoOpAgentJournalFaultInjector.Instance,
+            NoOpAgentJournalDegradationHandler.Instance,
             NullLogger<SqliteAgentJournal>.Instance);
 
     private static async Task AddSessionAsync(SqliteAgentJournal journal)

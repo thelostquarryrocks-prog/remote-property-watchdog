@@ -5,7 +5,10 @@ namespace RemotePropertyWatchdog.Agent.Service;
 public sealed class AgentLifecycleCoordinator(
     IAgentLifecycleStore store,
     TimeProvider timeProvider,
-    IOptions<AgentLifecycleOptions> options) : IAgentLifecycleCoordinator, IDisposable
+    IOptions<AgentLifecycleOptions> options) :
+    IAgentLifecycleCoordinator,
+    IAgentJournalDegradationHandler,
+    IDisposable
 {
     private readonly SemaphoreSlim gate = new(1, 1);
     private AgentLifecycleState? currentState;
@@ -24,7 +27,11 @@ public sealed class AgentLifecycleCoordinator(
 
             AgentLifecycleMarker? previous = await store.ReadLastMarkerAsync(cancellationToken);
             ValidatePreviousMarker(previous);
-            DateTimeOffset now = timeProvider.GetUtcNow();
+            DateTimeOffset now = NormalizeTransitionTimestamp(
+                timeProvider.GetUtcNow(),
+                previous?.StartedAtUtc,
+                previous?.ReadyAtUtc,
+                previous?.StoppedAtUtc);
             AgentLifecycleState state = new(
                 Guid.NewGuid(),
                 now,
@@ -87,13 +94,10 @@ public sealed class AgentLifecycleCoordinator(
                 return state;
             }
 
-            DateTimeOffset readyAtUtc = timeProvider.GetUtcNow();
+            DateTimeOffset readyAtUtc = NormalizeTransitionTimestamp(
+                timeProvider.GetUtcNow(),
+                state.StartedAtUtc);
             TimeSpan elapsed = readyAtUtc - state.StartedAtUtc;
-            if (elapsed < TimeSpan.Zero)
-            {
-                elapsed = TimeSpan.Zero;
-            }
-
             if (elapsed > options.Value.ReadinessTimeout)
             {
                 throw new InvalidOperationException("Lifecycle readiness exceeded the configured timeout.");
@@ -165,6 +169,35 @@ public sealed class AgentLifecycleCoordinator(
         }
     }
 
+    public async Task<bool> TransitionToJournalDegradedAsync(CancellationToken cancellationToken)
+    {
+        await gate.WaitAsync(cancellationToken);
+        try
+        {
+            AgentLifecycleState? state = currentState;
+            if (state?.IsReady != true)
+            {
+                return true;
+            }
+
+            state = state with { ReadyAtUtc = null, ReadinessElapsed = null };
+            Volatile.Write(ref currentState, state);
+            try
+            {
+                await store.WriteMarkerAsync(ToMarker(state), cancellationToken);
+                return true;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
     public async Task<AgentLifecycleState> StopAsync(CancellationToken cancellationToken)
     {
         await gate.WaitAsync(cancellationToken);
@@ -176,7 +209,11 @@ public sealed class AgentLifecycleCoordinator(
                 return state;
             }
 
-            state = state with { StoppedAtUtc = timeProvider.GetUtcNow(), PlannedShutdown = true };
+            DateTimeOffset stoppedAtUtc = NormalizeTransitionTimestamp(
+                timeProvider.GetUtcNow(),
+                state.StartedAtUtc,
+                state.ReadyAtUtc);
+            state = state with { StoppedAtUtc = stoppedAtUtc, PlannedShutdown = true };
             await store.WriteMarkerAsync(ToMarker(state), cancellationToken);
             currentState = state;
             return state;
@@ -188,6 +225,22 @@ public sealed class AgentLifecycleCoordinator(
     }
 
     public void Dispose() => gate.Dispose();
+
+    private static DateTimeOffset NormalizeTransitionTimestamp(
+        DateTimeOffset candidate,
+        params DateTimeOffset?[] lowerBounds)
+    {
+        DateTimeOffset normalized = candidate.ToUniversalTime();
+        foreach (DateTimeOffset? lowerBound in lowerBounds)
+        {
+            if (lowerBound.HasValue && normalized < lowerBound.Value)
+            {
+                normalized = lowerBound.Value;
+            }
+        }
+
+        return normalized;
+    }
 
     private static AgentLifecycleMarker ToMarker(AgentLifecycleState state) =>
         new(

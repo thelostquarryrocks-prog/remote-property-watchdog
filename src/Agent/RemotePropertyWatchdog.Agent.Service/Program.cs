@@ -30,7 +30,11 @@ public static class Program
                     .ValidateOnStart();
                 services.AddSingleton<IAgentLifecycleFileSystem, DefaultAgentLifecycleFileSystem>();
                 services.AddSingleton<IAgentLifecycleStore, FileAgentLifecycleStore>();
-                services.AddSingleton<IAgentLifecycleCoordinator, AgentLifecycleCoordinator>();
+                services.AddSingleton<AgentLifecycleCoordinator>();
+                services.AddSingleton<IAgentLifecycleCoordinator>(
+                    serviceProvider => serviceProvider.GetRequiredService<AgentLifecycleCoordinator>());
+                services.AddSingleton<IAgentJournalDegradationHandler>(
+                    serviceProvider => serviceProvider.GetRequiredService<AgentLifecycleCoordinator>());
                 services.AddSingleton<IAgentJournalFaultInjector>(NoOpAgentJournalFaultInjector.Instance);
                 services.AddSingleton<IAgentJournal, SqliteAgentJournal>();
                 services.AddSingleton<AgentWorker>();
