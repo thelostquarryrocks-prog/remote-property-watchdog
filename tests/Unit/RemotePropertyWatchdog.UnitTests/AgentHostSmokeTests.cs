@@ -85,6 +85,87 @@ public sealed class AgentHostSmokeTests
     }
 
     [Fact]
+    public async Task DuplicateProbeRetryPreservesRealHostReadinessMarkerAndLaterJournalWork()
+    {
+        string markerPath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.json");
+        string databasePath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.db");
+        ListLogger<SqliteAgentJournal> journalLogger = new();
+        using IHost host = Program.CreateHostBuilder([
+                "--AgentLifecycle:MarkerPath", markerPath,
+                "--AgentLifecycle:ReadinessTimeout", "00:01:00",
+                "--AgentJournal:DatabasePath", databasePath
+            ])
+            .ConfigureServices(services =>
+                services.AddSingleton<ILogger<SqliteAgentJournal>>(journalLogger))
+            .Build();
+
+        await host.StartAsync(CancellationToken.None);
+        IAgentLifecycleCoordinator coordinator = host.Services.GetRequiredService<IAgentLifecycleCoordinator>();
+        await WaitUntilReadyAsync(coordinator);
+        AgentLifecycleState readyState = Assert.IsType<AgentLifecycleState>(coordinator.CurrentState);
+        IAgentJournal journal = host.Services.GetRequiredService<IAgentJournal>();
+        AgentWorker worker = GetAgentWorker(host);
+        IAgentServiceHealth serviceHealth = host.Services.GetRequiredService<IAgentServiceHealth>();
+        FileAgentLifecycleStore lifecycleStore = new(
+            Options.Create(new AgentLifecycleOptions { MarkerPath = markerPath }));
+        AgentLifecycleMarker readyMarker = Assert.IsType<AgentLifecycleMarker>(
+            await lifecycleStore.ReadLastMarkerAsync(CancellationToken.None));
+        ProbeSampleWrite original = RuntimeProbe(readyState.SessionId, readyState.ReadyAtUtc!.Value) with
+        {
+            SampleId = "sample-ready-duplicate"
+        };
+
+        await journal.AppendProbeSampleAsync(original, CancellationToken.None);
+        await journal.AppendProbeSampleAsync(
+            original with
+            {
+                ObservedAtUtc = original.ObservedAtUtc.AddSeconds(1),
+                ProbeState = "unreachable",
+                TargetId = "target-alternate",
+                Evidence = ["probe_timeout"]
+            },
+            CancellationToken.None);
+        await journal.AppendProbeSampleAsync(
+            original with { SampleId = "sample-ready-after-duplicate" },
+            CancellationToken.None);
+        MaterialEventCommit commit = await journal.AppendMaterialEventAsync(
+            new MaterialEventWrite(
+                "event-ready-after-probe-duplicate",
+                "agent-synthetic",
+                "property-synthetic",
+                readyState.SessionId.ToString("D"),
+                original.ObservedAtUtc,
+                MaterialEventType.TargetStateChanged,
+                "target-synthetic",
+                "Synthetic target",
+                "up",
+                "down",
+                ["probe_timeout"],
+                "up",
+                "up"),
+            CancellationToken.None);
+
+        AgentLifecycleMarker markerAfterWrites = Assert.IsType<AgentLifecycleMarker>(
+            await lifecycleStore.ReadLastMarkerAsync(CancellationToken.None));
+        Assert.Equal(2L, await ReadProbeSampleCountAsync(databasePath));
+        Assert.Equal(1, commit.AgentSequence);
+        Assert.Single(await journal.ReadPendingOutboxAsync("agent-synthetic", 10, CancellationToken.None));
+        Assert.Equal(AgentJournalHealthState.Healthy, journal.Health.State);
+        Assert.Equal(AgentJournalHealthState.Healthy, worker.Health.State);
+        Assert.True(worker.IsReady);
+        Assert.Same(worker, serviceHealth);
+        Assert.True(serviceHealth.IsReady);
+        Assert.Equal(readyState, coordinator.CurrentState);
+        Assert.Equal(readyMarker, markerAfterWrites);
+        Assert.DoesNotContain(journalLogger.Entries, entry => entry.EventId is 101 or 104);
+        Assert.DoesNotContain(
+            journalLogger.Entries,
+            entry => entry.Message.Contains("runtime_write_failed", StringComparison.Ordinal));
+
+        await host.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
     public async Task AuthenticR0003UpgradeCreatesJournalThenRequiresAndReusesIt()
     {
         string markerPath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.json");
@@ -1564,6 +1645,21 @@ public sealed class AgentHostSmokeTests
             command.CommandText = $"SELECT COUNT(*) FROM {tableName};";
             Assert.Equal(0L, Convert.ToInt64(await command.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
         }
+    }
+
+    private static async Task<long> ReadProbeSampleCountAsync(string databasePath)
+    {
+        SqliteConnectionStringBuilder builder = new()
+        {
+            DataSource = databasePath,
+            Mode = SqliteOpenMode.ReadWrite,
+            Pooling = false
+        };
+        await using SqliteConnection connection = new(builder.ToString());
+        await connection.OpenAsync();
+        await using SqliteCommand command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM probe_samples;";
+        return Convert.ToInt64(await command.ExecuteScalarAsync(), CultureInfo.InvariantCulture);
     }
 
     private static async Task InsertOutboxForeignKeyViolationAsync(string databasePath)

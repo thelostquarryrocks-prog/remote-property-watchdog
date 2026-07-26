@@ -338,6 +338,116 @@ public sealed class SqliteAgentJournalTests
     }
 
     [Fact]
+    public async Task ExactProbeRetryIsAnIdempotentNoOpAndLaterProbeSucceeds()
+    {
+        using TestDatabase database = new();
+        using SqliteAgentJournal journal = CreateJournal(database.Path);
+        await AddSessionAsync(journal);
+        ProbeSampleWrite sample = Probe("sample-exact-retry");
+
+        await journal.AppendProbeSampleAsync(sample, CancellationToken.None);
+        await journal.AppendProbeSampleAsync(sample, CancellationToken.None);
+
+        Assert.Equal(AgentJournalHealthState.Healthy, journal.Health.State);
+        Assert.Equal(1L, await ReadProbeSampleCountAsync(database));
+
+        await journal.AppendProbeSampleAsync(Probe("sample-after-exact-retry"), CancellationToken.None);
+        Assert.Equal(2L, await ReadProbeSampleCountAsync(database));
+    }
+
+    [Fact]
+    public async Task ProbeRetryWithDifferentContentLeavesOriginalRowUnchanged()
+    {
+        using TestDatabase database = new();
+        using SqliteAgentJournal journal = CreateJournal(database.Path);
+        await AddSessionAsync(journal);
+        await journal.RecordSessionAsync(
+            new AgentSessionRecord("session-alternate", Now.AddMinutes(-1)),
+            CancellationToken.None);
+        ProbeSampleWrite original = Probe("sample-content-retry");
+        await journal.AppendProbeSampleAsync(original, CancellationToken.None);
+        string originalSignature = await ReadProbeSampleSignatureAsync(database, original.SampleId);
+
+        ProbeSampleWrite conflictingRetry = original with
+        {
+            AgentId = "agent-alternate",
+            SessionId = "session-alternate",
+            ObservedAtUtc = Now.AddMinutes(1),
+            ProbeKind = "icmp",
+            ProbeState = "unreachable",
+            TargetId = "target-alternate",
+            Evidence = ["probe_timeout"]
+        };
+        await journal.AppendProbeSampleAsync(conflictingRetry, CancellationToken.None);
+
+        Assert.Equal(originalSignature, await ReadProbeSampleSignatureAsync(database, original.SampleId));
+        Assert.Equal(1L, await ReadProbeSampleCountAsync(database));
+        Assert.Equal(AgentJournalHealthState.Healthy, journal.Health.State);
+
+        await journal.AppendProbeSampleAsync(Probe("sample-after-content-retry"), CancellationToken.None);
+        Assert.Equal(2L, await ReadProbeSampleCountAsync(database));
+    }
+
+    [Fact]
+    public async Task ConcurrentProbeRetriesCommitExactlyOneRowWithoutDegrading()
+    {
+        using TestDatabase database = new();
+        using SqliteAgentJournal setup = CreateJournal(database.Path);
+        await AddSessionAsync(setup);
+        const int writerCount = 12;
+        SqliteAgentJournal[] journals = Enumerable.Range(0, writerCount)
+            .Select(_ => CreateJournal(database.Path))
+            .ToArray();
+        TaskCompletionSource start = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            await Task.WhenAll(journals.Select(InitializeExistingAsync));
+            Task[] writes = journals
+                .Select(journal => Task.Run(async () =>
+                {
+                    await start.Task;
+                    await journal.AppendProbeSampleAsync(Probe("sample-concurrent-retry"), CancellationToken.None);
+                }))
+                .ToArray();
+
+            start.SetResult();
+            await Task.WhenAll(writes);
+
+            Assert.Equal(1L, await ReadProbeSampleCountAsync(database));
+            Assert.All(journals, journal => Assert.Equal(AgentJournalHealthState.Healthy, journal.Health.State));
+            await setup.AppendProbeSampleAsync(Probe("sample-after-concurrent-retry"), CancellationToken.None);
+            Assert.Equal(2L, await ReadProbeSampleCountAsync(database));
+        }
+        finally
+        {
+            foreach (SqliteAgentJournal journal in journals)
+            {
+                journal.Dispose();
+            }
+        }
+    }
+
+    [Fact]
+    public async Task ProbeForeignKeyFailureStillDegradesAndBlocksLaterWork()
+    {
+        using TestDatabase database = new();
+        using SqliteAgentJournal journal = CreateJournal(database.Path);
+        await AddSessionAsync(journal);
+
+        AgentJournalDegradedException error = await Assert.ThrowsAsync<AgentJournalDegradedException>(
+            () => journal.AppendProbeSampleAsync(
+                Probe("sample-invalid-session") with { SessionId = "session-missing" },
+                CancellationToken.None));
+
+        AssertRuntimeDegraded(journal, error, "runtime_write_failed");
+        Assert.Equal(0L, await ReadProbeSampleCountAsync(database));
+        Assert.Equal(0L, await ReadForeignKeyViolationCountAsync(database));
+        AgentJournalDegradedException blocked = await Assert.ThrowsAsync<AgentJournalDegradedException>(
+            () => journal.AppendProbeSampleAsync(Probe("sample-after-invalid-session"), CancellationToken.None));
+        Assert.Equal(error.Health, blocked.Health);
+    }
+
+    [Fact]
     public async Task SessionExactAndStaleRetriesCannotRegressStoredMilestones()
     {
         using TestDatabase database = new();
@@ -1073,6 +1183,10 @@ public sealed class SqliteAgentJournalTests
         Assert.Equal(AgentJournalHealthState.NotInitialized, journal.Health.State);
         await InitializeFreshAsync(journal);
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => journal.AppendProbeSampleAsync(Probe("sample-cancelled"), canceled.Token));
+        Assert.Equal(0L, await ReadProbeSampleCountAsync(database));
+        Assert.Equal(AgentJournalHealthState.Healthy, journal.Health.State);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
             () => journal.ReadPendingOutboxAsync("agent-synthetic", 1, canceled.Token));
         Assert.Equal(AgentJournalHealthState.Healthy, journal.Health.State);
     }
@@ -1367,6 +1481,37 @@ public sealed class SqliteAgentJournalTests
         await using SqliteConnection connection = await database.OpenAsync();
         Assert.Equal(materialEvents, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM material_events;"));
         Assert.Equal(outbox, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM outbox;"));
+    }
+
+    private static async Task<long> ReadProbeSampleCountAsync(TestDatabase database)
+    {
+        await using SqliteConnection connection = await database.OpenAsync();
+        return await ScalarInt64Async(connection, "SELECT COUNT(*) FROM probe_samples;");
+    }
+
+    private static async Task<string> ReadProbeSampleSignatureAsync(TestDatabase database, string sampleId)
+    {
+        await using SqliteConnection connection = await database.OpenAsync();
+        await using SqliteCommand command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT agent_id, session_id, observed_at_utc, probe_kind, probe_state, target_id, evidence_json
+            FROM probe_samples
+            WHERE sample_id = $sample_id;
+            """;
+        command.Parameters.AddWithValue("$sample_id", sampleId);
+        await using SqliteDataReader reader = await command.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        string signature = string.Join(
+            "\u001f",
+            reader.GetString(0),
+            reader.GetString(1),
+            reader.GetString(2),
+            reader.GetString(3),
+            reader.GetString(4),
+            reader.IsDBNull(5) ? "<null>" : reader.GetString(5),
+            reader.GetString(6));
+        Assert.False(await reader.ReadAsync());
+        return signature;
     }
 
     private static async Task<AgentSessionRecord> ReadSessionAsync(TestDatabase database)

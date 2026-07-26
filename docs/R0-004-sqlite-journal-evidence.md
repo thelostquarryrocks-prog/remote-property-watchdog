@@ -31,6 +31,16 @@ If the lifecycle-marker replacement fails during runtime degradation, the servic
 
 Session persistence uses a single worker boundary for started, ready, and stopped milestones. Cancellation is rethrown unchanged. A ready failure before commit rolls back to the started milestone, retains the exact bounded degradation reason, never publishes readiness, blocks later ordinary journal work, and waits for shutdown without retry. A failure after the SQLite commit but before publication leaves the committed ready milestone intact while the marker, coordinator, worker, and service-health surfaces remain not ready; the unclean marker makes the next process start deterministic, and the existing owned journal is validated and reused. A degradation in that post-commit/pre-publication interval has the same durable SQLite outcome but wins the transition gate and rejects publication. A cancellation while readiness waits for the transition gate never enters the publication delegate. Cancellation during lifecycle-marker serialization cannot expose a partial JSON marker because the store writes a separate temporary file and replaces atomically; `CurrentState` changes only after replacement succeeds. No code falsifies or rolls back an already committed SQLite milestone. Stopped or planned-shutdown lifecycle state is never reported ready.
 
+## Duplicate probe retry semantics
+
+`ProbeSampleWrite.SampleId` is caller-supplied and is the `probe_samples.sample_id` primary key. The original insertion used an unconditional `INSERT`, so a legitimate retry of an already committed sample raised a SQLite primary-key exception. The common runtime storage-failure boundary then classified that expected domain collision as `runtime_write_failed`, terminally degraded the otherwise healthy journal, propagated not-ready state to every readiness surface, and blocked later ordinary work.
+
+`IAgentJournal.AppendProbeSampleAsync` returns `Task` and defines no duplicate result object or duplicate exception. Its established duplicate contract is therefore idempotent success: the first accepted sample is durable, and later submissions with the same `sample_id` complete as successful no-ops. The insert now uses `ON CONFLICT(sample_id) DO NOTHING`. This is an atomic conflict target for only the probe primary key; it is not `INSERT OR IGNORE`, exception-message parsing, a read-before-insert check, or broad classification of SQLite constraint errors.
+
+Same-ID/same-content and same-ID/different-content retries both retain the original durable row byte-for-value at the column level. The retry never replaces, updates, or merges the stored timestamp, session, agent, probe kind/state, target, or evidence. Concurrent submissions serialize through SQLite's unique primary-key enforcement: exactly one row commits and every other caller receives the same successful no-op outcome. Duplicate handling emits no degradation reason or duplicate log and does not expose sample IDs, payloads, SQL, paths, or customer/LAN data.
+
+All non-`sample_id` failures retain the existing fail-closed path. A new probe ID with a missing session still raises the foreign-key constraint, becomes bounded `runtime_write_failed`, clears readiness through the shared transition gate, and blocks later work. CHECK, NOT NULL, schema, database I/O, read-only/full/locked-after-policy, transaction, corruption, lifecycle, and unexpected constraint failures are not suppressed. Pre-cancellation still propagates `OperationCanceledException` without writing or degrading. Deterministic integration coverage proves exact retry, changed-content retry, coordinated concurrent retry, original-row preservation, later valid probe activity, foreign-key classification, and cancellation. A real-host test additionally proves duplicate handling leaves `AgentWorker`, `AgentLifecycleCoordinator.CurrentState`, `IAgentServiceHealth`, and the durable lifecycle marker ready and unchanged; later probe, sequence, material-event, and outbox operations remain available, with no `runtime_write_failed` or `lifecycle_marker_write_failed` log.
+
 The configured database path must be absolute. The default is `RemotePropertyWatchdog/Agent/agent-journal.db` below the operating system's common application-data directory. Logs contain schema/health codes and sequence numbers, not database paths, payloads, target labels, evidence contents, or exception text.
 
 ## Schema version and migration behavior
@@ -126,6 +136,10 @@ The automated test suite demonstrates:
 - corrupt real-host startup remaining visibly degraded, not ready, and byte-for-byte unmodified through clean shutdown;
 - session exact/stale retry non-regression, forward milestone progression, deterministic conflict rejection, and chronology validation;
 - first synthetic probe and material event writes satisfying the local-session foreign key without adding a fake or authenticated agent identity to the session;
+- same-content and changed-content duplicate probe retries completing as idempotent no-ops, retaining exactly one unchanged original row, preserving healthy journal state, and permitting a later distinct probe;
+- twelve coordinated concurrent submissions for one probe `sample_id` committing exactly one row with no exception, degradation, deadlock, partial transaction, arbitrary delay, or timing-based assertion;
+- a new probe ID with an invalid session retaining bounded terminal `runtime_write_failed` behavior, creating no row or foreign-key violation, and blocking later ordinary work;
+- real-host duplicate handling preserving worker, coordinator, formal service-health, and durable marker readiness while later probe, sequence, material-event, and outbox activity succeeds and no degradation reason is logged;
 - all-or-none rollback before commit and both rows after a post-commit fault;
 - restart continuation at the next committed sequence;
 - deterministic duplicate-ID rejection without an outbox row or sequence gap;
@@ -154,7 +168,7 @@ The automated test suite demonstrates:
 
 ## Validation
 
-The P2 foreign-key integrity correction was validated with:
+The P1 duplicate-probe correction was validated with:
 
 - `python scripts/validate-kickoff.py`
 - `python scripts/scan-secrets.py`
@@ -165,7 +179,7 @@ The P2 foreign-key integrity correction was validated with:
 - `dotnet list ./RemotePropertyWatchdog.sln package --vulnerable --include-transitive`
 - `git diff --check`
 
-Final local result: **162 passed, 0 failed, 0 skipped** (70 unit, 83 integration, 8 contract, 1 build). The Release build completed with 0 warnings and 0 errors. Kickoff validation, secret scanning, the aggregate repository test script, diff checks, and generated database/WAL/SHM and path/data scans passed. The vulnerability audit found no known vulnerable direct or transitive packages. The sandbox-only full-suite invocation produced 11 Windows Event Log access failures after 151 tests passed; the unchanged suite was rerun through the authorized Windows project context and all 162 tests passed. No production logging or security behavior was weakened.
+Final local result: **167 passed, 0 failed, 0 skipped** (71 unit, 87 integration, 8 contract, 1 build). The Release build completed with 0 warnings and 0 errors. Kickoff validation, secret scanning, the aggregate repository test script, diff checks, and generated database/WAL/SHM and path/data scans passed. The vulnerability audit found no known vulnerable direct or transitive packages. Both sandbox-only full-suite invocations (direct and through the aggregate script) produced the same 11 Windows Event Log access failures after 156 tests passed; each unchanged validation path was rerun through the authorized normal Windows project context and all 167 tests passed. No production logging or security behavior was weakened.
 
 The repository ignore rules cover `*.db`, `*.sqlite`, and `*.sqlite3` databases plus their `-journal`, `-wal`, and `-shm` companions. Generated databases use operating-system temporary directories and are not committed. Test identities and values are synthetic; no customer or LAN data is used.
 

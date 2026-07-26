@@ -223,7 +223,8 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
                     INSERT INTO probe_samples (
                         sample_id, agent_id, session_id, observed_at_utc, probe_kind, probe_state, target_id, evidence_json)
                     VALUES (
-                        $sample_id, $agent_id, $session_id, $observed_at_utc, $probe_kind, $probe_state, $target_id, $evidence_json);
+                        $sample_id, $agent_id, $session_id, $observed_at_utc, $probe_kind, $probe_state, $target_id, $evidence_json)
+                    ON CONFLICT(sample_id) DO NOTHING;
                     """;
                 command.Parameters.AddWithValue("$sample_id", sample.SampleId);
                 command.Parameters.AddWithValue("$agent_id", sample.AgentId);
