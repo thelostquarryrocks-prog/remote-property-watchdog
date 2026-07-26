@@ -25,9 +25,16 @@ public sealed partial class AgentWorker(
             AgentLifecycleState started = await lifecycleCoordinator.StartAsync(stoppingToken);
             LogAgentHostStarted(logger, started.SessionId, started.StartedAtUtc, started.PreviousSessionId, started.PreviousSessionEndedCleanly);
 
-            AgentJournalInitializationMode initializationMode = started.PreviousSessionId is null
-                ? AgentJournalInitializationMode.CreateIfMissingForFreshLifecycle
-                : AgentJournalInitializationMode.RequireExistingForPriorLifecycle;
+            AgentJournalInitializationMode initializationMode;
+            if (started.HasJournalOwnership)
+            {
+                initializationMode = AgentJournalInitializationMode.RequireExistingForPriorLifecycle;
+            }
+            else
+            {
+                await lifecycleCoordinator.ClaimJournalOwnershipAsync(stoppingToken);
+                initializationMode = AgentJournalInitializationMode.CreateIfMissingForFreshLifecycle;
+            }
             AgentJournalHealth journalHealth = await agentJournal.InitializeAsync(initializationMode, stoppingToken);
             if (journalHealth.State != AgentJournalHealthState.Healthy)
             {
@@ -42,13 +49,14 @@ public sealed partial class AgentWorker(
                 return;
             }
 
-            AgentLifecycleState ready = await lifecycleCoordinator.MarkReadyAsync(stoppingToken);
+            AgentLifecycleState ready = await lifecycleCoordinator.PrepareReadyAsync(stoppingToken);
             if (!await TryPersistSessionAsync(ToJournalSession(ready), stoppingToken))
             {
                 await WaitForShutdownAsync(stoppingToken);
                 return;
             }
 
+            ready = await lifecycleCoordinator.PublishReadyAsync(ready, stoppingToken);
             Interlocked.Exchange(ref monitoringReady, 1);
             LogAgentHostReady(logger, ready.SessionId, ready.ReadyAtUtc!.Value, ready.ReadinessElapsed!.Value.TotalMilliseconds, options.Value.ReadinessTimeout.TotalSeconds);
 

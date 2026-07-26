@@ -15,7 +15,7 @@ public sealed class AgentLifecycleCoordinatorTests
         AgentLifecycleCoordinator firstCoordinator = new(new FileAgentLifecycleStore(options), clock, options);
         AgentLifecycleState firstStart = await firstCoordinator.StartAsync(CancellationToken.None);
         clock.Advance(TimeSpan.FromSeconds(1));
-        AgentLifecycleState firstReady = await firstCoordinator.MarkReadyAsync(CancellationToken.None);
+        AgentLifecycleState firstReady = await MarkReadyAsync(firstCoordinator);
         clock.Advance(TimeSpan.FromSeconds(1));
         AgentLifecycleState firstStop = await firstCoordinator.StopAsync(CancellationToken.None);
 
@@ -33,7 +33,7 @@ public sealed class AgentLifecycleCoordinatorTests
         AgentLifecycleCoordinator secondCoordinator = new(new FileAgentLifecycleStore(options), clock, options);
         AgentLifecycleState secondStart = await secondCoordinator.StartAsync(CancellationToken.None);
         clock.Advance(TimeSpan.FromSeconds(1));
-        AgentLifecycleState secondReady = await secondCoordinator.MarkReadyAsync(CancellationToken.None);
+        AgentLifecycleState secondReady = await MarkReadyAsync(secondCoordinator);
 
         Assert.NotEqual(firstStart.SessionId, secondStart.SessionId);
         Assert.Equal(firstStart.SessionId, secondStart.PreviousSessionId);
@@ -72,7 +72,7 @@ public sealed class AgentLifecycleCoordinatorTests
         await coordinator.StartAsync(CancellationToken.None);
         clock.Advance(TimeSpan.FromMilliseconds(1500));
 
-        AgentLifecycleState ready = await coordinator.MarkReadyAsync(CancellationToken.None);
+        AgentLifecycleState ready = await MarkReadyAsync(coordinator);
 
         Assert.True(ready.IsReady);
         Assert.Equal(TimeSpan.FromMilliseconds(1500), ready.ReadinessElapsed);
@@ -89,7 +89,7 @@ public sealed class AgentLifecycleCoordinatorTests
         await coordinator.StartAsync(CancellationToken.None);
         clock.Advance(TimeSpan.FromSeconds(2));
 
-        await Assert.ThrowsAsync<InvalidOperationException>(() => coordinator.MarkReadyAsync(CancellationToken.None));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => coordinator.PrepareReadyAsync(CancellationToken.None));
 
         Assert.Null(store.Marker?.ReadyAtUtc);
         Assert.Null(store.Marker?.ReadinessElapsedMilliseconds);
@@ -107,7 +107,7 @@ public sealed class AgentLifecycleCoordinatorTests
             Options.Create(new AgentLifecycleOptions()));
         await coordinator.StartAsync(CancellationToken.None);
         clock.Advance(TimeSpan.FromSeconds(1));
-        Assert.True((await coordinator.MarkReadyAsync(CancellationToken.None)).IsReady);
+        Assert.True((await MarkReadyAsync(coordinator)).IsReady);
 
         AgentLifecycleState notReady = await coordinator.MarkNotReadyAsync(CancellationToken.None);
 
@@ -119,6 +119,99 @@ public sealed class AgentLifecycleCoordinatorTests
         Assert.Null(store.Marker?.ReadinessElapsedMilliseconds);
     }
 
+    [Fact]
+    public async Task PreparedReadinessIsNotPublishedUntilExplicitPublication()
+    {
+        InMemoryLifecycleStore store = new();
+        TestTimeProvider clock = new(new DateTimeOffset(2026, 7, 15, 1, 2, 3, TimeSpan.Zero));
+        AgentLifecycleCoordinator coordinator = new(
+            store,
+            clock,
+            Options.Create(new AgentLifecycleOptions()));
+        await coordinator.StartAsync(CancellationToken.None);
+        clock.Advance(TimeSpan.FromSeconds(1));
+
+        AgentLifecycleState candidate = await coordinator.PrepareReadyAsync(CancellationToken.None);
+
+        Assert.True(candidate.IsReady);
+        Assert.False(coordinator.CurrentState?.IsReady);
+        Assert.Null(store.Marker?.ReadyAtUtc);
+        Assert.Null(store.Marker?.ReadinessElapsedMilliseconds);
+
+        AgentLifecycleState published = await coordinator.PublishReadyAsync(candidate, CancellationToken.None);
+
+        Assert.True(coordinator.CurrentState?.IsReady);
+        Assert.Equal(candidate.ReadyAtUtc, published.ReadyAtUtc);
+        Assert.Equal(candidate.ReadinessElapsed, published.ReadinessElapsed);
+        Assert.Equal(candidate.ReadyAtUtc, store.Marker?.ReadyAtUtc);
+    }
+
+    [Fact]
+    public async Task InterruptedLegacyUpgradeCannotReauthorizeCreationAfterOwnershipClaim()
+    {
+        AgentLifecycleMarker legacy = AuthenticLegacyMarker();
+        InMemoryLifecycleStore store = new(legacy);
+        TestTimeProvider clock = new(new DateTimeOffset(2026, 7, 15, 2, 0, 0, TimeSpan.Zero));
+        IOptions<AgentLifecycleOptions> options = Options.Create(new AgentLifecycleOptions());
+
+        using (AgentLifecycleCoordinator beforeClaim = new(store, clock, options))
+        {
+            AgentLifecycleState started = await beforeClaim.StartAsync(CancellationToken.None);
+            Assert.False(started.HasJournalOwnership);
+        }
+
+        clock.Advance(TimeSpan.FromSeconds(1));
+        using (AgentLifecycleCoordinator retryBeforeClaim = new(store, clock, options))
+        {
+            AgentLifecycleState retried = await retryBeforeClaim.StartAsync(CancellationToken.None);
+            Assert.False(retried.HasJournalOwnership);
+            AgentLifecycleState claimed = await retryBeforeClaim.ClaimJournalOwnershipAsync(CancellationToken.None);
+            Assert.True(claimed.HasJournalOwnership);
+        }
+
+        clock.Advance(TimeSpan.FromSeconds(1));
+        using AgentLifecycleCoordinator afterClaim = new(store, clock, options);
+        AgentLifecycleState restarted = await afterClaim.StartAsync(CancellationToken.None);
+
+        Assert.True(restarted.HasJournalOwnership);
+        Assert.Equal(AgentLifecycleMarker.CurrentJournalOwnershipVersion, store.Marker?.JournalOwnershipVersion);
+    }
+
+    [Fact]
+    public async Task AmbiguousOwnershipEvidenceIsRejectedBeforeLifecycleStart()
+    {
+        AgentLifecycleMarker ambiguous = AuthenticLegacyMarker() with { JournalOwnershipVersion = 0 };
+        InMemoryLifecycleStore store = new(ambiguous);
+        AgentLifecycleCoordinator coordinator = new(
+            store,
+            new TestTimeProvider(new DateTimeOffset(2026, 7, 15, 2, 0, 0, TimeSpan.Zero)),
+            Options.Create(new AgentLifecycleOptions()));
+
+        await Assert.ThrowsAsync<InvalidDataException>(
+            () => coordinator.StartAsync(CancellationToken.None));
+
+        Assert.Null(coordinator.CurrentState);
+        Assert.Same(ambiguous, store.Marker);
+    }
+
+    private static AgentLifecycleMarker AuthenticLegacyMarker() =>
+        new(
+            Guid.Parse("11111111-1111-4111-8111-111111111111"),
+            new DateTimeOffset(2026, 7, 14, 23, 0, 0, TimeSpan.Zero),
+            new DateTimeOffset(2026, 7, 14, 23, 0, 1, TimeSpan.Zero),
+            1000,
+            new DateTimeOffset(2026, 7, 14, 23, 0, 2, TimeSpan.Zero),
+            PlannedShutdown: true,
+            PreviousSessionId: null,
+            PreviousSessionEndedCleanly: true);
+
+    private static async Task<AgentLifecycleState> MarkReadyAsync(
+        AgentLifecycleCoordinator coordinator)
+    {
+        AgentLifecycleState ready = await coordinator.PrepareReadyAsync(CancellationToken.None);
+        return await coordinator.PublishReadyAsync(ready, CancellationToken.None);
+    }
+
     private static async Task<AgentLifecycleMarker> ReadMarkerAsync(string markerPath)
     {
         FileAgentLifecycleStore store = new(Options.Create(new AgentLifecycleOptions { MarkerPath = markerPath }));
@@ -127,9 +220,9 @@ public sealed class AgentLifecycleCoordinatorTests
         return marker;
     }
 
-    private sealed class InMemoryLifecycleStore : IAgentLifecycleStore
+    private sealed class InMemoryLifecycleStore(AgentLifecycleMarker? marker = null) : IAgentLifecycleStore
     {
-        public AgentLifecycleMarker? Marker { get; private set; }
+        public AgentLifecycleMarker? Marker { get; private set; } = marker;
 
         public Task<AgentLifecycleMarker?> ReadLastMarkerAsync(CancellationToken cancellationToken) => Task.FromResult(Marker);
 

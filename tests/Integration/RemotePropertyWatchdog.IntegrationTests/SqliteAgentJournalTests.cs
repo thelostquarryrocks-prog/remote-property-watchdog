@@ -1308,6 +1308,8 @@ public sealed class SqliteAgentJournalTests
                 : Task.CompletedTask;
         }
 
+        public Task AfterSessionCommitAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
         public Task BeforeMaterialEventCommitAsync(CancellationToken cancellationToken) => Task.CompletedTask;
 
         public Task AfterMaterialEventCommitAsync(CancellationToken cancellationToken) => Task.CompletedTask;
@@ -1316,6 +1318,8 @@ public sealed class SqliteAgentJournalTests
     private sealed class ThrowingFaultInjector(bool beforeCommit = false, bool afterCommit = false) : IAgentJournalFaultInjector
     {
         public Task BeforeSessionCommitAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public Task AfterSessionCommitAsync(CancellationToken cancellationToken) => Task.CompletedTask;
 
         public Task BeforeMaterialEventCommitAsync(CancellationToken cancellationToken) =>
             beforeCommit ? Task.FromException(new SyntheticJournalFaultException()) : Task.CompletedTask;

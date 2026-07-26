@@ -54,6 +54,7 @@ public sealed class AgentHostSmokeTests
 
         Assert.NotNull(started);
         Assert.Null(started.PreviousSessionId);
+        Assert.True(started.HasJournalOwnership);
         await WaitUntilJournalSessionReadyAsync(databasePath, started.SessionId);
         await host.StopAsync(CancellationToken.None);
 
@@ -75,6 +76,137 @@ public sealed class AgentHostSmokeTests
         Assert.Equal(AgentJournalHealthState.Healthy, health.State);
         Assert.Equal(SqliteJournalSchema.CurrentVersion, health.SchemaVersion);
     }
+
+    [Fact]
+    public async Task AuthenticR0003UpgradeCreatesJournalThenRequiresAndReusesIt()
+    {
+        string markerPath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.json");
+        string databasePath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.db");
+        Guid legacySessionId = Guid.Parse("11111111-1111-4111-8111-111111111111");
+        await WriteAuthenticR0003MarkerAsync(markerPath, legacySessionId);
+
+        Guid upgradedSessionId;
+        using (IHost upgradeHost = CreateHost(markerPath, databasePath))
+        {
+            await upgradeHost.StartAsync(CancellationToken.None);
+            IAgentLifecycleCoordinator coordinator = upgradeHost.Services.GetRequiredService<IAgentLifecycleCoordinator>();
+            await WaitUntilReadyAsync(coordinator);
+            upgradedSessionId = coordinator.CurrentState!.SessionId;
+
+            Assert.Equal(legacySessionId, coordinator.CurrentState.PreviousSessionId);
+            Assert.True(coordinator.CurrentState.HasJournalOwnership);
+            Assert.NotNull(await ReadJournalSessionAsync(databasePath, upgradedSessionId));
+            AgentLifecycleMarker marker = Assert.IsType<AgentLifecycleMarker>(
+                await new FileAgentLifecycleStore(
+                        Options.Create(new AgentLifecycleOptions { MarkerPath = markerPath }))
+                    .ReadLastMarkerAsync(CancellationToken.None));
+            Assert.Equal(AgentLifecycleMarker.CurrentJournalOwnershipVersion, marker.JournalOwnershipVersion);
+
+            await upgradeHost.StopAsync(CancellationToken.None);
+        }
+
+        Guid restartedSessionId;
+        using (IHost restartedHost = CreateHost(markerPath, databasePath))
+        {
+            await restartedHost.StartAsync(CancellationToken.None);
+            IAgentLifecycleCoordinator coordinator = restartedHost.Services.GetRequiredService<IAgentLifecycleCoordinator>();
+            await WaitUntilReadyAsync(coordinator);
+            restartedSessionId = coordinator.CurrentState!.SessionId;
+
+            Assert.Equal(upgradedSessionId, coordinator.CurrentState.PreviousSessionId);
+            Assert.True(coordinator.CurrentState.HasJournalOwnership);
+            Assert.NotNull(await ReadJournalSessionAsync(databasePath, upgradedSessionId));
+            Assert.NotNull(await ReadJournalSessionAsync(databasePath, restartedSessionId));
+
+            await restartedHost.StopAsync(CancellationToken.None);
+        }
+
+        File.Delete(databasePath);
+        File.Delete($"{databasePath}-wal");
+        File.Delete($"{databasePath}-shm");
+        AssertJournalFilesAbsent(databasePath);
+
+        using IHost missingHost = CreateHost(markerPath, databasePath);
+        await missingHost.StartAsync(CancellationToken.None);
+        IAgentJournal journal = missingHost.Services.GetRequiredService<IAgentJournal>();
+        IAgentLifecycleCoordinator missingCoordinator = missingHost.Services.GetRequiredService<IAgentLifecycleCoordinator>();
+        await WaitUntilJournalStateAsync(journal, AgentJournalHealthState.Degraded);
+
+        Assert.Equal("database_missing", journal.Health.ReasonCode);
+        Assert.Equal(restartedSessionId, missingCoordinator.CurrentState?.PreviousSessionId);
+        Assert.False(missingCoordinator.CurrentState?.IsReady);
+        AssertJournalFilesAbsent(databasePath);
+
+        await missingHost.StopAsync(CancellationToken.None);
+        AssertJournalFilesAbsent(databasePath);
+    }
+
+    [Fact]
+    public async Task CrashAfterOwnershipClaimBeforeJournalCreationFailsClosedOnRestart()
+    {
+        string markerPath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.json");
+        string databasePath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.db");
+        await WriteAuthenticR0003MarkerAsync(
+            markerPath,
+            Guid.Parse("22222222-2222-4222-8222-222222222222"));
+        IOptions<AgentLifecycleOptions> options = Options.Create(new AgentLifecycleOptions { MarkerPath = markerPath });
+        using (AgentLifecycleCoordinator interrupted = new(
+                   new FileAgentLifecycleStore(options),
+                   TimeProvider.System,
+                   options))
+        {
+            await interrupted.StartAsync(CancellationToken.None);
+            AgentLifecycleState claimed = await interrupted.ClaimJournalOwnershipAsync(CancellationToken.None);
+            Assert.True(claimed.HasJournalOwnership);
+        }
+
+        AssertJournalFilesAbsent(databasePath);
+
+        using IHost restartedHost = CreateHost(markerPath, databasePath);
+        await restartedHost.StartAsync(CancellationToken.None);
+        IAgentJournal journal = restartedHost.Services.GetRequiredService<IAgentJournal>();
+        IAgentLifecycleCoordinator coordinator = restartedHost.Services.GetRequiredService<IAgentLifecycleCoordinator>();
+        await WaitUntilJournalStateAsync(journal, AgentJournalHealthState.Degraded);
+
+        Assert.Equal("database_missing", journal.Health.ReasonCode);
+        Assert.True(coordinator.CurrentState?.HasJournalOwnership);
+        Assert.False(coordinator.CurrentState?.IsReady);
+        AssertJournalFilesAbsent(databasePath);
+
+        await restartedHost.StopAsync(CancellationToken.None);
+        AssertJournalFilesAbsent(databasePath);
+    }
+
+    [Fact]
+    public async Task MalformedLegacyMarkerCannotAuthorizeJournalCreation()
+    {
+        string markerPath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.json");
+        string databasePath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.db");
+        Directory.CreateDirectory(Path.GetDirectoryName(markerPath)!);
+        await File.WriteAllTextAsync(markerPath, "{}", CancellationToken.None);
+        ListLogger<AgentWorker> logger = new();
+        using IHost host = Program.CreateHostBuilder([
+                "--AgentLifecycle:MarkerPath", markerPath,
+                "--AgentLifecycle:ReadinessTimeout", "00:01:00",
+                "--AgentJournal:DatabasePath", databasePath
+            ])
+            .ConfigureServices(services =>
+                services.AddSingleton<ILogger<AgentWorker>>(logger))
+            .Build();
+
+        await host.StartAsync(CancellationToken.None);
+        await WaitUntilLoggedAsync(logger, eventId: 5);
+        IAgentJournal journal = host.Services.GetRequiredService<IAgentJournal>();
+        IAgentLifecycleCoordinator coordinator = host.Services.GetRequiredService<IAgentLifecycleCoordinator>();
+
+        Assert.Equal(AgentJournalHealthState.NotInitialized, journal.Health.State);
+        Assert.Null(coordinator.CurrentState);
+        AssertJournalFilesAbsent(databasePath);
+
+        await host.StopAsync(CancellationToken.None);
+        AssertJournalFilesAbsent(databasePath);
+    }
+
 
     [Fact]
     public async Task InitialSessionStorageFailureDegradesRealWorkerBeforeReadinessAndStopsFurtherJournalWork()
@@ -164,6 +296,115 @@ public sealed class AgentHostSmokeTests
         Assert.False(serviceHealth.IsReady);
         Assert.Equal(2, faultInjector.Calls);
         Assert.Equal("runtime_write_failed", serviceHealth.Health.ReasonCode);
+    }
+
+    [Fact]
+    public async Task ReadyCommitRemainsUnpublishedWhileBlockedAndPublishesOneTimestampAfterCommit()
+    {
+        string markerPath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.json");
+        string databasePath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.db");
+        BlockingReadySessionFaultInjector faultInjector = new();
+        using IHost host = CreateHostWithFaultInjector(markerPath, databasePath, faultInjector);
+
+        await host.StartAsync(CancellationToken.None);
+        await faultInjector.ReadyCommitEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        IAgentJournal journal = host.Services.GetRequiredService<IAgentJournal>();
+        IAgentLifecycleCoordinator coordinator = host.Services.GetRequiredService<IAgentLifecycleCoordinator>();
+        AgentWorker worker = GetAgentWorker(host);
+        IAgentServiceHealth serviceHealth = host.Services.GetRequiredService<IAgentServiceHealth>();
+        Guid sessionId = coordinator.CurrentState!.SessionId;
+        AgentLifecycleMarker blockedMarker = Assert.IsType<AgentLifecycleMarker>(
+            await new FileAgentLifecycleStore(
+                    Options.Create(new AgentLifecycleOptions { MarkerPath = markerPath }))
+                .ReadLastMarkerAsync(CancellationToken.None));
+        AgentSessionRecord blockedSession = Assert.IsType<AgentSessionRecord>(
+            await ReadJournalSessionAsync(databasePath, sessionId));
+
+        Assert.Equal(AgentJournalHealthState.Healthy, journal.Health.State);
+        Assert.False(coordinator.CurrentState.IsReady);
+        Assert.Null(coordinator.CurrentState.ReadyAtUtc);
+        Assert.Null(blockedMarker.ReadyAtUtc);
+        Assert.Null(blockedMarker.ReadinessElapsedMilliseconds);
+        Assert.Null(blockedSession.ReadyAtUtc);
+        Assert.False(worker.IsReady);
+        Assert.False(serviceHealth.IsReady);
+        await AssertNoProbeEventOutboxOrSequenceWritesAsync(databasePath);
+
+        faultInjector.ReleaseReadyCommit();
+        await WaitUntilReadyAsync(coordinator);
+        await WaitUntilJournalSessionReadyAsync(databasePath, sessionId);
+        AgentLifecycleMarker publishedMarker = Assert.IsType<AgentLifecycleMarker>(
+            await new FileAgentLifecycleStore(
+                    Options.Create(new AgentLifecycleOptions { MarkerPath = markerPath }))
+                .ReadLastMarkerAsync(CancellationToken.None));
+        AgentSessionRecord publishedSession = Assert.IsType<AgentSessionRecord>(
+            await ReadJournalSessionAsync(databasePath, sessionId));
+
+        Assert.True(worker.IsReady);
+        Assert.True(serviceHealth.IsReady);
+        Assert.True(coordinator.CurrentState.IsReady);
+        Assert.Equal(coordinator.CurrentState.ReadyAtUtc, publishedMarker.ReadyAtUtc);
+        Assert.Equal(coordinator.CurrentState.ReadyAtUtc, publishedSession.ReadyAtUtc);
+        Assert.Equal(
+            Convert.ToInt64(coordinator.CurrentState.ReadinessElapsed!.Value.TotalMilliseconds),
+            publishedMarker.ReadinessElapsedMilliseconds);
+
+        await host.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task PostCommitPrePublicationFailureStaysNotReadyAndRecoversDeterministically()
+    {
+        string markerPath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.json");
+        string databasePath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.db");
+        PostCommitReadySessionFaultInjector faultInjector = new();
+        ListLogger<AgentWorker> logger = new();
+        Guid failedSessionId;
+        using (IHost failedHost = CreateHostWithFaultInjector(markerPath, databasePath, faultInjector, logger))
+        {
+            await failedHost.StartAsync(CancellationToken.None);
+            await faultInjector.FaultInjected.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await WaitUntilLoggedAsync(logger, eventId: 5);
+            IAgentJournal journal = failedHost.Services.GetRequiredService<IAgentJournal>();
+            IAgentLifecycleCoordinator coordinator = failedHost.Services.GetRequiredService<IAgentLifecycleCoordinator>();
+            AgentWorker worker = GetAgentWorker(failedHost);
+            IAgentServiceHealth serviceHealth = failedHost.Services.GetRequiredService<IAgentServiceHealth>();
+            failedSessionId = coordinator.CurrentState!.SessionId;
+            AgentSessionRecord persisted = Assert.IsType<AgentSessionRecord>(
+                await ReadJournalSessionAsync(databasePath, failedSessionId));
+            AgentLifecycleMarker marker = Assert.IsType<AgentLifecycleMarker>(
+                await new FileAgentLifecycleStore(
+                        Options.Create(new AgentLifecycleOptions { MarkerPath = markerPath }))
+                    .ReadLastMarkerAsync(CancellationToken.None));
+
+            Assert.Equal(AgentJournalHealthState.Healthy, journal.Health.State);
+            Assert.NotNull(persisted.ReadyAtUtc);
+            Assert.Null(marker.ReadyAtUtc);
+            Assert.Null(marker.ReadinessElapsedMilliseconds);
+            Assert.False(coordinator.CurrentState.IsReady);
+            Assert.False(worker.IsReady);
+            Assert.False(serviceHealth.IsReady);
+            await AssertNoProbeEventOutboxOrSequenceWritesAsync(databasePath);
+
+            await failedHost.StopAsync(CancellationToken.None);
+            Assert.False(coordinator.CurrentState.PlannedShutdown);
+        }
+
+        using IHost recoveredHost = CreateHost(markerPath, databasePath);
+        await recoveredHost.StartAsync(CancellationToken.None);
+        IAgentLifecycleCoordinator recoveredCoordinator = recoveredHost.Services.GetRequiredService<IAgentLifecycleCoordinator>();
+        IAgentServiceHealth recoveredHealth = recoveredHost.Services.GetRequiredService<IAgentServiceHealth>();
+        await WaitUntilReadyAsync(recoveredCoordinator);
+        Guid recoveredSessionId = recoveredCoordinator.CurrentState!.SessionId;
+        await WaitUntilJournalSessionReadyAsync(databasePath, recoveredSessionId);
+
+        Assert.Equal(failedSessionId, recoveredCoordinator.CurrentState.PreviousSessionId);
+        Assert.True(recoveredCoordinator.CurrentState.IsReady);
+        Assert.True(recoveredHealth.IsReady);
+        Assert.NotNull(await ReadJournalSessionAsync(databasePath, failedSessionId));
+        Assert.NotNull(await ReadJournalSessionAsync(databasePath, recoveredSessionId));
+
+        await recoveredHost.StopAsync(CancellationToken.None);
     }
 
     [Fact]
@@ -381,7 +622,15 @@ public sealed class AgentHostSmokeTests
             AgentJournalInitializationMode.CreateIfMissingForFreshLifecycle,
             journal.InitializationMode);
         Assert.Equal(
-            ["lifecycle_start", "journal_initialize", "journal_session_started", "lifecycle_ready", "journal_session_ready"],
+            [
+                "lifecycle_start",
+                "lifecycle_journal_owned",
+                "journal_initialize",
+                "journal_session_started",
+                "lifecycle_ready_prepared",
+                "journal_session_ready",
+                "lifecycle_ready_published"
+            ],
             operations);
 
         await worker.StopAsync(CancellationToken.None);
@@ -389,10 +638,12 @@ public sealed class AgentHostSmokeTests
         Assert.Equal(
             [
                 "lifecycle_start",
+                "lifecycle_journal_owned",
                 "journal_initialize",
                 "journal_session_started",
-                "lifecycle_ready",
+                "lifecycle_ready_prepared",
                 "journal_session_ready",
+                "lifecycle_ready_published",
                 "lifecycle_stop",
                 "journal_session_stopped"
             ],
@@ -475,6 +726,31 @@ public sealed class AgentHostSmokeTests
 
         Assert.True(coordinator.StopCalled);
         Assert.False(coordinator.CleanShutdownRecorded);
+    }
+
+    private static IHost CreateHost(string markerPath, string databasePath) =>
+        Program.CreateHostBuilder([
+            "--AgentLifecycle:MarkerPath", markerPath,
+            "--AgentLifecycle:ReadinessTimeout", "00:01:00",
+            "--AgentJournal:DatabasePath", databasePath
+        ]).Build();
+
+    private static async Task WriteAuthenticR0003MarkerAsync(string markerPath, Guid sessionId)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(markerPath)!);
+        string json = $$"""
+            {
+              "session_id": "{{sessionId:D}}",
+              "started_at_utc": "2026-07-14T23:00:00+00:00",
+              "ready_at_utc": "2026-07-14T23:00:01+00:00",
+              "readiness_elapsed_milliseconds": 1000,
+              "stopped_at_utc": "2026-07-14T23:00:02+00:00",
+              "planned_shutdown": true,
+              "previous_session_id": null,
+              "previous_session_ended_cleanly": true
+            }
+            """;
+        await File.WriteAllTextAsync(markerPath, json, CancellationToken.None);
     }
 
     private static async Task WaitUntilLoggedAsync(ListLogger<AgentWorker> logger, int eventId)
@@ -627,15 +903,24 @@ public sealed class AgentHostSmokeTests
     private static IHost CreateHostWithFaultInjector(
         string markerPath,
         string databasePath,
-        IAgentJournalFaultInjector faultInjector) =>
-        Program.CreateHostBuilder([
-                "--AgentLifecycle:MarkerPath", markerPath,
-                "--AgentLifecycle:ReadinessTimeout", "00:01:00",
-                "--AgentJournal:DatabasePath", databasePath
-            ])
-            .ConfigureServices(services =>
-                services.AddSingleton<IAgentJournalFaultInjector>(faultInjector))
+        IAgentJournalFaultInjector faultInjector,
+        ListLogger<AgentWorker>? logger = null)
+    {
+        IHostBuilder builder = Program.CreateHostBuilder([
+            "--AgentLifecycle:MarkerPath", markerPath,
+            "--AgentLifecycle:ReadinessTimeout", "00:01:00",
+            "--AgentJournal:DatabasePath", databasePath
+        ]);
+        return builder.ConfigureServices(services =>
+            {
+                services.AddSingleton<IAgentJournalFaultInjector>(faultInjector);
+                if (logger is not null)
+                {
+                    services.AddSingleton<ILogger<AgentWorker>>(logger);
+                }
+            })
             .Build();
+    }
 
     private static AgentWorker GetAgentWorker(IHost host) =>
         Assert.IsType<AgentWorker>(
@@ -659,6 +944,61 @@ public sealed class AgentHostSmokeTests
         }
     }
 
+    private sealed class BlockingReadySessionFaultInjector : IAgentJournalFaultInjector
+    {
+        private readonly TaskCompletionSource releaseReadyCommit = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int calls;
+
+        public TaskCompletionSource ReadyCommitEntered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task BeforeSessionCommitAsync(CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            calls++;
+            if (calls == 2)
+            {
+                ReadyCommitEntered.TrySetResult();
+                await releaseReadyCommit.Task.WaitAsync(cancellationToken);
+            }
+        }
+
+        public Task AfterSessionCommitAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public Task BeforeMaterialEventCommitAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public Task AfterMaterialEventCommitAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public void ReleaseReadyCommit() => releaseReadyCommit.TrySetResult();
+    }
+
+    private sealed class PostCommitReadySessionFaultInjector : IAgentJournalFaultInjector
+    {
+        private int calls;
+
+        public TaskCompletionSource FaultInjected { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task BeforeSessionCommitAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public Task AfterSessionCommitAsync(CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            calls++;
+            if (calls != 2)
+            {
+                return Task.CompletedTask;
+            }
+
+            FaultInjected.TrySetResult();
+            return Task.FromException(new SyntheticSessionPostCommitException());
+        }
+
+        public Task BeforeMaterialEventCommitAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public Task AfterMaterialEventCommitAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+    }
+
+    private sealed class SyntheticSessionPostCommitException : Exception;
+
     private sealed class SessionFaultInjector(int failOnCall, Exception exception) : IAgentJournalFaultInjector
     {
         public int Calls { get; private set; }
@@ -671,6 +1011,8 @@ public sealed class AgentHostSmokeTests
                 ? Task.FromException(exception)
                 : Task.CompletedTask;
         }
+
+        public Task AfterSessionCommitAsync(CancellationToken cancellationToken) => Task.CompletedTask;
 
         public Task BeforeMaterialEventCommitAsync(CancellationToken cancellationToken) => Task.CompletedTask;
 
@@ -710,7 +1052,8 @@ public sealed class AgentHostSmokeTests
 
     private sealed class RecordingLifecycleCoordinator(
         List<string>? operations = null,
-        Guid? previousSessionId = null) : IAgentLifecycleCoordinator
+        Guid? previousSessionId = null,
+        bool journalOwned = false) : IAgentLifecycleCoordinator
     {
         private readonly AgentLifecycleState state = new(
             Guid.NewGuid(),
@@ -720,7 +1063,8 @@ public sealed class AgentHostSmokeTests
             StoppedAtUtc: null,
             PlannedShutdown: false,
             PreviousSessionId: previousSessionId,
-            PreviousSessionEndedCleanly: true);
+            PreviousSessionEndedCleanly: true,
+            JournalOwnershipVersion: journalOwned ? AgentLifecycleMarker.CurrentJournalOwnershipVersion : null);
 
         public bool StopCalled { get; private set; }
 
@@ -741,17 +1085,30 @@ public sealed class AgentHostSmokeTests
             return Task.FromResult(state);
         }
 
-        public Task<AgentLifecycleState> MarkReadyAsync(CancellationToken cancellationToken)
+        public Task<AgentLifecycleState> ClaimJournalOwnershipAsync(CancellationToken cancellationToken)
         {
-            operations?.Add("lifecycle_ready");
+            operations?.Add("lifecycle_journal_owned");
+            CurrentState = CurrentState! with { JournalOwnershipVersion = AgentLifecycleMarker.CurrentJournalOwnershipVersion };
+            return Task.FromResult(CurrentState);
+        }
+
+        public Task<AgentLifecycleState> PrepareReadyAsync(CancellationToken cancellationToken)
+        {
+            operations?.Add("lifecycle_ready_prepared");
             MarkReadyCalled = true;
             if (MarkReadyException is not null)
             {
                 return Task.FromException<AgentLifecycleState>(MarkReadyException);
             }
 
-            CurrentState = state with { ReadyAtUtc = state.StartedAtUtc, ReadinessElapsed = TimeSpan.Zero };
-            return Task.FromResult(CurrentState);
+            return Task.FromResult(CurrentState! with { ReadyAtUtc = state.StartedAtUtc, ReadinessElapsed = TimeSpan.Zero });
+        }
+
+        public Task<AgentLifecycleState> PublishReadyAsync(AgentLifecycleState readyState, CancellationToken cancellationToken)
+        {
+            operations?.Add("lifecycle_ready_published");
+            CurrentState = readyState;
+            return Task.FromResult(readyState);
         }
 
         public Task<AgentLifecycleState> MarkNotReadyAsync(CancellationToken cancellationToken)
