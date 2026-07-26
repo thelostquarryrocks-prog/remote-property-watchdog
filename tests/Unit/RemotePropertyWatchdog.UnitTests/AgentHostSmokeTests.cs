@@ -166,6 +166,113 @@ public sealed class AgentHostSmokeTests
     }
 
     [Fact]
+    public async Task CredentialUrlValidationPreservesRealHostReadinessAndLaterJournalWorkWithoutLoggingInput()
+    {
+        string markerPath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.json");
+        string databasePath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.db");
+        ListLogger<SqliteAgentJournal> journalLogger = new();
+        ListLogger<AgentWorker> workerLogger = new();
+        using IHost host = Program.CreateHostBuilder([
+                "--AgentLifecycle:MarkerPath", markerPath,
+                "--AgentLifecycle:ReadinessTimeout", "00:01:00",
+                "--AgentJournal:DatabasePath", databasePath
+            ])
+            .ConfigureServices(services =>
+            {
+                services.AddSingleton<ILogger<SqliteAgentJournal>>(journalLogger);
+                services.AddSingleton<ILogger<AgentWorker>>(workerLogger);
+            })
+            .Build();
+
+        await host.StartAsync(CancellationToken.None);
+        IAgentLifecycleCoordinator coordinator = host.Services.GetRequiredService<IAgentLifecycleCoordinator>();
+        await WaitUntilReadyAsync(coordinator);
+        AgentLifecycleState readyState = Assert.IsType<AgentLifecycleState>(coordinator.CurrentState);
+        DateTimeOffset readyAtUtc = readyState.ReadyAtUtc ??
+            throw new InvalidOperationException("The host must publish a readiness timestamp.");
+        IAgentJournal journal = host.Services.GetRequiredService<IAgentJournal>();
+        AgentWorker worker = GetAgentWorker(host);
+        IAgentServiceHealth serviceHealth = host.Services.GetRequiredService<IAgentServiceHealth>();
+        FileAgentLifecycleStore lifecycleStore = new(
+            Options.Create(new AgentLifecycleOptions { MarkerPath = markerPath }));
+        AgentLifecycleMarker readyMarker = Assert.IsType<AgentLifecycleMarker>(
+            await lifecycleStore.ReadLastMarkerAsync(CancellationToken.None));
+        int journalLogCount = journalLogger.Entries.Count;
+        int workerLogCount = workerLogger.Entries.Count;
+        const string prohibitedUrl = "https://camera.local/live?token=synthetic-value";
+
+        ArgumentException rejection = await Assert.ThrowsAsync<ArgumentException>(
+            () => journal.AppendMaterialEventAsync(
+                new MaterialEventWrite(
+                    "event-rejected-credential-url",
+                    "agent-synthetic",
+                    "property-synthetic",
+                    readyState.SessionId.ToString("D"),
+                    readyAtUtc,
+                    MaterialEventType.TargetStateChanged,
+                    "target-synthetic",
+                    prohibitedUrl,
+                    "up",
+                    "down",
+                    ["probe_timeout"],
+                    "up",
+                    "up"),
+                CancellationToken.None));
+
+        Assert.Equal("values", rejection.ParamName);
+        Assert.Contains(
+            "Persistence input contains a prohibited secret-bearing value.",
+            rejection.Message,
+            StringComparison.Ordinal);
+        await AssertNoProbeEventOutboxOrSequenceWritesAsync(databasePath);
+        Assert.Equal(journalLogCount, journalLogger.Entries.Count);
+        Assert.Equal(workerLogCount, workerLogger.Entries.Count);
+        Assert.DoesNotContain(journalLogger.Entries, entry => entry.Message.Contains(prohibitedUrl, StringComparison.Ordinal));
+        Assert.DoesNotContain(workerLogger.Entries, entry => entry.Message.Contains(prohibitedUrl, StringComparison.Ordinal));
+        Assert.DoesNotContain(journalLogger.Entries, entry => entry.Exception is not null);
+        Assert.DoesNotContain(workerLogger.Entries, entry => entry.Exception is not null);
+
+        await journal.AppendProbeSampleAsync(
+            RuntimeProbe(readyState.SessionId, readyAtUtc) with
+            {
+                SampleId = "sample-after-credential-url-rejection"
+            },
+            CancellationToken.None);
+        MaterialEventCommit commit = await journal.AppendMaterialEventAsync(
+            new MaterialEventWrite(
+                "event-after-credential-url-rejection",
+                "agent-synthetic",
+                "property-synthetic",
+                readyState.SessionId.ToString("D"),
+                readyAtUtc,
+                MaterialEventType.TargetStateChanged,
+                "target-synthetic",
+                "Synthetic target",
+                "up",
+                "down",
+                ["probe_timeout"],
+                "up",
+                "up"),
+            CancellationToken.None);
+
+        AgentLifecycleMarker markerAfterWrites = Assert.IsType<AgentLifecycleMarker>(
+            await lifecycleStore.ReadLastMarkerAsync(CancellationToken.None));
+        Assert.Equal(1L, await ReadProbeSampleCountAsync(databasePath));
+        Assert.Equal(1, commit.AgentSequence);
+        Assert.Single(await journal.ReadPendingOutboxAsync("agent-synthetic", 10, CancellationToken.None));
+        Assert.Equal(AgentJournalHealthState.Healthy, journal.Health.State);
+        Assert.Equal(AgentJournalHealthState.Healthy, worker.Health.State);
+        Assert.True(worker.IsReady);
+        Assert.Same(worker, serviceHealth);
+        Assert.True(serviceHealth.IsReady);
+        Assert.Equal(readyState, coordinator.CurrentState);
+        Assert.Equal(readyMarker, markerAfterWrites);
+        Assert.DoesNotContain(journalLogger.Entries, entry => entry.EventId is 101 or 104);
+
+        await host.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
     public async Task AuthenticR0003UpgradeCreatesJournalThenRequiresAndReusesIt()
     {
         string markerPath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.json");

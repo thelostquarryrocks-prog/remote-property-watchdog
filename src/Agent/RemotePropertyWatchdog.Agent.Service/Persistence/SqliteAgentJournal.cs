@@ -24,6 +24,39 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
         "rtsp://"
     ];
 
+    private static readonly HashSet<string> SensitiveUriParameterNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "access_token",
+        "api_key",
+        "api_token",
+        "apikey",
+        "auth_token",
+        "client_secret",
+        "connection-string-password",
+        "connection_string_password",
+        "credential",
+        "credentials",
+        "enrollment-token",
+        "enrollment_token",
+        "passwd",
+        "password",
+        "provider-secret",
+        "provider_secret",
+        "pwd",
+        "secret",
+        "sig",
+        "signature",
+        "token",
+        "x-amz-credential",
+        "x-amz-security-token",
+        "x-amz-signature",
+        "x-goog-api-key",
+        "x-goog-credential",
+        "x-goog-signature"
+    };
+
+    private const int MaximumUriParameterDecodingPasses = 2;
+
     private readonly SemaphoreSlim initializationGate = new(1, 1);
     private readonly AgentJournalOptions options;
     private readonly TimeProvider timeProvider;
@@ -1054,12 +1087,166 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
         foreach (string value in values.Where(static value => value is not null).Cast<string>())
         {
             if (ProhibitedSecretMarkers.Any(marker => value.Contains(marker, StringComparison.OrdinalIgnoreCase)) ||
-                Uri.TryCreate(value, UriKind.Absolute, out Uri? uri) && !string.IsNullOrEmpty(uri.UserInfo))
+                IsCredentialBearingAbsoluteUri(value))
             {
                 throw new ArgumentException("Persistence input contains a prohibited secret-bearing value.", nameof(values));
             }
         }
     }
+
+    private static bool IsCredentialBearingAbsoluteUri(string value)
+    {
+        if (Uri.TryCreate(value, UriKind.Absolute, out Uri? uri))
+        {
+            return !string.IsNullOrEmpty(uri.UserInfo) ||
+                ContainsSensitiveUriParameter(uri.Query, '?') ||
+                ContainsSensitiveUriParameter(uri.Fragment, '#');
+        }
+
+        if (!HasAbsoluteUriScheme(value))
+        {
+            return false;
+        }
+
+        int queryStart = value.IndexOf('?');
+        int fragmentStart = value.IndexOf('#');
+        string query = queryStart < 0
+            ? string.Empty
+            : value[queryStart..(fragmentStart > queryStart ? fragmentStart : value.Length)];
+        string fragment = fragmentStart < 0 ? string.Empty : value[fragmentStart..];
+        return ContainsSensitiveUriParameter(query, '?') ||
+            ContainsSensitiveUriParameter(fragment, '#');
+    }
+
+    private static bool HasAbsoluteUriScheme(string value)
+    {
+        int colon = value.IndexOf(':');
+        if (colon < 1 || !char.IsAsciiLetter(value[0]))
+        {
+            return false;
+        }
+
+        for (int index = 1; index < colon; index++)
+        {
+            char character = value[index];
+            if (!char.IsAsciiLetterOrDigit(character) && character is not ('+' or '.' or '-'))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool ContainsSensitiveUriParameter(string component, char prefix)
+    {
+        if (string.IsNullOrEmpty(component))
+        {
+            return false;
+        }
+
+        string candidate = component[0] == prefix ? component[1..] : component;
+        for (int decodingPass = 0; decodingPass <= MaximumUriParameterDecodingPasses; decodingPass++)
+        {
+            if (ContainsSensitiveUriParameterName(candidate))
+            {
+                return true;
+            }
+
+            if (decodingPass == MaximumUriParameterDecodingPasses)
+            {
+                break;
+            }
+
+            string decoded = DecodeUriParameterSyntaxOnce(candidate);
+            if (StringComparer.Ordinal.Equals(decoded, candidate))
+            {
+                break;
+            }
+
+            candidate = decoded;
+        }
+
+        return false;
+    }
+
+    private static bool ContainsSensitiveUriParameterName(string component)
+    {
+        int segmentStart = 0;
+        while (segmentStart <= component.Length)
+        {
+            int separatorOffset = component.AsSpan(segmentStart).IndexOfAny('&', '?');
+            int segmentEnd = separatorOffset < 0 ? component.Length : segmentStart + separatorOffset;
+            ReadOnlySpan<char> segment = component.AsSpan(segmentStart, segmentEnd - segmentStart);
+            int equalsOffset = segment.IndexOf('=');
+            ReadOnlySpan<char> parameterName = (equalsOffset < 0 ? segment : segment[..equalsOffset]).Trim();
+            if (!parameterName.IsEmpty && SensitiveUriParameterNames.Contains(parameterName.ToString()))
+            {
+                return true;
+            }
+
+            if (separatorOffset < 0)
+            {
+                break;
+            }
+
+            segmentStart = segmentEnd + 1;
+        }
+
+        return false;
+    }
+
+    private static string DecodeUriParameterSyntaxOnce(string value)
+    {
+        int firstEscape = value.IndexOf('%');
+        if (firstEscape < 0)
+        {
+            return value;
+        }
+
+        char[] decoded = value.ToCharArray();
+        int writeIndex = firstEscape;
+        for (int readIndex = firstEscape; readIndex < value.Length; readIndex++)
+        {
+            if (value[readIndex] == '%' &&
+                readIndex + 2 < value.Length &&
+                TryParseAsciiHex(value[readIndex + 1], value[readIndex + 2], out char decodedCharacter))
+            {
+                decoded[writeIndex++] = decodedCharacter;
+                readIndex += 2;
+            }
+            else
+            {
+                decoded[writeIndex++] = value[readIndex];
+            }
+        }
+
+        return new string(decoded, 0, writeIndex);
+    }
+
+    private static bool TryParseAsciiHex(char high, char low, out char value)
+    {
+        int highValue = HexValue(high);
+        int lowValue = HexValue(low);
+        int decoded = (highValue << 4) | lowValue;
+        if (highValue < 0 || lowValue < 0 || decoded > 0x7f)
+        {
+            value = default;
+            return false;
+        }
+
+        value = (char)decoded;
+        return true;
+    }
+
+    private static int HexValue(char value) =>
+        value switch
+        {
+            >= '0' and <= '9' => value - '0',
+            >= 'A' and <= 'F' => value - 'A' + 10,
+            >= 'a' and <= 'f' => value - 'a' + 10,
+            _ => -1
+        };
 
     private static string ToUtcText(DateTimeOffset value) =>
         value.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture);

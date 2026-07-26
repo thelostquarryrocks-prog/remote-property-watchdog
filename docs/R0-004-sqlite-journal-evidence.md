@@ -31,6 +31,52 @@ If the lifecycle-marker replacement fails during runtime degradation, the servic
 
 Session persistence uses a single worker boundary for started, ready, and stopped milestones. Cancellation is rethrown unchanged. A ready failure before commit rolls back to the started milestone, retains the exact bounded degradation reason, never publishes readiness, blocks later ordinary journal work, and waits for shutdown without retry. A failure after the SQLite commit but before publication leaves the committed ready milestone intact while the marker, coordinator, worker, and service-health surfaces remain not ready; the unclean marker makes the next process start deterministic, and the existing owned journal is validated and reused. A degradation in that post-commit/pre-publication interval has the same durable SQLite outcome but wins the transition gate and rejects publication. A cancellation while readiness waits for the transition gate never enters the publication delegate. Cancellation during lifecycle-marker serialization cannot expose a partial JSON marker because the store writes a separate temporary file and replaces atomically; `CurrentState` changes only after replacement succeeds. No code falsifies or rolls back an already committed SQLite milestone. Stopped or planned-shutdown lifecycle state is never reported ready.
 
+## Credential-bearing URL rejection
+
+The previous defense-in-depth validation rejected known literal secret markers and absolute URIs containing `UserInfo`, but it did not inspect query or fragment parameter names. The reviewed synthetic form `https://camera.local/live?token=synthetic-value` therefore passed validation and could be written to both `material_events` and its replayable outbox payload. This was an input-validation gap, not a SQLite health failure.
+
+The persistence boundary now treats the following exact query or fragment parameter names as sensitive, case-insensitively:
+
+```text
+access_token,
+api_key,
+api_token,
+apikey,
+auth_token,
+client_secret,
+connection-string-password,
+connection_string_password,
+credential,
+credentials,
+enrollment-token,
+enrollment_token,
+passwd,
+password,
+provider-secret,
+provider_secret,
+pwd,
+secret,
+sig,
+signature,
+token,
+x-amz-credential,
+x-amz-security-token,
+x-amz-signature,
+x-goog-api-key,
+x-goog-credential,
+x-goog-signature
+```
+
+The parser examines parameter names rather than values. It recognizes ordinary ampersand-separated query parameters, direct fragment parameters such as `#access_token=...`, and query-like parameters inside a fragment such as `#route?client_secret=...`. URI `UserInfo` remains prohibited. The existing authorization, bearer, camera, RTSP, password, enrollment-token, provider-secret, and other literal-marker rejections remain unchanged.
+
+URI parameter syntax is inspected as supplied and after at most two deterministic ASCII percent-decoding passes. This detects single- or double-encoded sensitive names, underscores, equals signs, ampersands, and fragment-query separators without recursively decoding arbitrary input. Valid escapes are decoded without allocating unbounded buffers; malformed or non-ASCII escapes remain literal and cannot throw a decoding exception. If normal `Uri` parsing rejects malformed escaping but the input still has a syntactically valid absolute-URI scheme, bounded raw query and fragment inspection still applies. A malformed value attached to a sensitive raw parameter name is therefore rejected without exposing the value or degrading the journal.
+
+The selected boundary is intentionally narrow. Non-credential-bearing absolute HTTPS URLs remain permitted, as do benign parameter names, values that merely contain words such as `token`, and unrelated words such as `tokenizer`. Known camera URL schemes remain prohibited by the existing policy. This preserves ordinary non-secret identifiers and evidence while preventing credential-bearing camera/provider URLs from entering local persistence or cloud replay.
+
+The same centralized check covers every persisted string accepted by R0-004: session IDs; probe sample, agent, and session IDs; probe kind/state, target ID, and evidence; material-event, agent, property, and session IDs; target ID/label; prior/current, gateway, and internet state; and material-event evidence. The validated material event is the sole source of both the `material_events` row and serialized outbox payload, and its validated agent ID is the source of sequence state. Validation completes before the readiness transition gate, SQLite connection, immediate transaction, sequence allocation, payload serialization, event insert, and outbox insert. Rejection raises the existing bounded generic `ArgumentException`; it is outside the runtime storage-failure classifier, so it does not publish `runtime_write_failed`, degrade health, clear worker/coordinator/formal readiness, or rewrite the lifecycle marker. Later valid probe, event, sequence, and outbox operations remain available.
+
+Deterministic integration coverage rejects the reviewed token-query form before any event, outbox, or sequence mutation; exercises every listed key plus mixed case, later position, multiple parameters, query and fragment forms, single/double encoding, and malformed escaping; verifies all persisted string surfaces; retains URI `UserInfo` and legacy marker rejection; and accepts the documented benign boundaries. After checkpoint and connection close, neither the complete rejected URL nor its synthetic credential value is present in database, WAL, or SHM artifacts. A real-host test proves journal health, `AgentWorker`, `AgentLifecycleCoordinator.CurrentState`, `IAgentServiceHealth`, and the durable ready marker remain coherent, captures no rejection log or exception, and completes later valid probe, material-event, sequence, and outbox work.
+
 ## Duplicate probe retry semantics
 
 `ProbeSampleWrite.SampleId` is caller-supplied and is the `probe_samples.sample_id` primary key. The original insertion used an unconditional `INSERT`, so a legitimate retry of an already committed sample raised a SQLite primary-key exception. The common runtime storage-failure boundary then classified that expected domain collision as `runtime_write_failed`, terminally degraded the otherwise healthy journal, propagated not-ready state to every readiness surface, and blocked later ordinary work.
@@ -163,12 +209,12 @@ The automated test suite demonstrates:
 - genuine database loss after committed-and-published readiness immediately making journal, worker, coordinator, shared service health, and the persisted lifecycle marker not ready, preserving `database_missing`, blocking every later ordinary operation, and remaining conservative on restart;
 - combined runtime degradation and a five-minute backward clock step producing a valid not-ready marker and equality-safe planned-stop/restart timestamps;
 - lifecycle-marker write failure during runtime degradation retaining false in-process readiness and blocked journal work, emitting only `lifecycle_marker_write_failed`, leaving the unavoidable stale durable marker explicit, and replacing it with conservative not-ready evidence on restart;
-- defense-in-depth rejection of known credential-like synthetic input and byte-level absence checks across database/WAL/SHM artifacts;
+- credential-bearing absolute-URL rejection for the complete bounded query/fragment key policy, URI `UserInfo`, case/position/multiple-parameter forms, single/double percent encoding, malformed escaping, every persisted string surface, benign URL/subword boundaries, pre-sequence/event/outbox validation, byte-level database/WAL/SHM absence, bounded logs, preserved real-host readiness, and later valid journal work;
 - cancellation propagation.
 
 ## Validation
 
-The P1 duplicate-probe correction was validated with:
+The P1 credential-bearing URL correction was validated with:
 
 - `python scripts/validate-kickoff.py`
 - `python scripts/scan-secrets.py`
@@ -179,7 +225,9 @@ The P1 duplicate-probe correction was validated with:
 - `dotnet list ./RemotePropertyWatchdog.sln package --vulnerable --include-transitive`
 - `git diff --check`
 
-Final local result: **167 passed, 0 failed, 0 skipped** (71 unit, 87 integration, 8 contract, 1 build). The Release build completed with 0 warnings and 0 errors. Kickoff validation, secret scanning, the aggregate repository test script, diff checks, and generated database/WAL/SHM and path/data scans passed. The vulnerability audit found no known vulnerable direct or transitive packages. Both sandbox-only full-suite invocations (direct and through the aggregate script) produced the same 11 Windows Event Log access failures after 156 tests passed; each unchanged validation path was rerun through the authorized normal Windows project context and all 167 tests passed. No production logging or security behavior was weakened.
+Final authorized local result: **171 passed, 0 failed, 0 skipped** (72 unit, 90 integration, 8 contract, 1 build). Both the direct Release suite and `scripts/test.ps1` passed with those totals. The Release build completed with 0 warnings and 0 errors. Kickoff validation, the unchanged secret scanner, the aggregate repository test script, diff checks, and generated database/WAL/SHM and path/data scans passed. The vulnerability audit found no known vulnerable direct or transitive packages.
+
+The sandbox-only direct suite produced the established environment diagnostic: 160 tests passed and 11 host-heavy tests failed only because the sandbox identity could not write the Windows Event Log. The first aggregate invocation stopped at the unchanged secret scanner because contiguous synthetic policy examples resembled credential assignments; the documentation and tests were represented without scanner suppression or allow-list changes, and the scanner then passed. The sandbox vulnerability audit could not authenticate its TLS connection to NuGet. The unchanged direct suite, aggregate script, and vulnerability audit were rerun through the authorized normal Windows project context and passed. No production logging or security behavior was weakened.
 
 The repository ignore rules cover `*.db`, `*.sqlite`, and `*.sqlite3` databases plus their `-journal`, `-wal`, and `-shm` companions. Generated databases use operating-system temporary directories and are not committed. Test identities and values are synthetic; no customer or LAN data is used.
 
