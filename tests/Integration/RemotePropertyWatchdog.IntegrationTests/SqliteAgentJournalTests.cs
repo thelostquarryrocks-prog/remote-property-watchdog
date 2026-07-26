@@ -1190,7 +1190,72 @@ public sealed class SqliteAgentJournalTests
     }
 
     [Fact]
-    public async Task SensitiveQueryAndFragmentKeyPolicyRejectsCasePositionEncodedAndMalformedForms()
+    public async Task ReviewedBareCredentialAssignmentsAreRejectedBeforeEventOutboxOrSequenceMutationAndAbsentFromArtifacts()
+    {
+        using TestDatabase database = new();
+        ListLogger<SqliteAgentJournal> logger = new();
+        using SqliteAgentJournal journal = CreateJournal(database.Path, logger: logger);
+        await AddSessionAsync(journal);
+        string[] prohibitedAssignments =
+        [
+            "api_key=synthetic-value",
+            "token=synthetic-value"
+        ];
+
+        for (int index = 0; index < prohibitedAssignments.Length; index++)
+        {
+            MaterialEventWrite prohibited = Event($"event-bare-credential-{index:D2}") with
+            {
+                TargetLabel = prohibitedAssignments[index]
+            };
+            await AssertCredentialValidationRejectedAsync(
+                () => journal.AppendMaterialEventAsync(prohibited, CancellationToken.None));
+        }
+
+        Assert.Equal(AgentJournalHealthState.Healthy, journal.Health.State);
+        Assert.DoesNotContain(logger.Entries, entry => entry.EventId is 101 or 104);
+        Assert.All(
+            prohibitedAssignments,
+            assignment => Assert.DoesNotContain(
+                logger.Entries,
+                entry => entry.Message.Contains(assignment, StringComparison.Ordinal)));
+        Assert.DoesNotContain(
+            logger.Entries,
+            entry => entry.Message.Contains("synthetic-value", StringComparison.Ordinal));
+        await AssertCountsAsync(database, materialEvents: 0, outbox: 0);
+        await using (SqliteConnection connection = await database.OpenAsync())
+        {
+            Assert.Equal(0L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM local_state;"));
+        }
+
+        await journal.AppendProbeSampleAsync(Probe("sample-after-bare-credential-rejection"), CancellationToken.None);
+        MaterialEventCommit next = await journal.AppendMaterialEventAsync(
+            Event("event-after-bare-credential-rejection"),
+            CancellationToken.None);
+        Assert.Equal(1, next.AgentSequence);
+        Assert.Single(await journal.ReadPendingOutboxAsync("agent-synthetic", 10, CancellationToken.None));
+        Assert.Equal(1L, await ReadProbeSampleCountAsync(database));
+        Assert.Equal(AgentJournalHealthState.Healthy, (await journal.VerifyIntegrityAsync(CancellationToken.None)).State);
+        await CheckpointAsync(database);
+
+        byte[][] prohibitedMarkers =
+        [
+            .. prohibitedAssignments.Select(Encoding.UTF8.GetBytes),
+            Encoding.UTF8.GetBytes("synthetic-value")
+        ];
+        foreach (string path in Directory.EnumerateFiles(database.DirectoryPath, "agent.db*"))
+        {
+            byte[] bytes = await File.ReadAllBytesAsync(path);
+            Assert.All(
+                prohibitedMarkers,
+                marker => Assert.False(
+                    ContainsSequence(bytes, marker),
+                    $"Bare credential assignment content was persisted in {Path.GetFileName(path)}."));
+        }
+    }
+
+    [Fact]
+    public async Task SharedSensitiveKeyPolicyRejectsUrlParametersAndBareAssignments()
     {
         using TestDatabase database = new();
         using SqliteAgentJournal journal = CreateJournal(database.Path);
@@ -1226,12 +1291,18 @@ public sealed class SqliteAgentJournalTests
             "x-goog-signature"
         ];
 
-        List<string> prohibitedUrls = sensitiveKeys
-            .Select(key => $"https://camera.local/live?mode=preview&{key}=synthetic-value")
+        List<string> prohibitedValues = sensitiveKeys
+            .SelectMany(
+                key => new[]
+                {
+                    $"https://camera.local/live?mode=preview&{key}=synthetic-value",
+                    $"status=up; {key}=synthetic-value"
+                })
             .ToList();
-        prohibitedUrls.AddRange(
+        prohibitedValues.AddRange(
         [
             "https://camera.local/live?ToKeN=synthetic-value",
+            "status=up; ToKeN=synthetic-value",
             "https://camera.local/live?mode=preview&quality=high&API_KEY=synthetic-value",
             "https://camera.local/live#access_token=synthetic-value",
             "https://camera.local/live#route?client_secret=synthetic-value",
@@ -1242,11 +1313,11 @@ public sealed class SqliteAgentJournalTests
             "https://camera.local/live?token=synthetic-value%ZZ"
         ]);
 
-        for (int index = 0; index < prohibitedUrls.Count; index++)
+        for (int index = 0; index < prohibitedValues.Count; index++)
         {
             MaterialEventWrite prohibited = Event($"event-credential-form-{index:D2}") with
             {
-                TargetLabel = prohibitedUrls[index]
+                TargetLabel = prohibitedValues[index]
             };
             await AssertCredentialValidationRejectedAsync(
                 () => journal.AppendMaterialEventAsync(prohibited, CancellationToken.None));
@@ -1256,6 +1327,72 @@ public sealed class SqliteAgentJournalTests
         await AssertCountsAsync(database, materialEvents: 0, outbox: 0);
         await using SqliteConnection connection = await database.OpenAsync();
         Assert.Equal(0L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM local_state;"));
+    }
+
+    [Fact]
+    public async Task BareAssignmentGrammarHandlesPlacementWhitespaceEncodingMalformedInputAndBenignBoundaries()
+    {
+        using TestDatabase database = new();
+        using SqliteAgentJournal journal = CreateJournal(database.Path);
+        await AddSessionAsync(journal);
+        string[] prohibitedValues =
+        [
+            "token=synthetic-value",
+            "api_key \t= synthetic-value",
+            "mode=preview; token=synthetic-value",
+            "api_key=synthetic-value; mode=preview",
+            "mode=preview, token=synthetic-value, quality=high",
+            "mode=preview&api_key=synthetic-value",
+            "%74oken=synthetic-value",
+            "%2574oken=synthetic-value",
+            "token%3Dsynthetic-value",
+            "%74oken%253Dsynthetic-value",
+            "mode=preview; to%6ben=synthetic-value",
+            "mode=preview; token=synthetic-value%ZZ"
+        ];
+
+        for (int index = 0; index < prohibitedValues.Length; index++)
+        {
+            await AssertCredentialValidationRejectedAsync(
+                () => journal.AppendMaterialEventAsync(
+                    Event($"event-bare-grammar-rejected-{index:D2}") with
+                    {
+                        TargetLabel = prohibitedValues[index]
+                    },
+                    CancellationToken.None));
+        }
+
+        await AssertCountsAsync(database, materialEvents: 0, outbox: 0);
+        await using (SqliteConnection connection = await database.OpenAsync())
+        {
+            Assert.Equal(0L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM local_state;"));
+        }
+
+        string[] benignValues =
+        [
+            "tokenizer=enabled",
+            "mytoken=enabled",
+            "prefix-token=enabled",
+            "token_backup=enabled",
+            "access_token_backup=enabled",
+            "api_keyring=enabled",
+            "mode=preview; note=synthetic-value",
+            "mode=preview; token%ZZ=synthetic-value",
+            "%252574oken=synthetic-value"
+        ];
+        for (int index = 0; index < benignValues.Length; index++)
+        {
+            MaterialEventCommit commit = await journal.AppendMaterialEventAsync(
+                Event($"event-bare-grammar-benign-{index:D2}") with
+                {
+                    TargetLabel = benignValues[index]
+                },
+                CancellationToken.None);
+            Assert.Equal(index + 1, commit.AgentSequence);
+        }
+
+        await AssertCountsAsync(database, materialEvents: benignValues.Length, outbox: benignValues.Length);
+        Assert.Equal(AgentJournalHealthState.Healthy, journal.Health.State);
     }
 
     [Fact]
@@ -1290,6 +1427,53 @@ public sealed class SqliteAgentJournalTests
             () => journal.AppendMaterialEventAsync(materialEvent with { Evidence = [prohibitedUrl] }, CancellationToken.None),
             () => journal.AppendMaterialEventAsync(materialEvent with { GatewayState = prohibitedUrl }, CancellationToken.None),
             () => journal.AppendMaterialEventAsync(materialEvent with { InternetState = prohibitedUrl }, CancellationToken.None)
+        ];
+
+        foreach (Func<Task> prohibitedWrite in prohibitedWrites)
+        {
+            await AssertCredentialValidationRejectedAsync(prohibitedWrite);
+        }
+
+        Assert.Equal(AgentJournalHealthState.Healthy, journal.Health.State);
+        await AssertCountsAsync(database, materialEvents: 0, outbox: 0);
+        Assert.Equal(0L, await ReadProbeSampleCountAsync(database));
+        await using SqliteConnection connection = await database.OpenAsync();
+        Assert.Equal(1L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM agent_sessions;"));
+        Assert.Equal(0L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM local_state;"));
+    }
+
+    [Fact]
+    public async Task BareCredentialAssignmentValidationCoversEveryPersistedStringSurface()
+    {
+        using TestDatabase database = new();
+        using SqliteAgentJournal journal = CreateJournal(database.Path);
+        await AddSessionAsync(journal);
+        const string prohibitedAssignment = "token=synthetic-value";
+        ProbeSampleWrite probe = Probe("sample-bare-surface");
+        MaterialEventWrite materialEvent = Event("event-bare-surface");
+        Func<Task>[] prohibitedWrites =
+        [
+            () => journal.RecordSessionAsync(
+                new AgentSessionRecord(prohibitedAssignment, Now),
+                CancellationToken.None),
+            () => journal.AppendProbeSampleAsync(probe with { SampleId = prohibitedAssignment }, CancellationToken.None),
+            () => journal.AppendProbeSampleAsync(probe with { AgentId = prohibitedAssignment }, CancellationToken.None),
+            () => journal.AppendProbeSampleAsync(probe with { SessionId = prohibitedAssignment }, CancellationToken.None),
+            () => journal.AppendProbeSampleAsync(probe with { ProbeKind = prohibitedAssignment }, CancellationToken.None),
+            () => journal.AppendProbeSampleAsync(probe with { ProbeState = prohibitedAssignment }, CancellationToken.None),
+            () => journal.AppendProbeSampleAsync(probe with { TargetId = prohibitedAssignment }, CancellationToken.None),
+            () => journal.AppendProbeSampleAsync(probe with { Evidence = [prohibitedAssignment] }, CancellationToken.None),
+            () => journal.AppendMaterialEventAsync(materialEvent with { EventId = prohibitedAssignment }, CancellationToken.None),
+            () => journal.AppendMaterialEventAsync(materialEvent with { AgentId = prohibitedAssignment }, CancellationToken.None),
+            () => journal.AppendMaterialEventAsync(materialEvent with { PropertyId = prohibitedAssignment }, CancellationToken.None),
+            () => journal.AppendMaterialEventAsync(materialEvent with { SessionId = prohibitedAssignment }, CancellationToken.None),
+            () => journal.AppendMaterialEventAsync(materialEvent with { TargetId = prohibitedAssignment }, CancellationToken.None),
+            () => journal.AppendMaterialEventAsync(materialEvent with { TargetLabel = prohibitedAssignment }, CancellationToken.None),
+            () => journal.AppendMaterialEventAsync(materialEvent with { FromState = prohibitedAssignment }, CancellationToken.None),
+            () => journal.AppendMaterialEventAsync(materialEvent with { ToState = prohibitedAssignment }, CancellationToken.None),
+            () => journal.AppendMaterialEventAsync(materialEvent with { Evidence = [prohibitedAssignment] }, CancellationToken.None),
+            () => journal.AppendMaterialEventAsync(materialEvent with { GatewayState = prohibitedAssignment }, CancellationToken.None),
+            () => journal.AppendMaterialEventAsync(materialEvent with { InternetState = prohibitedAssignment }, CancellationToken.None)
         ];
 
         foreach (Func<Task> prohibitedWrite in prohibitedWrites)
@@ -1350,10 +1534,17 @@ public sealed class SqliteAgentJournalTests
                 TargetLabel = "https://camera.local/live?mode=synthetic%ZZ"
             },
             CancellationToken.None);
+        MaterialEventCommit boundedEncoding = await journal.AppendMaterialEventAsync(
+            Event("event-benign-triple-encoded-url") with
+            {
+                TargetLabel = "https://camera.local/live?%252574oken=synthetic-value"
+            },
+            CancellationToken.None);
 
         Assert.Equal(1, benign.AgentSequence);
         Assert.Equal(2, malformedBenign.AgentSequence);
-        await AssertCountsAsync(database, materialEvents: 2, outbox: 2);
+        Assert.Equal(3, boundedEncoding.AgentSequence);
+        await AssertCountsAsync(database, materialEvents: 3, outbox: 3);
         Assert.Equal(AgentJournalHealthState.Healthy, journal.Health.State);
     }
 

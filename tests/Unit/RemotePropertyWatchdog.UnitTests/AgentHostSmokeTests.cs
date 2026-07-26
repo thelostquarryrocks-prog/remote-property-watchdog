@@ -166,7 +166,20 @@ public sealed class AgentHostSmokeTests
     }
 
     [Fact]
-    public async Task CredentialUrlValidationPreservesRealHostReadinessAndLaterJournalWorkWithoutLoggingInput()
+    public Task CredentialUrlValidationPreservesRealHostReadinessAndLaterJournalWorkWithoutLoggingInput() =>
+        AssertCredentialValidationPreservesRealHostReadinessAndLaterJournalWorkWithoutLoggingInputAsync(
+            "https://camera.local/live?token=synthetic-value",
+            "credential-url");
+
+    [Fact]
+    public Task BareCredentialAssignmentValidationPreservesRealHostReadinessAndLaterJournalWorkWithoutLoggingInput() =>
+        AssertCredentialValidationPreservesRealHostReadinessAndLaterJournalWorkWithoutLoggingInputAsync(
+            "api_key=synthetic-value",
+            "bare-credential-assignment");
+
+    private static async Task AssertCredentialValidationPreservesRealHostReadinessAndLaterJournalWorkWithoutLoggingInputAsync(
+        string prohibitedValue,
+        string eventName)
     {
         string markerPath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.json");
         string databasePath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.db");
@@ -199,19 +212,18 @@ public sealed class AgentHostSmokeTests
             await lifecycleStore.ReadLastMarkerAsync(CancellationToken.None));
         int journalLogCount = journalLogger.Entries.Count;
         int workerLogCount = workerLogger.Entries.Count;
-        const string prohibitedUrl = "https://camera.local/live?token=synthetic-value";
 
         ArgumentException rejection = await Assert.ThrowsAsync<ArgumentException>(
             () => journal.AppendMaterialEventAsync(
                 new MaterialEventWrite(
-                    "event-rejected-credential-url",
+                    $"event-rejected-{eventName}",
                     "agent-synthetic",
                     "property-synthetic",
                     readyState.SessionId.ToString("D"),
                     readyAtUtc,
                     MaterialEventType.TargetStateChanged,
                     "target-synthetic",
-                    prohibitedUrl,
+                    prohibitedValue,
                     "up",
                     "down",
                     ["probe_timeout"],
@@ -227,20 +239,22 @@ public sealed class AgentHostSmokeTests
         await AssertNoProbeEventOutboxOrSequenceWritesAsync(databasePath);
         Assert.Equal(journalLogCount, journalLogger.Entries.Count);
         Assert.Equal(workerLogCount, workerLogger.Entries.Count);
-        Assert.DoesNotContain(journalLogger.Entries, entry => entry.Message.Contains(prohibitedUrl, StringComparison.Ordinal));
-        Assert.DoesNotContain(workerLogger.Entries, entry => entry.Message.Contains(prohibitedUrl, StringComparison.Ordinal));
+        Assert.DoesNotContain(journalLogger.Entries, entry => entry.Message.Contains(prohibitedValue, StringComparison.Ordinal));
+        Assert.DoesNotContain(workerLogger.Entries, entry => entry.Message.Contains(prohibitedValue, StringComparison.Ordinal));
+        Assert.DoesNotContain(journalLogger.Entries, entry => entry.Message.Contains("synthetic-value", StringComparison.Ordinal));
+        Assert.DoesNotContain(workerLogger.Entries, entry => entry.Message.Contains("synthetic-value", StringComparison.Ordinal));
         Assert.DoesNotContain(journalLogger.Entries, entry => entry.Exception is not null);
         Assert.DoesNotContain(workerLogger.Entries, entry => entry.Exception is not null);
 
         await journal.AppendProbeSampleAsync(
             RuntimeProbe(readyState.SessionId, readyAtUtc) with
             {
-                SampleId = "sample-after-credential-url-rejection"
+                SampleId = $"sample-after-{eventName}-rejection"
             },
             CancellationToken.None);
         MaterialEventCommit commit = await journal.AppendMaterialEventAsync(
             new MaterialEventWrite(
-                "event-after-credential-url-rejection",
+                $"event-after-{eventName}-rejection",
                 "agent-synthetic",
                 "property-synthetic",
                 readyState.SessionId.ToString("D"),

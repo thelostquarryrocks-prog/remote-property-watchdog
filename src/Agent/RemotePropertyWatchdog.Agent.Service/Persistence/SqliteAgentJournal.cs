@@ -24,7 +24,7 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
         "rtsp://"
     ];
 
-    private static readonly HashSet<string> SensitiveUriParameterNames = new(StringComparer.OrdinalIgnoreCase)
+    private static readonly HashSet<string> SensitiveParameterNames = new(StringComparer.OrdinalIgnoreCase)
     {
         "access_token",
         "api_key",
@@ -55,7 +55,7 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
         "x-goog-signature"
     };
 
-    private const int MaximumUriParameterDecodingPasses = 2;
+    private const int MaximumParameterDecodingPasses = 2;
 
     private readonly SemaphoreSlim initializationGate = new(1, 1);
     private readonly AgentJournalOptions options;
@@ -1086,8 +1086,9 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
     {
         foreach (string value in values.Where(static value => value is not null).Cast<string>())
         {
-            if (ProhibitedSecretMarkers.Any(marker => value.Contains(marker, StringComparison.OrdinalIgnoreCase)) ||
-                IsCredentialBearingAbsoluteUri(value))
+            if (IsCredentialBearingAbsoluteUri(value) ||
+                ContainsSensitiveBareAssignment(value) ||
+                ProhibitedSecretMarkers.Any(marker => value.Contains(marker, StringComparison.OrdinalIgnoreCase)))
             {
                 throw new ArgumentException("Persistence input contains a prohibited secret-bearing value.", nameof(values));
             }
@@ -1146,14 +1147,24 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
         }
 
         string candidate = component[0] == prefix ? component[1..] : component;
-        for (int decodingPass = 0; decodingPass <= MaximumUriParameterDecodingPasses; decodingPass++)
+        return ContainsSensitiveSyntaxWithBoundedDecoding(candidate, ContainsSensitiveUriParameterName);
+    }
+
+    private static bool ContainsSensitiveBareAssignment(string value) =>
+        ContainsSensitiveSyntaxWithBoundedDecoding(value, ContainsSensitiveBareAssignmentSyntax);
+
+    private static bool ContainsSensitiveSyntaxWithBoundedDecoding(
+        string candidate,
+        Func<string, bool> containsSensitiveSyntax)
+    {
+        for (int decodingPass = 0; decodingPass <= MaximumParameterDecodingPasses; decodingPass++)
         {
-            if (ContainsSensitiveUriParameterName(candidate))
+            if (containsSensitiveSyntax(candidate))
             {
                 return true;
             }
 
-            if (decodingPass == MaximumUriParameterDecodingPasses)
+            if (decodingPass == MaximumParameterDecodingPasses)
             {
                 break;
             }
@@ -1180,7 +1191,7 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
             ReadOnlySpan<char> segment = component.AsSpan(segmentStart, segmentEnd - segmentStart);
             int equalsOffset = segment.IndexOf('=');
             ReadOnlySpan<char> parameterName = (equalsOffset < 0 ? segment : segment[..equalsOffset]).Trim();
-            if (!parameterName.IsEmpty && SensitiveUriParameterNames.Contains(parameterName.ToString()))
+            if (!parameterName.IsEmpty && SensitiveParameterNames.Contains(parameterName.ToString()))
             {
                 return true;
             }
@@ -1195,6 +1206,51 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
 
         return false;
     }
+
+    private static bool ContainsSensitiveBareAssignmentSyntax(string value)
+    {
+        for (int candidateStart = 0; candidateStart < value.Length; candidateStart++)
+        {
+            if (!IsSensitiveParameterNameCharacter(value[candidateStart]) ||
+                candidateStart > 0 && !IsBareAssignmentBoundary(value[candidateStart - 1]))
+            {
+                continue;
+            }
+
+            int parameterNameEnd = candidateStart + 1;
+            while (parameterNameEnd < value.Length &&
+                IsSensitiveParameterNameCharacter(value[parameterNameEnd]))
+            {
+                parameterNameEnd++;
+            }
+
+            int assignmentDelimiter = parameterNameEnd;
+            while (assignmentDelimiter < value.Length && IsAsciiWhitespace(value[assignmentDelimiter]))
+            {
+                assignmentDelimiter++;
+            }
+
+            if (assignmentDelimiter < value.Length &&
+                value[assignmentDelimiter] == '=' &&
+                SensitiveParameterNames.Contains(value[candidateStart..parameterNameEnd]))
+            {
+                return true;
+            }
+
+            candidateStart = parameterNameEnd - 1;
+        }
+
+        return false;
+    }
+
+    private static bool IsSensitiveParameterNameCharacter(char value) =>
+        char.IsAsciiLetterOrDigit(value) || value is '_' or '-';
+
+    private static bool IsBareAssignmentBoundary(char value) =>
+        !char.IsLetterOrDigit(value) && value is not ('_' or '-');
+
+    private static bool IsAsciiWhitespace(char value) =>
+        value is ' ' or '\t' or '\r' or '\n' or '\f' or '\v';
 
     private static string DecodeUriParameterSyntaxOnce(string value)
     {
