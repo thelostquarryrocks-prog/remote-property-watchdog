@@ -30,6 +30,7 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
     private readonly IAgentJournalFaultInjector faultInjector;
     private readonly IAgentJournalDegradationHandler degradationHandler;
     private readonly IAgentReadinessTransitionGate readinessTransitionGate;
+    private readonly Func<CancellationToken, Task> beforeForeignKeyCheckRead;
     private readonly ILogger<SqliteAgentJournal> logger;
     private readonly string databasePath;
     private AgentJournalHealth health = AgentJournalHealth.NotInitialized;
@@ -41,12 +42,32 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
         IAgentJournalDegradationHandler degradationHandler,
         IAgentReadinessTransitionGate readinessTransitionGate,
         ILogger<SqliteAgentJournal> logger)
+        : this(
+            options,
+            timeProvider,
+            faultInjector,
+            degradationHandler,
+            readinessTransitionGate,
+            static _ => Task.CompletedTask,
+            logger)
+    {
+    }
+
+    internal SqliteAgentJournal(
+        IOptions<AgentJournalOptions> options,
+        TimeProvider timeProvider,
+        IAgentJournalFaultInjector faultInjector,
+        IAgentJournalDegradationHandler degradationHandler,
+        IAgentReadinessTransitionGate readinessTransitionGate,
+        Func<CancellationToken, Task> beforeForeignKeyCheckRead,
+        ILogger<SqliteAgentJournal> logger)
     {
         this.options = options.Value;
         this.timeProvider = timeProvider;
         this.faultInjector = faultInjector;
         this.degradationHandler = degradationHandler;
         this.readinessTransitionGate = readinessTransitionGate;
+        this.beforeForeignKeyCheckRead = beforeForeignKeyCheckRead;
         this.logger = logger;
         databasePath = ResolveDatabasePath(this.options.DatabasePath);
     }
@@ -95,7 +116,7 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
                         allowCreate: false,
                         cancellationToken);
                     stage = JournalVerificationStage.Integrity;
-                    string result = await RunIntegrityCheckAsync(connection, cancellationToken);
+                    string result = await RunIntegrityChecksAsync(connection, cancellationToken);
                     if (!StringComparer.Ordinal.Equals(result, "ok"))
                     {
                         return await SetDegradedAsync(current.SchemaVersion, "integrity_check_failed", "failed", sqliteErrorCode: null);
@@ -371,7 +392,28 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
                 return await SetDegradedAsync(schemaVersion, "schema_validation_failed", "not_run", sqliteErrorCode: null);
             }
 
-            string integrityResult = await RunIntegrityCheckAsync(connection, cancellationToken);
+            string integrityResult;
+            try
+            {
+                integrityResult = await RunIntegrityChecksAsync(connection, cancellationToken);
+            }
+            catch (SqliteException ex)
+            {
+                return await SetDegradedAsync(
+                    schemaVersion,
+                    "integrity_check_failed",
+                    "failed",
+                    ex.SqliteErrorCode);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
+            {
+                return await SetDegradedAsync(
+                    schemaVersion,
+                    "integrity_check_failed",
+                    "failed",
+                    sqliteErrorCode: null);
+            }
+
             if (!StringComparer.Ordinal.Equals(integrityResult, "ok"))
             {
                 return await SetDegradedAsync(schemaVersion, "integrity_check_failed", "failed", sqliteErrorCode: null);
@@ -599,22 +641,37 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
         return await SqliteJournalSchemaValidator.ValidateAsync(connection, cancellationToken);
     }
 
-    private static async Task<string> RunIntegrityCheckAsync(SqliteConnection connection, CancellationToken cancellationToken)
+    private async Task<string> RunIntegrityChecksAsync(
+        SqliteConnection connection,
+        CancellationToken cancellationToken)
     {
-        await using SqliteCommand command = connection.CreateCommand();
-        command.CommandText = "PRAGMA integrity_check;";
-        await using SqliteDataReader reader = await command.ExecuteReaderAsync(cancellationToken);
-        int rows = 0;
-        while (await reader.ReadAsync(cancellationToken))
+        await using (SqliteCommand command = connection.CreateCommand())
         {
-            rows++;
-            if (!StringComparer.Ordinal.Equals(reader.GetString(0), "ok"))
+            command.CommandText = "PRAGMA integrity_check;";
+            await using SqliteDataReader reader = await command.ExecuteReaderAsync(cancellationToken);
+            int rows = 0;
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                rows++;
+                if (!StringComparer.Ordinal.Equals(reader.GetString(0), "ok"))
+                {
+                    return "failed";
+                }
+            }
+
+            if (rows != 1)
             {
                 return "failed";
             }
         }
 
-        return rows == 1 ? "ok" : "failed";
+        await using (SqliteCommand command = connection.CreateCommand())
+        {
+            command.CommandText = "PRAGMA foreign_key_check;";
+            await using SqliteDataReader reader = await command.ExecuteReaderAsync(cancellationToken);
+            await beforeForeignKeyCheckRead(cancellationToken);
+            return await reader.ReadAsync(cancellationToken) ? "failed" : "ok";
+        }
     }
 
     private async Task<long> AllocateSequenceAsync(

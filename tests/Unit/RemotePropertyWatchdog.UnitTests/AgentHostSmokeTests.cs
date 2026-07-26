@@ -1040,6 +1040,97 @@ public sealed class AgentHostSmokeTests
     }
 
     [Fact]
+    public async Task OwnedJournalForeignKeyViolationBlocksEveryReadinessSurfaceWithoutRepairOrStartupWrites()
+    {
+        string markerPath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.json");
+        string databasePath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.db");
+        SignalingLogger<AgentWorker> readyLogger = new(eventId: 2);
+        using (IHost setupHost = Program.CreateHostBuilder([
+                "--AgentLifecycle:MarkerPath", markerPath,
+                "--AgentLifecycle:ReadinessTimeout", "00:01:00",
+                "--AgentJournal:DatabasePath", databasePath
+            ])
+            .ConfigureServices(services => services.AddSingleton<ILogger<AgentWorker>>(readyLogger))
+            .Build())
+        {
+            await setupHost.StartAsync(CancellationToken.None);
+            await readyLogger.WaitAsync();
+            await setupHost.StopAsync(CancellationToken.None);
+        }
+
+        AgentLifecycleMarker ownedMarker = Assert.IsType<AgentLifecycleMarker>(
+            await new FileAgentLifecycleStore(
+                    Options.Create(new AgentLifecycleOptions { MarkerPath = markerPath }))
+                .ReadLastMarkerAsync(CancellationToken.None));
+        Assert.Equal(AgentLifecycleMarker.CurrentJournalOwnershipVersion, ownedMarker.JournalOwnershipVersion);
+        await InsertOutboxForeignKeyViolationAsync(databasePath);
+        string before = await ReadJournalContentSignatureAsync(databasePath);
+
+        SignalingLogger<AgentWorker> degradedLogger = new(eventId: 8);
+        ListLogger<SqliteAgentJournal> journalLogger = new();
+        using IHost host = Program.CreateHostBuilder([
+                "--AgentLifecycle:MarkerPath", markerPath,
+                "--AgentLifecycle:ReadinessTimeout", "00:01:00",
+                "--AgentJournal:DatabasePath", databasePath
+            ])
+            .ConfigureServices(services =>
+            {
+                services.AddSingleton<ILogger<AgentWorker>>(degradedLogger);
+                services.AddSingleton<ILogger<SqliteAgentJournal>>(journalLogger);
+            })
+            .Build();
+
+        await host.StartAsync(CancellationToken.None);
+        LogEntry degradedLog = await degradedLogger.WaitAsync();
+        IAgentJournal journal = host.Services.GetRequiredService<IAgentJournal>();
+        IAgentLifecycleCoordinator coordinator = host.Services.GetRequiredService<IAgentLifecycleCoordinator>();
+        AgentWorker worker = GetAgentWorker(host);
+        IAgentServiceHealth serviceHealth = host.Services.GetRequiredService<IAgentServiceHealth>();
+
+        Assert.Equal(AgentJournalHealthState.Degraded, journal.Health.State);
+        Assert.Equal("integrity_check_failed", journal.Health.ReasonCode);
+        Assert.Equal("failed", journal.Health.IntegrityResult);
+        Assert.Equal(journal.Health, worker.Health);
+        Assert.Equal(journal.Health, serviceHealth.Health);
+        Assert.False(worker.IsReady);
+        Assert.False(serviceHealth.IsReady);
+        Assert.False(coordinator.CurrentState?.IsReady);
+        Assert.Null(coordinator.CurrentState?.ReadyAtUtc);
+        AgentLifecycleMarker rejectedMarker = Assert.IsType<AgentLifecycleMarker>(
+            await new FileAgentLifecycleStore(
+                    Options.Create(new AgentLifecycleOptions { MarkerPath = markerPath }))
+                .ReadLastMarkerAsync(CancellationToken.None));
+        Assert.Null(rejectedMarker.ReadyAtUtc);
+        Assert.Null(rejectedMarker.ReadinessElapsedMilliseconds);
+
+        AgentLifecycleState rejectedState = Assert.IsType<AgentLifecycleState>(coordinator.CurrentState);
+        await AssertBlockedAfterDegradationAsync(
+            journal,
+            new AgentSessionRecord(rejectedState.SessionId.ToString("D"), rejectedState.StartedAtUtc),
+            rejectedState.SessionId,
+            rejectedState.StartedAtUtc,
+            "integrity_check_failed");
+        Assert.Equal(before, await ReadJournalContentSignatureAsync(databasePath));
+
+        Assert.Null(degradedLog.Exception);
+        Assert.DoesNotContain(databasePath, degradedLog.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("outbox", degradedLog.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("event-missing", degradedLog.Message, StringComparison.Ordinal);
+        LogEntry journalDegradedLog = Assert.Single(
+            journalLogger.Entries,
+            entry => entry.EventId == 101);
+        Assert.Null(journalDegradedLog.Exception);
+        Assert.DoesNotContain(databasePath, journalDegradedLog.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("outbox", journalDegradedLog.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("event-missing", journalDegradedLog.Message, StringComparison.Ordinal);
+
+        await host.StopAsync(CancellationToken.None);
+
+        Assert.False(coordinator.CurrentState?.IsReady);
+        Assert.Equal(before, await ReadJournalContentSignatureAsync(databasePath));
+    }
+
+    [Fact]
     public async Task CorruptJournalRemainsDegradedAndPreventsRealHostReadinessWithoutReplacingFile()
     {
         string markerPath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.json");
@@ -1473,6 +1564,63 @@ public sealed class AgentHostSmokeTests
             command.CommandText = $"SELECT COUNT(*) FROM {tableName};";
             Assert.Equal(0L, Convert.ToInt64(await command.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
         }
+    }
+
+    private static async Task InsertOutboxForeignKeyViolationAsync(string databasePath)
+    {
+        SqliteConnectionStringBuilder builder = new()
+        {
+            DataSource = databasePath,
+            Mode = SqliteOpenMode.ReadWrite,
+            Pooling = false
+        };
+        await using SqliteConnection connection = new(builder.ToString());
+        await connection.OpenAsync();
+        await using SqliteCommand command = connection.CreateCommand();
+        command.CommandText = """
+            PRAGMA wal_checkpoint(TRUNCATE);
+            PRAGMA journal_mode = DELETE;
+            PRAGMA foreign_keys = OFF;
+            INSERT INTO outbox(
+                outbox_id, event_id, agent_id, agent_sequence, payload_json, created_at_utc)
+            VALUES (
+                'outbox-orphan', 'event-missing', 'agent-synthetic', 1, '{}',
+                '2026-07-26T12:00:00.0000000+00:00');
+            """;
+        await command.ExecuteNonQueryAsync();
+    }
+
+    private static async Task<string> ReadJournalContentSignatureAsync(string databasePath)
+    {
+        SqliteConnectionStringBuilder builder = new()
+        {
+            DataSource = databasePath,
+            Mode = SqliteOpenMode.ReadWrite,
+            Pooling = false
+        };
+        await using SqliteConnection connection = new(builder.ToString());
+        await connection.OpenAsync();
+        List<string> parts = [];
+        foreach (string table in SqliteJournalSchema.Tables)
+        {
+            await using SqliteCommand count = connection.CreateCommand();
+            count.CommandText = $"SELECT COUNT(*) FROM {table};";
+            parts.Add($"{table}={Convert.ToInt64(await count.ExecuteScalarAsync(), CultureInfo.InvariantCulture)}");
+        }
+
+        await using (SqliteCommand integrity = connection.CreateCommand())
+        {
+            integrity.CommandText = "PRAGMA integrity_check;";
+            parts.Add($"integrity={Convert.ToString(await integrity.ExecuteScalarAsync(), CultureInfo.InvariantCulture)}");
+        }
+
+        await using (SqliteCommand foreignKeys = connection.CreateCommand())
+        {
+            foreignKeys.CommandText = "SELECT COUNT(*) FROM pragma_foreign_key_check;";
+            parts.Add($"foreign_key_violations={Convert.ToInt64(await foreignKeys.ExecuteScalarAsync(), CultureInfo.InvariantCulture)}");
+        }
+
+        return string.Join("\u001f", parts);
     }
 
     private static async Task AssertBlockedAfterDegradationAsync(
@@ -2013,6 +2161,42 @@ public sealed class AgentHostSmokeTests
         {
             Entries.Add(new LogEntry(logLevel, eventId.Id, exception, formatter(state, exception)));
         }
+
+        private sealed class NullScope : IDisposable
+        {
+            public static NullScope Instance { get; } = new();
+
+            public void Dispose()
+            {
+            }
+        }
+    }
+
+    private sealed class SignalingLogger<T>(int eventId) : ILogger<T>
+    {
+        private readonly TaskCompletionSource<LogEntry> completion =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public IDisposable BeginScope<TState>(TState state) where TState : notnull => NullScope.Instance;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId loggedEventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            if (loggedEventId.Id == eventId)
+            {
+                completion.TrySetResult(
+                    new LogEntry(logLevel, loggedEventId.Id, exception, formatter(state, exception)));
+            }
+        }
+
+        public Task<LogEntry> WaitAsync() =>
+            completion.Task.WaitAsync(TimeSpan.FromSeconds(10));
 
         private sealed class NullScope : IDisposable
         {

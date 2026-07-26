@@ -627,6 +627,79 @@ public sealed class SqliteAgentJournalTests
         Assert.Equal("ok", health.IntegrityResult);
     }
 
+    [Theory]
+    [InlineData("probe_samples_to_agent_sessions")]
+    [InlineData("material_events_to_agent_sessions")]
+    [InlineData("outbox_to_material_events")]
+    public async Task InitializationRejectsAndPreservesEveryDeclaredForeignKeyViolation(string relationship)
+    {
+        using TestDatabase database = new();
+        await CreateValidDeleteModeDatabaseAsync(database);
+        await InsertForeignKeyViolationAsync(database, relationship);
+        string before = await ReadJournalContentSignatureAsync(database);
+        Assert.Equal("ok", await ReadIntegrityResultAsync(database));
+        Assert.Equal(1L, await ReadForeignKeyViolationCountAsync(database));
+
+        using SqliteAgentJournal journal = CreateJournal(database.Path);
+        AgentJournalHealth health = await InitializeExistingAsync(journal);
+
+        Assert.Equal(AgentJournalHealthState.Degraded, health.State);
+        Assert.Equal("integrity_check_failed", health.ReasonCode);
+        Assert.Equal("failed", health.IntegrityResult);
+        Assert.InRange(health.ReasonCode.Length, 1, 64);
+        await AssertAllRuntimeOperationsBlockedAsync(journal, "integrity_check_failed");
+        Assert.Equal(before, await ReadJournalContentSignatureAsync(database));
+        Assert.Equal("ok", await ReadIntegrityResultAsync(database));
+        Assert.Equal(1L, await ReadForeignKeyViolationCountAsync(database));
+        Assert.False(File.Exists($"{database.Path}-wal"));
+        Assert.False(File.Exists($"{database.Path}-shm"));
+    }
+
+    [Fact]
+    public async Task ExplicitVerificationRejectsAndPreservesExistingForeignKeyViolation()
+    {
+        using TestDatabase database = new();
+        using SqliteAgentJournal journal = CreateJournal(database.Path);
+        await AddSessionAsync(journal);
+        await journal.AppendMaterialEventAsync(Event("event-valid-before-foreign-key-check"), CancellationToken.None);
+        await SetDeleteJournalModeAsync(database);
+        await InsertForeignKeyViolationAsync(database, "probe_samples_to_agent_sessions");
+        string before = await ReadJournalContentSignatureAsync(database);
+        Assert.Equal("ok", await ReadIntegrityResultAsync(database));
+        Assert.Equal(1L, await ReadForeignKeyViolationCountAsync(database));
+
+        AgentJournalHealth health = await journal.VerifyIntegrityAsync(CancellationToken.None);
+
+        Assert.Equal(AgentJournalHealthState.Degraded, health.State);
+        Assert.Equal("integrity_check_failed", health.ReasonCode);
+        Assert.Equal("failed", health.IntegrityResult);
+        Assert.Equal(before, await ReadJournalContentSignatureAsync(database));
+        Assert.Equal(1L, await ReadForeignKeyViolationCountAsync(database));
+    }
+
+    [Fact]
+    public async Task ForeignKeyCheckReadFailureFailsClosedWithoutModifyingJournal()
+    {
+        using TestDatabase database = new();
+        await CreateValidDeleteModeDatabaseAsync(database);
+        string before = await ReadJournalContentSignatureAsync(database);
+        using SqliteAgentJournal journal = CreateJournal(
+            database.Path,
+            beforeForeignKeyCheckRead:
+                static _ => Task.FromException(new IOException("Synthetic foreign-key check read failure.")));
+
+        AgentJournalHealth health = await InitializeExistingAsync(journal);
+
+        Assert.Equal(AgentJournalHealthState.Degraded, health.State);
+        Assert.Equal("integrity_check_failed", health.ReasonCode);
+        Assert.Equal("failed", health.IntegrityResult);
+        Assert.InRange(health.ReasonCode.Length, 1, 64);
+        Assert.Equal(before, await ReadJournalContentSignatureAsync(database));
+        Assert.Equal(0L, await ReadForeignKeyViolationCountAsync(database));
+        Assert.False(File.Exists($"{database.Path}-wal"));
+        Assert.False(File.Exists($"{database.Path}-shm"));
+    }
+
     [Fact]
     public async Task DeletedInitializedDatabaseDegradesWithoutRecreation()
     {
@@ -1004,13 +1077,17 @@ public sealed class SqliteAgentJournalTests
         Assert.Equal(AgentJournalHealthState.Healthy, journal.Health.State);
     }
 
-    private static SqliteAgentJournal CreateJournal(string path, IAgentJournalFaultInjector? faultInjector = null) =>
+    private static SqliteAgentJournal CreateJournal(
+        string path,
+        IAgentJournalFaultInjector? faultInjector = null,
+        Func<CancellationToken, Task>? beforeForeignKeyCheckRead = null) =>
         new(
             Options.Create(new AgentJournalOptions { DatabasePath = path, BusyTimeout = TimeSpan.FromSeconds(15) }),
             new FixedTimeProvider(Now),
             faultInjector ?? NoOpAgentJournalFaultInjector.Instance,
             NoOpAgentJournalDegradationHandler.Instance,
             ImmediateReadinessTransitionGate.Instance,
+            beforeForeignKeyCheckRead ?? (static _ => Task.CompletedTask),
             NullLogger<SqliteAgentJournal>.Instance);
 
     private static async Task AddSessionAsync(SqliteAgentJournal journal)
@@ -1107,6 +1184,61 @@ public sealed class SqliteAgentJournalTests
         await ExecuteAsync(connection, sql);
     }
 
+    private static async Task InsertForeignKeyViolationAsync(TestDatabase database, string relationship)
+    {
+        string sql = relationship switch
+        {
+            "probe_samples_to_agent_sessions" => """
+                INSERT INTO probe_samples(
+                    sample_id, agent_id, session_id, observed_at_utc, probe_kind, probe_state, target_id, evidence_json)
+                VALUES (
+                    'sample-orphan', 'agent-synthetic', 'session-missing', '2026-07-19T12:00:00.0000000+00:00',
+                    'tcp', 'unreachable', 'target-synthetic', '["probe_timeout"]');
+                """,
+            "material_events_to_agent_sessions" => """
+                INSERT INTO material_events(
+                    event_id, schema_version, agent_id, property_id, agent_sequence, session_id,
+                    observed_at_utc, event_type, target_id, target_label, from_state, to_state,
+                    evidence_json, gateway_state, internet_state, created_at_utc)
+                VALUES (
+                    'event-orphan', 'v1', 'agent-synthetic', 'property-synthetic', 1, 'session-missing',
+                    '2026-07-19T12:00:00.0000000+00:00', 'target_state_changed', 'target-synthetic',
+                    'Synthetic target', 'up', 'down', '["probe_timeout"]', 'up', 'up',
+                    '2026-07-19T12:00:00.0000000+00:00');
+                """,
+            "outbox_to_material_events" => """
+                INSERT INTO outbox(
+                    outbox_id, event_id, agent_id, agent_sequence, payload_json, created_at_utc)
+                VALUES (
+                    'outbox-orphan', 'event-missing', 'agent-synthetic', 1, '{}',
+                    '2026-07-19T12:00:00.0000000+00:00');
+                """,
+            _ => throw new ArgumentOutOfRangeException(nameof(relationship))
+        };
+
+        await using SqliteConnection connection = await database.OpenAsync();
+        await ExecuteAsync(connection, "PRAGMA foreign_keys = OFF;");
+        await ExecuteAsync(connection, sql);
+    }
+
+    private static async Task AssertAllRuntimeOperationsBlockedAsync(
+        SqliteAgentJournal journal,
+        string reasonCode)
+    {
+        AgentJournalDegradedException session = await Assert.ThrowsAsync<AgentJournalDegradedException>(
+            () => journal.RecordSessionAsync(Session(), CancellationToken.None));
+        AgentJournalDegradedException probe = await Assert.ThrowsAsync<AgentJournalDegradedException>(
+            () => journal.AppendProbeSampleAsync(Probe("sample-blocked"), CancellationToken.None));
+        AgentJournalDegradedException materialEvent = await Assert.ThrowsAsync<AgentJournalDegradedException>(
+            () => journal.AppendMaterialEventAsync(Event("event-blocked"), CancellationToken.None));
+        AgentJournalDegradedException outbox = await Assert.ThrowsAsync<AgentJournalDegradedException>(
+            () => journal.ReadPendingOutboxAsync("agent-synthetic", 10, CancellationToken.None));
+
+        Assert.All(
+            new[] { session, probe, materialEvent, outbox },
+            failure => Assert.Equal(reasonCode, failure.Health.ReasonCode));
+    }
+
     private static async Task CreateValidDeleteModeDatabaseAsync(TestDatabase database)
     {
         using (SqliteAgentJournal journal = CreateJournal(database.Path))
@@ -1172,6 +1304,25 @@ public sealed class SqliteAgentJournalTests
     {
         await using SqliteConnection connection = await database.OpenAsync();
         return await ScalarStringAsync(connection, "PRAGMA integrity_check;");
+    }
+
+    private static async Task<long> ReadForeignKeyViolationCountAsync(TestDatabase database)
+    {
+        await using SqliteConnection connection = await database.OpenAsync();
+        return await ScalarInt64Async(connection, "SELECT COUNT(*) FROM pragma_foreign_key_check;");
+    }
+
+    private static async Task<string> ReadJournalContentSignatureAsync(TestDatabase database)
+    {
+        List<string> parts = [await ReadDiagnosticSignatureAsync(database)];
+        await using SqliteConnection connection = await database.OpenAsync();
+        foreach (string table in SqliteJournalSchema.Tables)
+        {
+            parts.Add($"{table}={await ScalarInt64Async(connection, $"SELECT COUNT(*) FROM {table};")}");
+        }
+
+        parts.Add($"foreign_key_violations={await ScalarInt64Async(connection, "SELECT COUNT(*) FROM pragma_foreign_key_check;")}");
+        return string.Join("\u001f", parts);
     }
 
     private static async Task<string> ReadDiagnosticSignatureAsync(TestDatabase database)
