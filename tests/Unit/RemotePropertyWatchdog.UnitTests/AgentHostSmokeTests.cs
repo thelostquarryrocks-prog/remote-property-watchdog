@@ -28,6 +28,8 @@ public sealed class AgentHostSmokeTests
         Assert.IsType<FileAgentLifecycleStore>(host.Services.GetRequiredService<IAgentLifecycleStore>());
         Assert.IsType<SqliteAgentJournal>(host.Services.GetRequiredService<IAgentJournal>());
         Assert.IsType<NoOpAgentJournalFaultInjector>(host.Services.GetRequiredService<IAgentJournalFaultInjector>());
+        Assert.IsType<AgentReadinessTransitionGate>(
+            host.Services.GetRequiredService<IAgentReadinessTransitionGate>());
         AgentWorker worker = Assert.Single(hostedServices.OfType<AgentWorker>());
         Assert.Same(worker, host.Services.GetRequiredService<IAgentServiceHealth>());
     }
@@ -355,6 +357,338 @@ public sealed class AgentHostSmokeTests
             publishedMarker.ReadinessElapsedMilliseconds);
 
         await host.StopAsync(CancellationToken.None);
+    }
+
+    [Theory]
+    [InlineData(ReadinessPausePoint.BeforeGate)]
+    [InlineData(ReadinessPausePoint.AfterGate)]
+    [InlineData(ReadinessPausePoint.AfterPublication)]
+    public async Task ConcurrentReadinessAndDegradationAlwaysFinishNotReady(
+        ReadinessPausePoint pausePoint)
+    {
+        for (int iteration = 0; iteration < 3; iteration++)
+        {
+            string markerPath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.json");
+            string databasePath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.db");
+            CoordinatedReadinessTransitionGate transitionGate = new(pausePoint);
+            MaterialEventStorageFaultInjector faultInjector = new();
+            MutableTimeProvider clock = new(new DateTimeOffset(2026, 7, 15, 1, 2, 3, TimeSpan.Zero));
+            ListLogger<AgentWorker> workerLogger = new();
+            using IHost host = Program.CreateHostBuilder([
+                    "--AgentLifecycle:MarkerPath", markerPath,
+                    "--AgentLifecycle:ReadinessTimeout", "00:01:00",
+                    "--AgentJournal:DatabasePath", databasePath
+                ])
+                .ConfigureServices(services =>
+                {
+                    services.AddSingleton<IAgentReadinessTransitionGate>(transitionGate);
+                    services.AddSingleton<IAgentJournalFaultInjector>(faultInjector);
+                    services.AddSingleton<TimeProvider>(clock);
+                    services.AddSingleton<ILogger<AgentWorker>>(workerLogger);
+                })
+                .Build();
+
+            await host.StartAsync(CancellationToken.None);
+            await transitionGate.ReadinessPaused.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            IAgentJournal journal = host.Services.GetRequiredService<IAgentJournal>();
+            IAgentLifecycleCoordinator coordinator = host.Services.GetRequiredService<IAgentLifecycleCoordinator>();
+            AgentWorker worker = GetAgentWorker(host);
+            IAgentServiceHealth serviceHealth = host.Services.GetRequiredService<IAgentServiceHealth>();
+            Guid sessionId = coordinator.CurrentState!.SessionId;
+            AgentSessionRecord committedReady = Assert.IsType<AgentSessionRecord>(
+                await ReadJournalSessionAsync(databasePath, sessionId));
+            Assert.NotNull(committedReady.ReadyAtUtc);
+
+            AgentLifecycleMarker pausedMarker = Assert.IsType<AgentLifecycleMarker>(
+                await new FileAgentLifecycleStore(
+                        Options.Create(new AgentLifecycleOptions { MarkerPath = markerPath }))
+                    .ReadLastMarkerAsync(CancellationToken.None));
+            if (pausePoint == ReadinessPausePoint.AfterPublication)
+            {
+                Assert.True(coordinator.CurrentState.IsReady);
+                Assert.True(worker.IsReady);
+                Assert.True(serviceHealth.IsReady);
+                Assert.NotNull(pausedMarker.ReadyAtUtc);
+            }
+            else
+            {
+                Assert.False(coordinator.CurrentState.IsReady);
+                Assert.False(worker.IsReady);
+                Assert.False(serviceHealth.IsReady);
+                Assert.Null(pausedMarker.ReadyAtUtc);
+            }
+
+            clock.Advance(TimeSpan.FromMinutes(-5));
+            Task<MaterialEventCommit> degradation = journal.AppendMaterialEventAsync(
+                RuntimeEvent(sessionId, clock.GetUtcNow(), iteration),
+                CancellationToken.None);
+            if (pausePoint == ReadinessPausePoint.BeforeGate)
+            {
+                AgentJournalDegradedException failure =
+                    await Assert.ThrowsAsync<AgentJournalDegradedException>(() => degradation);
+                Assert.Equal("runtime_write_failed", failure.Health.ReasonCode);
+            }
+            else
+            {
+                await transitionGate.JournalOperationAttempted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            }
+
+            transitionGate.ReleaseReadiness();
+            if (pausePoint != ReadinessPausePoint.BeforeGate)
+            {
+                AgentJournalDegradedException failure =
+                    await Assert.ThrowsAsync<AgentJournalDegradedException>(() => degradation);
+                Assert.Equal("runtime_write_failed", failure.Health.ReasonCode);
+            }
+            else
+            {
+                await WaitUntilLoggedAsync(workerLogger, eventId: 8);
+            }
+
+            Assert.Equal(AgentJournalHealthState.Degraded, journal.Health.State);
+            Assert.Equal("runtime_write_failed", journal.Health.ReasonCode);
+            Assert.False(coordinator.CurrentState.IsReady);
+            Assert.False(worker.IsReady);
+            Assert.False(serviceHealth.IsReady);
+            AgentLifecycleMarker degradedMarker = Assert.IsType<AgentLifecycleMarker>(
+                await new FileAgentLifecycleStore(
+                        Options.Create(new AgentLifecycleOptions { MarkerPath = markerPath }))
+                    .ReadLastMarkerAsync(CancellationToken.None));
+            Assert.Null(degradedMarker.ReadyAtUtc);
+            Assert.Null(degradedMarker.ReadinessElapsedMilliseconds);
+            Assert.Equal(1, faultInjector.MaterialEventCalls);
+            await AssertNoProbeEventOutboxOrSequenceWritesAsync(databasePath);
+            await AssertBlockedAfterDegradationAsync(
+                journal,
+                new AgentSessionRecord(sessionId.ToString("D"), coordinator.CurrentState.StartedAtUtc),
+                sessionId,
+                clock.GetUtcNow(),
+                "runtime_write_failed");
+
+            await host.StopAsync(CancellationToken.None);
+
+            Assert.True(coordinator.CurrentState.PlannedShutdown);
+            Assert.False(coordinator.CurrentState.IsReady);
+            Assert.Equal(coordinator.CurrentState.StartedAtUtc, coordinator.CurrentState.StoppedAtUtc);
+            AgentLifecycleMarker stoppedMarker = Assert.IsType<AgentLifecycleMarker>(
+                await new FileAgentLifecycleStore(
+                        Options.Create(new AgentLifecycleOptions { MarkerPath = markerPath }))
+                    .ReadLastMarkerAsync(CancellationToken.None));
+            Assert.Equal(TimeSpan.Zero, stoppedMarker.StartedAtUtc.Offset);
+            Assert.Equal(TimeSpan.Zero, stoppedMarker.StoppedAtUtc?.Offset);
+            Assert.True(stoppedMarker.StoppedAtUtc >= stoppedMarker.StartedAtUtc);
+            Assert.Null(stoppedMarker.ReadyAtUtc);
+        }
+    }
+
+    [Fact]
+    public async Task DegradationQueuedDuringReadyMarkerWriteCannotLeaveReadyMarker()
+    {
+        string markerPath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.json");
+        string databasePath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.db");
+        IOptions<AgentLifecycleOptions> lifecycleOptions =
+            Options.Create(new AgentLifecycleOptions { MarkerPath = markerPath });
+        BlockingReadyLifecycleStore lifecycleStore =
+            new(new FileAgentLifecycleStore(lifecycleOptions));
+        ObservingReadinessTransitionGate transitionGate = new();
+        MaterialEventStorageFaultInjector faultInjector = new();
+        ListLogger<AgentWorker> workerLogger = new();
+        using IHost host = Program.CreateHostBuilder([
+                "--AgentLifecycle:MarkerPath", markerPath,
+                "--AgentLifecycle:ReadinessTimeout", "00:01:00",
+                "--AgentJournal:DatabasePath", databasePath
+            ])
+            .ConfigureServices(services =>
+            {
+                services.AddSingleton<IAgentLifecycleStore>(lifecycleStore);
+                services.AddSingleton<IAgentReadinessTransitionGate>(transitionGate);
+                services.AddSingleton<IAgentJournalFaultInjector>(faultInjector);
+                services.AddSingleton<ILogger<AgentWorker>>(workerLogger);
+            })
+            .Build();
+
+        await host.StartAsync(CancellationToken.None);
+        await lifecycleStore.ReadyWriteEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        IAgentJournal journal = host.Services.GetRequiredService<IAgentJournal>();
+        IAgentLifecycleCoordinator coordinator = host.Services.GetRequiredService<IAgentLifecycleCoordinator>();
+        AgentWorker worker = GetAgentWorker(host);
+        IAgentServiceHealth serviceHealth = host.Services.GetRequiredService<IAgentServiceHealth>();
+        Guid sessionId = coordinator.CurrentState!.SessionId;
+        AgentSessionRecord committedReady = Assert.IsType<AgentSessionRecord>(
+            await ReadJournalSessionAsync(databasePath, sessionId));
+        Assert.NotNull(committedReady.ReadyAtUtc);
+        Assert.False(coordinator.CurrentState.IsReady);
+        Assert.False(worker.IsReady);
+        Assert.False(serviceHealth.IsReady);
+
+        transitionGate.ObserveNextJournalOperation();
+        Task<MaterialEventCommit> degradation = journal.AppendMaterialEventAsync(
+            RuntimeEvent(sessionId, DateTimeOffset.UtcNow, 0),
+            CancellationToken.None);
+        await transitionGate.JournalOperationAttempted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(AgentJournalHealthState.Healthy, journal.Health.State);
+        lifecycleStore.ReleaseReadyWrite();
+        await Assert.ThrowsAsync<AgentJournalDegradedException>(() => degradation);
+
+        Assert.Equal("runtime_write_failed", journal.Health.ReasonCode);
+        Assert.False(coordinator.CurrentState.IsReady);
+        Assert.False(worker.IsReady);
+        Assert.False(serviceHealth.IsReady);
+        AgentLifecycleMarker marker = Assert.IsType<AgentLifecycleMarker>(
+            await new FileAgentLifecycleStore(lifecycleOptions)
+                .ReadLastMarkerAsync(CancellationToken.None));
+        Assert.Null(marker.ReadyAtUtc);
+        Assert.Null(marker.ReadinessElapsedMilliseconds);
+        await AssertNoProbeEventOutboxOrSequenceWritesAsync(databasePath);
+
+        await host.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task CancelledReadinessWaitingForTransitionGateNeverPublishesPartialReadiness()
+    {
+        string markerPath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.json");
+        string databasePath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.db");
+        CoordinatedReadinessTransitionGate transitionGate = new(ReadinessPausePoint.BeforeGate);
+        using IHost host = Program.CreateHostBuilder([
+                "--AgentLifecycle:MarkerPath", markerPath,
+                "--AgentLifecycle:ReadinessTimeout", "00:01:00",
+                "--AgentJournal:DatabasePath", databasePath
+            ])
+            .ConfigureServices(services =>
+                services.AddSingleton<IAgentReadinessTransitionGate>(transitionGate))
+            .Build();
+
+        await host.StartAsync(CancellationToken.None);
+        await transitionGate.ReadinessPaused.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        IAgentJournal journal = host.Services.GetRequiredService<IAgentJournal>();
+        IAgentLifecycleCoordinator coordinator = host.Services.GetRequiredService<IAgentLifecycleCoordinator>();
+        IAgentServiceHealth serviceHealth = host.Services.GetRequiredService<IAgentServiceHealth>();
+        Guid sessionId = coordinator.CurrentState!.SessionId;
+
+        await host.StopAsync(CancellationToken.None);
+
+        Assert.Equal(AgentJournalHealthState.Healthy, journal.Health.State);
+        Assert.False(coordinator.CurrentState.IsReady);
+        Assert.False(serviceHealth.IsReady);
+        Assert.True(coordinator.CurrentState.PlannedShutdown);
+        AgentSessionRecord committedReady = Assert.IsType<AgentSessionRecord>(
+            await ReadJournalSessionAsync(databasePath, sessionId));
+        Assert.NotNull(committedReady.ReadyAtUtc);
+        AgentLifecycleMarker marker = Assert.IsType<AgentLifecycleMarker>(
+            await new FileAgentLifecycleStore(
+                    Options.Create(new AgentLifecycleOptions { MarkerPath = markerPath }))
+                .ReadLastMarkerAsync(CancellationToken.None));
+        Assert.Null(marker.ReadyAtUtc);
+        Assert.Null(marker.ReadinessElapsedMilliseconds);
+        Assert.True(marker.PlannedShutdown);
+    }
+
+    [Fact]
+    public async Task DegradationMarkerFailureDuringReadinessRaceStaysFailClosedAndRestartsConservatively()
+    {
+        string markerPath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.json");
+        string databasePath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.db");
+        CoordinatedReadinessTransitionGate transitionGate = new(ReadinessPausePoint.AfterPublication);
+        MaterialEventStorageFaultInjector faultInjector = new();
+        IOptions<AgentLifecycleOptions> lifecycleOptions =
+            Options.Create(new AgentLifecycleOptions { MarkerPath = markerPath });
+        FailingAfterReadyLifecycleStore lifecycleStore =
+            new(new FileAgentLifecycleStore(lifecycleOptions));
+        ListLogger<SqliteAgentJournal> journalLogger = new();
+        ListLogger<AgentWorker> workerLogger = new();
+        Guid degradedSessionId;
+
+        using (IHost host = Program.CreateHostBuilder([
+                "--AgentLifecycle:MarkerPath", markerPath,
+                "--AgentLifecycle:ReadinessTimeout", "00:01:00",
+                "--AgentJournal:DatabasePath", databasePath
+            ])
+            .ConfigureServices(services =>
+            {
+                services.AddSingleton<IAgentReadinessTransitionGate>(transitionGate);
+                services.AddSingleton<IAgentJournalFaultInjector>(faultInjector);
+                services.AddSingleton<IAgentLifecycleStore>(lifecycleStore);
+                services.AddSingleton<ILogger<SqliteAgentJournal>>(journalLogger);
+                services.AddSingleton<ILogger<AgentWorker>>(workerLogger);
+            })
+            .Build())
+        {
+            await host.StartAsync(CancellationToken.None);
+            await transitionGate.ReadinessPaused.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            IAgentJournal journal = host.Services.GetRequiredService<IAgentJournal>();
+            IAgentLifecycleCoordinator coordinator = host.Services.GetRequiredService<IAgentLifecycleCoordinator>();
+            AgentWorker worker = GetAgentWorker(host);
+            IAgentServiceHealth serviceHealth = host.Services.GetRequiredService<IAgentServiceHealth>();
+            degradedSessionId = coordinator.CurrentState!.SessionId;
+            AgentLifecycleMarker readyMarker = Assert.IsType<AgentLifecycleMarker>(
+                await new FileAgentLifecycleStore(lifecycleOptions)
+                    .ReadLastMarkerAsync(CancellationToken.None));
+            Assert.NotNull(readyMarker.ReadyAtUtc);
+
+            Task<MaterialEventCommit> degradation = journal.AppendMaterialEventAsync(
+                RuntimeEvent(degradedSessionId, DateTimeOffset.UtcNow, 0),
+                CancellationToken.None);
+            await transitionGate.JournalOperationAttempted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            transitionGate.ReleaseReadiness();
+            await Assert.ThrowsAsync<AgentJournalDegradedException>(() => degradation);
+
+            Assert.Equal("runtime_write_failed", journal.Health.ReasonCode);
+            Assert.False(worker.IsReady);
+            Assert.False(serviceHealth.IsReady);
+            Assert.False(coordinator.CurrentState.IsReady);
+            Assert.Contains(
+                journalLogger.Entries,
+                entry =>
+                    entry.EventId == 104 &&
+                    entry.LogLevel == LogLevel.Error &&
+                    entry.Exception is null &&
+                    entry.Message.Contains("lifecycle_marker_write_failed", StringComparison.Ordinal));
+            AgentLifecycleMarker staleMarker = Assert.IsType<AgentLifecycleMarker>(
+                await new FileAgentLifecycleStore(lifecycleOptions)
+                    .ReadLastMarkerAsync(CancellationToken.None));
+            Assert.Equal(readyMarker, staleMarker);
+            await AssertNoProbeEventOutboxOrSequenceWritesAsync(databasePath);
+            await AssertBlockedAfterDegradationAsync(
+                journal,
+                new AgentSessionRecord(degradedSessionId.ToString("D"), coordinator.CurrentState.StartedAtUtc),
+                degradedSessionId,
+                DateTimeOffset.UtcNow,
+                "runtime_write_failed");
+
+            await host.StopAsync(CancellationToken.None);
+            Assert.False(coordinator.CurrentState.IsReady);
+            Assert.False(coordinator.CurrentState.PlannedShutdown);
+        }
+
+        CoordinatedReadinessTransitionGate restartGate = new(ReadinessPausePoint.BeforeGate);
+        using IHost restartedHost = Program.CreateHostBuilder([
+                "--AgentLifecycle:MarkerPath", markerPath,
+                "--AgentLifecycle:ReadinessTimeout", "00:01:00",
+                "--AgentJournal:DatabasePath", databasePath
+            ])
+            .ConfigureServices(services =>
+                services.AddSingleton<IAgentReadinessTransitionGate>(restartGate))
+            .Build();
+        await restartedHost.StartAsync(CancellationToken.None);
+        await restartGate.ReadinessPaused.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        IAgentLifecycleCoordinator restartedCoordinator =
+            restartedHost.Services.GetRequiredService<IAgentLifecycleCoordinator>();
+        IAgentServiceHealth restartedHealth =
+            restartedHost.Services.GetRequiredService<IAgentServiceHealth>();
+        Assert.Equal(degradedSessionId, restartedCoordinator.CurrentState?.PreviousSessionId);
+        Assert.False(restartedCoordinator.CurrentState?.IsReady);
+        Assert.False(restartedHealth.IsReady);
+        AgentLifecycleMarker restartedMarker = Assert.IsType<AgentLifecycleMarker>(
+            await new FileAgentLifecycleStore(lifecycleOptions)
+                .ReadLastMarkerAsync(CancellationToken.None));
+        Assert.Null(restartedMarker.ReadyAtUtc);
+        Assert.False(restartedMarker.PlannedShutdown);
+
+        restartGate.ReleaseReadiness();
+        await WaitUntilReadyAsync(restartedCoordinator);
+        Assert.True(restartedHealth.IsReady);
+        await restartedHost.StopAsync(CancellationToken.None);
     }
 
     [Fact]
@@ -1190,6 +1524,25 @@ public sealed class AgentHostSmokeTests
             "target-synthetic",
             ["probe_succeeded"]);
 
+    private static MaterialEventWrite RuntimeEvent(
+        Guid sessionId,
+        DateTimeOffset observedAtUtc,
+        int iteration) =>
+        new(
+            $"event-readiness-race-{iteration}-{Guid.NewGuid():N}",
+            "agent-synthetic",
+            "property-synthetic",
+            sessionId.ToString("D"),
+            observedAtUtc,
+            MaterialEventType.TargetStateChanged,
+            "target-synthetic",
+            "Synthetic target",
+            "up",
+            "down",
+            ["probe_timeout"],
+            "up",
+            "up");
+
     private static void DeleteJournalFiles(string databasePath)
     {
         File.Delete(databasePath);
@@ -1272,6 +1625,145 @@ public sealed class AgentHostSmokeTests
         public Task AfterMaterialEventCommitAsync(CancellationToken cancellationToken) => Task.CompletedTask;
     }
 
+    private sealed class MaterialEventStorageFaultInjector : IAgentJournalFaultInjector
+    {
+        public int MaterialEventCalls { get; private set; }
+
+        public Task BeforeSessionCommitAsync(CancellationToken cancellationToken) =>
+            Task.CompletedTask;
+
+        public Task AfterSessionCommitAsync(CancellationToken cancellationToken) =>
+            Task.CompletedTask;
+
+        public Task BeforeMaterialEventCommitAsync(CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            MaterialEventCalls++;
+            return Task.FromException(new IOException("synthetic storage failure"));
+        }
+
+        public Task AfterMaterialEventCommitAsync(CancellationToken cancellationToken) =>
+            Task.CompletedTask;
+    }
+
+    public enum ReadinessPausePoint
+    {
+        BeforeGate,
+        AfterGate,
+        AfterPublication
+    }
+
+    private sealed class CoordinatedReadinessTransitionGate(
+        ReadinessPausePoint pausePoint) : IAgentReadinessTransitionGate, IDisposable
+    {
+        private readonly SemaphoreSlim gate = new(1, 1);
+        private readonly TaskCompletionSource releaseReadiness =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int readinessIsPaused;
+
+        public TaskCompletionSource ReadinessPaused { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource JournalOperationAttempted { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task<T> ExecuteAsync<T>(
+            AgentReadinessTransitionKind kind,
+            Func<Task<T>> operation,
+            CancellationToken cancellationToken)
+        {
+            if (kind == AgentReadinessTransitionKind.ReadinessPublication &&
+                pausePoint == ReadinessPausePoint.BeforeGate)
+            {
+                await PauseReadinessAsync(cancellationToken);
+            }
+
+            if (kind == AgentReadinessTransitionKind.JournalOperation &&
+                Volatile.Read(ref readinessIsPaused) != 0)
+            {
+                JournalOperationAttempted.TrySetResult();
+            }
+
+            await gate.WaitAsync(cancellationToken);
+            try
+            {
+                if (kind == AgentReadinessTransitionKind.ReadinessPublication &&
+                    pausePoint == ReadinessPausePoint.AfterGate)
+                {
+                    await PauseReadinessAsync(cancellationToken);
+                }
+
+                T result = await operation();
+                if (kind == AgentReadinessTransitionKind.ReadinessPublication &&
+                    pausePoint == ReadinessPausePoint.AfterPublication)
+                {
+                    await PauseReadinessAsync(cancellationToken);
+                }
+
+                return result;
+            }
+            finally
+            {
+                gate.Release();
+            }
+        }
+
+        public void ReleaseReadiness() => releaseReadiness.TrySetResult();
+
+        public void Dispose() => gate.Dispose();
+
+        private async Task PauseReadinessAsync(CancellationToken cancellationToken)
+        {
+            Interlocked.Exchange(ref readinessIsPaused, 1);
+            ReadinessPaused.TrySetResult();
+            try
+            {
+                await releaseReadiness.Task.WaitAsync(cancellationToken);
+            }
+            finally
+            {
+                Interlocked.Exchange(ref readinessIsPaused, 0);
+            }
+        }
+    }
+
+    private sealed class ObservingReadinessTransitionGate : IAgentReadinessTransitionGate, IDisposable
+    {
+        private readonly SemaphoreSlim gate = new(1, 1);
+        private int observeNextJournalOperation;
+
+        public TaskCompletionSource JournalOperationAttempted { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task<T> ExecuteAsync<T>(
+            AgentReadinessTransitionKind kind,
+            Func<Task<T>> operation,
+            CancellationToken cancellationToken)
+        {
+            if (kind == AgentReadinessTransitionKind.JournalOperation &&
+                Interlocked.Exchange(ref observeNextJournalOperation, 0) != 0)
+            {
+                JournalOperationAttempted.TrySetResult();
+            }
+
+            await gate.WaitAsync(cancellationToken);
+            try
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                return await operation();
+            }
+            finally
+            {
+                gate.Release();
+            }
+        }
+
+        public void ObserveNextJournalOperation() =>
+            Interlocked.Exchange(ref observeNextJournalOperation, 1);
+
+        public void Dispose() => gate.Dispose();
+    }
+
     private static AgentWorker CreateWorker(
         RecordingLifecycleCoordinator coordinator,
         TimeSpan? cleanShutdownWriteTimeout = null,
@@ -1280,6 +1772,7 @@ public sealed class AgentHostSmokeTests
         new(
             coordinator,
             journal ?? new RecordingJournal(HealthyJournal()),
+            ImmediateReadinessTransitionGate.Instance,
             Options.Create(new AgentLifecycleOptions { CleanShutdownWriteTimeout = cleanShutdownWriteTimeout ?? TimeSpan.FromSeconds(1) }),
             logger ?? NullLogger<AgentWorker>.Instance);
 
@@ -1386,6 +1879,24 @@ public sealed class AgentHostSmokeTests
         }
     }
 
+    private sealed class ImmediateReadinessTransitionGate : IAgentReadinessTransitionGate
+    {
+        public static ImmediateReadinessTransitionGate Instance { get; } = new();
+
+        private ImmediateReadinessTransitionGate()
+        {
+        }
+
+        public Task<T> ExecuteAsync<T>(
+            AgentReadinessTransitionKind kind,
+            Func<Task<T>> operation,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return operation();
+        }
+    }
+
     private sealed class RecordingJournal(AgentJournalHealth health, List<string>? operations = null) : IAgentJournal
     {
         public TaskCompletionSource Initialized { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -1444,6 +1955,34 @@ public sealed class AgentHostSmokeTests
 
             return inner.WriteMarkerAsync(marker, cancellationToken);
         }
+    }
+
+    private sealed class BlockingReadyLifecycleStore(
+        IAgentLifecycleStore inner) : IAgentLifecycleStore
+    {
+        private readonly TaskCompletionSource releaseReadyWrite =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource ReadyWriteEntered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task<AgentLifecycleMarker?> ReadLastMarkerAsync(CancellationToken cancellationToken) =>
+            inner.ReadLastMarkerAsync(cancellationToken);
+
+        public async Task WriteMarkerAsync(
+            AgentLifecycleMarker marker,
+            CancellationToken cancellationToken)
+        {
+            if (marker.ReadyAtUtc is not null && !marker.PlannedShutdown)
+            {
+                ReadyWriteEntered.TrySetResult();
+                await releaseReadyWrite.Task.WaitAsync(cancellationToken);
+            }
+
+            await inner.WriteMarkerAsync(marker, cancellationToken);
+        }
+
+        public void ReleaseReadyWrite() => releaseReadyWrite.TrySetResult();
     }
 
     private sealed class MutableTimeProvider(DateTimeOffset utcNow) : TimeProvider

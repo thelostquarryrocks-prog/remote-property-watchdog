@@ -35,6 +35,7 @@ public static class Program
                     serviceProvider => serviceProvider.GetRequiredService<AgentLifecycleCoordinator>());
                 services.AddSingleton<IAgentJournalDegradationHandler>(
                     serviceProvider => serviceProvider.GetRequiredService<AgentLifecycleCoordinator>());
+                services.AddSingleton<IAgentReadinessTransitionGate, AgentReadinessTransitionGate>();
                 services.AddSingleton<IAgentJournalFaultInjector>(NoOpAgentJournalFaultInjector.Instance);
                 services.AddSingleton<IAgentJournal, SqliteAgentJournal>();
                 services.AddSingleton<AgentWorker>();

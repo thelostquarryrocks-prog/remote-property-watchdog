@@ -6,16 +6,19 @@ namespace RemotePropertyWatchdog.Agent.Service;
 public sealed partial class AgentWorker(
     IAgentLifecycleCoordinator lifecycleCoordinator,
     IAgentJournal agentJournal,
+    IAgentReadinessTransitionGate readinessTransitionGate,
     IOptions<AgentLifecycleOptions> options,
     ILogger<AgentWorker> logger) : BackgroundService, IAgentServiceHealth
 {
     private int executionFaulted;
-    private int monitoringReady;
+    private int shutdownStarted;
 
     public AgentJournalHealth Health => agentJournal.Health;
 
     public bool IsReady =>
-        Volatile.Read(ref monitoringReady) != 0 &&
+        Volatile.Read(ref executionFaulted) == 0 &&
+        Volatile.Read(ref shutdownStarted) == 0 &&
+        lifecycleCoordinator.CurrentState?.IsReady == true &&
         Health.State == AgentJournalHealthState.Healthy;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -56,8 +59,26 @@ public sealed partial class AgentWorker(
                 return;
             }
 
-            ready = await lifecycleCoordinator.PublishReadyAsync(ready, stoppingToken);
-            Interlocked.Exchange(ref monitoringReady, 1);
+            AgentLifecycleState? publishedReady = await readinessTransitionGate.ExecuteAsync(
+                AgentReadinessTransitionKind.ReadinessPublication,
+                async () =>
+                {
+                    if (agentJournal.Health.State != AgentJournalHealthState.Healthy)
+                    {
+                        return null;
+                    }
+
+                    return await lifecycleCoordinator.PublishReadyAsync(ready, stoppingToken);
+                },
+                stoppingToken);
+            if (publishedReady is null)
+            {
+                await TransitionToJournalDegradedAsync(agentJournal.Health, stoppingToken);
+                await WaitForShutdownAsync(stoppingToken);
+                return;
+            }
+
+            ready = publishedReady;
             LogAgentHostReady(logger, ready.SessionId, ready.ReadyAtUtc!.Value, ready.ReadinessElapsed!.Value.TotalMilliseconds, options.Value.ReadinessTimeout.TotalSeconds);
 
             await WaitForShutdownAsync(stoppingToken);
@@ -69,7 +90,6 @@ public sealed partial class AgentWorker(
         catch (Exception)
         {
             Interlocked.Exchange(ref executionFaulted, 1);
-            Interlocked.Exchange(ref monitoringReady, 0);
             LogAgentHostExecutionFaulted(logger, lifecycleCoordinator.CurrentState?.SessionId);
             throw;
         }
@@ -77,7 +97,7 @@ public sealed partial class AgentWorker(
 
     public override async Task StopAsync(CancellationToken cancellationToken)
     {
-        Interlocked.Exchange(ref monitoringReady, 0);
+        Interlocked.Exchange(ref shutdownStarted, 1);
         await base.StopAsync(cancellationToken);
 
         if (lifecycleCoordinator.CurrentState is null)
@@ -154,7 +174,6 @@ public sealed partial class AgentWorker(
         AgentJournalHealth journalHealth,
         CancellationToken _)
     {
-        Interlocked.Exchange(ref monitoringReady, 0);
         LogAgentJournalDegraded(
             logger,
             journalHealth.ReasonCode,

@@ -1010,6 +1010,7 @@ public sealed class SqliteAgentJournalTests
             new FixedTimeProvider(Now),
             faultInjector ?? NoOpAgentJournalFaultInjector.Instance,
             NoOpAgentJournalDegradationHandler.Instance,
+            ImmediateReadinessTransitionGate.Instance,
             NullLogger<SqliteAgentJournal>.Instance);
 
     private static async Task AddSessionAsync(SqliteAgentJournal journal)
@@ -1029,6 +1030,24 @@ public sealed class SqliteAgentJournalTests
         journal.InitializeAsync(
             AgentJournalInitializationMode.RequireExistingForPriorLifecycle,
             CancellationToken.None);
+
+    private sealed class ImmediateReadinessTransitionGate : IAgentReadinessTransitionGate
+    {
+        public static ImmediateReadinessTransitionGate Instance { get; } = new();
+
+        private ImmediateReadinessTransitionGate()
+        {
+        }
+
+        public Task<T> ExecuteAsync<T>(
+            AgentReadinessTransitionKind kind,
+            Func<Task<T>> operation,
+            CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return operation();
+        }
+    }
 
     private static void AssertJournalFilesAbsent(string databasePath)
     {

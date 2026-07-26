@@ -25,11 +25,11 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
     ];
 
     private readonly SemaphoreSlim initializationGate = new(1, 1);
-    private readonly SemaphoreSlim runtimeOperationGate = new(1, 1);
     private readonly AgentJournalOptions options;
     private readonly TimeProvider timeProvider;
     private readonly IAgentJournalFaultInjector faultInjector;
     private readonly IAgentJournalDegradationHandler degradationHandler;
+    private readonly IAgentReadinessTransitionGate readinessTransitionGate;
     private readonly ILogger<SqliteAgentJournal> logger;
     private readonly string databasePath;
     private AgentJournalHealth health = AgentJournalHealth.NotInitialized;
@@ -39,12 +39,14 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
         TimeProvider timeProvider,
         IAgentJournalFaultInjector faultInjector,
         IAgentJournalDegradationHandler degradationHandler,
+        IAgentReadinessTransitionGate readinessTransitionGate,
         ILogger<SqliteAgentJournal> logger)
     {
         this.options = options.Value;
         this.timeProvider = timeProvider;
         this.faultInjector = faultInjector;
         this.degradationHandler = degradationHandler;
+        this.readinessTransitionGate = readinessTransitionGate;
         this.logger = logger;
         databasePath = ResolveDatabasePath(this.options.DatabasePath);
     }
@@ -63,68 +65,10 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
         await initializationGate.WaitAsync(cancellationToken);
         try
         {
-            if (Health.State is not AgentJournalHealthState.NotInitialized)
-            {
-                return Health;
-            }
-
-            try
-            {
-                bool databaseExists = File.Exists(databasePath);
-                if (!databaseExists && mode == AgentJournalInitializationMode.RequireExistingForPriorLifecycle)
-                {
-                    return await SetDegradedAsync(null, "database_missing", "not_run", sqliteErrorCode: null);
-                }
-
-                await using SqliteConnection connection = await OpenConnectionAsync(
-                    allowCreate: !databaseExists,
-                    cancellationToken);
-                int schemaVersion = await MigrateToCurrentVersionAsync(connection, cancellationToken);
-
-                bool schemaIsValid = await ValidateSchemaAsync(connection, cancellationToken);
-                if (!schemaIsValid)
-                {
-                    return await SetDegradedAsync(schemaVersion, "schema_validation_failed", "not_run", sqliteErrorCode: null);
-                }
-
-                string integrityResult = await RunIntegrityCheckAsync(connection, cancellationToken);
-                if (!StringComparer.Ordinal.Equals(integrityResult, "ok"))
-                {
-                    return await SetDegradedAsync(schemaVersion, "integrity_check_failed", "failed", sqliteErrorCode: null);
-                }
-
-                await EnableWalAsync(connection, cancellationToken);
-                AgentJournalHealth initialized = new(AgentJournalHealthState.Healthy, schemaVersion, "healthy", "ok");
-                Volatile.Write(ref health, initialized);
-                LogInitialized(logger, schemaVersion, "wal", "full", "ok");
-                return initialized;
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch (UnsupportedAgentJournalSchemaException ex)
-            {
-                return await SetDegradedAsync(ex.ActualVersion, "schema_too_new", "not_run", sqliteErrorCode: null);
-            }
-            catch (UnownedAgentJournalException)
-            {
-                return await SetDegradedAsync(0, "database_not_owned", "not_run", sqliteErrorCode: null);
-            }
-            catch (SqliteException ex)
-            {
-                string reason = !File.Exists(databasePath)
-                    ? "database_missing"
-                    : ex.SqliteErrorCode == 26
-                        ? "database_invalid"
-                        : "initialization_failed";
-                return await SetDegradedAsync(null, reason, "failed", ex.SqliteErrorCode);
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
-            {
-                string reason = !File.Exists(databasePath) ? "database_missing" : "initialization_failed";
-                return await SetDegradedAsync(null, reason, "failed", sqliteErrorCode: null);
-            }
+            return await readinessTransitionGate.ExecuteAsync(
+                AgentReadinessTransitionKind.JournalOperation,
+                () => InitializeCoreAsync(mode, cancellationToken),
+                cancellationToken);
         }
         finally
         {
@@ -134,82 +78,80 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
 
     public async Task<AgentJournalHealth> VerifyIntegrityAsync(CancellationToken cancellationToken)
     {
-        await runtimeOperationGate.WaitAsync(cancellationToken);
-        try
-        {
-            AgentJournalHealth current = await EnsureHealthyAsync(cancellationToken);
-            if (!File.Exists(databasePath))
+        return await readinessTransitionGate.ExecuteAsync(
+            AgentReadinessTransitionKind.JournalOperation,
+            async () =>
             {
-                return await SetDegradedAsync(current.SchemaVersion, "database_missing", "not_run", sqliteErrorCode: null);
-            }
-
-            JournalVerificationStage stage = JournalVerificationStage.Opening;
-            try
-            {
-                await using SqliteConnection connection = await OpenConnectionAsync(
-                    allowCreate: false,
-                    cancellationToken);
-                stage = JournalVerificationStage.Integrity;
-                string result = await RunIntegrityCheckAsync(connection, cancellationToken);
-                if (!StringComparer.Ordinal.Equals(result, "ok"))
+                AgentJournalHealth current = await EnsureHealthyAsync(cancellationToken);
+                if (!File.Exists(databasePath))
                 {
-                    return await SetDegradedAsync(current.SchemaVersion, "integrity_check_failed", "failed", sqliteErrorCode: null);
+                    return await SetDegradedAsync(current.SchemaVersion, "database_missing", "not_run", sqliteErrorCode: null);
                 }
 
-                stage = JournalVerificationStage.Schema;
-                int schemaVersion = await ReadSchemaVersionAsync(connection, transaction: null, cancellationToken);
-                bool schemaIsValid =
-                    schemaVersion == SqliteJournalSchema.CurrentVersion &&
-                    await ValidateSchemaAsync(connection, cancellationToken);
-                if (!schemaIsValid)
+                JournalVerificationStage stage = JournalVerificationStage.Opening;
+                try
                 {
-                    return await SetDegradedAsync(schemaVersion, "schema_validation_failed", "ok", sqliteErrorCode: null);
-                }
+                    await using SqliteConnection connection = await OpenConnectionAsync(
+                        allowCreate: false,
+                        cancellationToken);
+                    stage = JournalVerificationStage.Integrity;
+                    string result = await RunIntegrityCheckAsync(connection, cancellationToken);
+                    if (!StringComparer.Ordinal.Equals(result, "ok"))
+                    {
+                        return await SetDegradedAsync(current.SchemaVersion, "integrity_check_failed", "failed", sqliteErrorCode: null);
+                    }
 
-                AgentJournalHealth verified = new(
-                    AgentJournalHealthState.Healthy,
-                    schemaVersion,
-                    "healthy",
-                    "ok");
-                Volatile.Write(ref health, verified);
-                LogIntegrityVerified(logger, schemaVersion, "ok");
-                return verified;
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch (SqliteException ex)
-            {
-                string reasonCode = !File.Exists(databasePath)
-                    ? "database_missing"
-                    : stage switch
+                    stage = JournalVerificationStage.Schema;
+                    int schemaVersion = await ReadSchemaVersionAsync(connection, transaction: null, cancellationToken);
+                    bool schemaIsValid =
+                        schemaVersion == SqliteJournalSchema.CurrentVersion &&
+                        await ValidateSchemaAsync(connection, cancellationToken);
+                    if (!schemaIsValid)
                     {
-                        JournalVerificationStage.Opening => "database_open_failed",
-                        JournalVerificationStage.Integrity => "integrity_check_failed",
-                        _ => "schema_validation_failed"
-                    };
-                string integrityResult = stage == JournalVerificationStage.Schema ? "ok" : "failed";
-                return await SetDegradedAsync(current.SchemaVersion, reasonCode, integrityResult, ex.SqliteErrorCode);
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
-            {
-                string reasonCode = !File.Exists(databasePath)
-                    ? "database_missing"
-                    : stage switch
-                    {
-                        JournalVerificationStage.Opening => "database_open_failed",
-                        JournalVerificationStage.Integrity => "integrity_check_failed",
-                        _ => "schema_validation_failed"
-                    };
-                string integrityResult = stage == JournalVerificationStage.Schema ? "ok" : "failed";
-                return await SetDegradedAsync(current.SchemaVersion, reasonCode, integrityResult, sqliteErrorCode: null);
-            }
-        }
-        finally
-        {
-            runtimeOperationGate.Release();
-        }
+                        return await SetDegradedAsync(schemaVersion, "schema_validation_failed", "ok", sqliteErrorCode: null);
+                    }
+
+                    AgentJournalHealth verified = new(
+                        AgentJournalHealthState.Healthy,
+                        schemaVersion,
+                        "healthy",
+                        "ok");
+                    Volatile.Write(ref health, verified);
+                    LogIntegrityVerified(logger, schemaVersion, "ok");
+                    return verified;
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (SqliteException ex)
+                {
+                    string reasonCode = !File.Exists(databasePath)
+                        ? "database_missing"
+                        : stage switch
+                        {
+                            JournalVerificationStage.Opening => "database_open_failed",
+                            JournalVerificationStage.Integrity => "integrity_check_failed",
+                            _ => "schema_validation_failed"
+                        };
+                    string integrityResult = stage == JournalVerificationStage.Schema ? "ok" : "failed";
+                    return await SetDegradedAsync(current.SchemaVersion, reasonCode, integrityResult, ex.SqliteErrorCode);
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
+                {
+                    string reasonCode = !File.Exists(databasePath)
+                        ? "database_missing"
+                        : stage switch
+                        {
+                            JournalVerificationStage.Opening => "database_open_failed",
+                            JournalVerificationStage.Integrity => "integrity_check_failed",
+                            _ => "schema_validation_failed"
+                        };
+                    string integrityResult = stage == JournalVerificationStage.Schema ? "ok" : "failed";
+                    return await SetDegradedAsync(current.SchemaVersion, reasonCode, integrityResult, sqliteErrorCode: null);
+                }
+            },
+            cancellationToken);
     }
 
     public async Task RecordSessionAsync(AgentSessionRecord session, CancellationToken cancellationToken)
@@ -362,7 +304,6 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
     public void Dispose()
     {
         initializationGate.Dispose();
-        runtimeOperationGate.Dispose();
     }
 
     private async Task<T> ExecuteRuntimeOperationAsync<T>(
@@ -370,37 +311,103 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
         Func<Task<T>> operation,
         CancellationToken cancellationToken)
     {
-        await runtimeOperationGate.WaitAsync(cancellationToken);
+        return await readinessTransitionGate.ExecuteAsync(
+            AgentReadinessTransitionKind.JournalOperation,
+            async () =>
+            {
+                try
+                {
+                    return await operation();
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (AgentJournalDegradedException)
+                {
+                    throw;
+                }
+                catch (Exception ex) when (
+                    ex is DbException or IOException or UnauthorizedAccessException or FormatException)
+                {
+                    string reasonCode = !File.Exists(databasePath) ? "database_missing" : failureReasonCode;
+                    int? sqliteErrorCode = ex is SqliteException sqliteException ? sqliteException.SqliteErrorCode : null;
+                    AgentJournalHealth degraded = await SetDegradedAsync(
+                        Health.SchemaVersion,
+                        reasonCode,
+                        "not_run",
+                        sqliteErrorCode);
+                    throw new AgentJournalDegradedException(degraded);
+                }
+            },
+            cancellationToken);
+    }
+
+    private async Task<AgentJournalHealth> InitializeCoreAsync(
+        AgentJournalInitializationMode mode,
+        CancellationToken cancellationToken)
+    {
+        if (Health.State is not AgentJournalHealthState.NotInitialized)
+        {
+            return Health;
+        }
+
         try
         {
-            try
+            bool databaseExists = File.Exists(databasePath);
+            if (!databaseExists && mode == AgentJournalInitializationMode.RequireExistingForPriorLifecycle)
             {
-                return await operation();
+                return await SetDegradedAsync(null, "database_missing", "not_run", sqliteErrorCode: null);
             }
-            catch (OperationCanceledException)
+
+            await using SqliteConnection connection = await OpenConnectionAsync(
+                allowCreate: !databaseExists,
+                cancellationToken);
+            int schemaVersion = await MigrateToCurrentVersionAsync(connection, cancellationToken);
+
+            bool schemaIsValid = await ValidateSchemaAsync(connection, cancellationToken);
+            if (!schemaIsValid)
             {
-                throw;
+                return await SetDegradedAsync(schemaVersion, "schema_validation_failed", "not_run", sqliteErrorCode: null);
             }
-            catch (AgentJournalDegradedException)
+
+            string integrityResult = await RunIntegrityCheckAsync(connection, cancellationToken);
+            if (!StringComparer.Ordinal.Equals(integrityResult, "ok"))
             {
-                throw;
+                return await SetDegradedAsync(schemaVersion, "integrity_check_failed", "failed", sqliteErrorCode: null);
             }
-            catch (Exception ex) when (
-                ex is DbException or IOException or UnauthorizedAccessException or FormatException)
-            {
-                string reasonCode = !File.Exists(databasePath) ? "database_missing" : failureReasonCode;
-                int? sqliteErrorCode = ex is SqliteException sqliteException ? sqliteException.SqliteErrorCode : null;
-                AgentJournalHealth degraded = await SetDegradedAsync(
-                    Health.SchemaVersion,
-                    reasonCode,
-                    "not_run",
-                    sqliteErrorCode);
-                throw new AgentJournalDegradedException(degraded);
-            }
+
+            await EnableWalAsync(connection, cancellationToken);
+            AgentJournalHealth initialized = new(AgentJournalHealthState.Healthy, schemaVersion, "healthy", "ok");
+            Volatile.Write(ref health, initialized);
+            LogInitialized(logger, schemaVersion, "wal", "full", "ok");
+            return initialized;
         }
-        finally
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            runtimeOperationGate.Release();
+            throw;
+        }
+        catch (UnsupportedAgentJournalSchemaException ex)
+        {
+            return await SetDegradedAsync(ex.ActualVersion, "schema_too_new", "not_run", sqliteErrorCode: null);
+        }
+        catch (UnownedAgentJournalException)
+        {
+            return await SetDegradedAsync(0, "database_not_owned", "not_run", sqliteErrorCode: null);
+        }
+        catch (SqliteException ex)
+        {
+            string reason = !File.Exists(databasePath)
+                ? "database_missing"
+                : ex.SqliteErrorCode == 26
+                    ? "database_invalid"
+                    : "initialization_failed";
+            return await SetDegradedAsync(null, reason, "failed", ex.SqliteErrorCode);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
+        {
+            string reason = !File.Exists(databasePath) ? "database_missing" : "initialization_failed";
+            return await SetDegradedAsync(null, reason, "failed", sqliteErrorCode: null);
         }
     }
 
