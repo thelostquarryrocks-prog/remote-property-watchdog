@@ -1087,7 +1087,7 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
         foreach (string value in values.Where(static value => value is not null).Cast<string>())
         {
             if (IsCredentialBearingAbsoluteUri(value) ||
-                ContainsSensitiveBareAssignment(value) ||
+                ContainsSensitiveAssignment(value) ||
                 ProhibitedSecretMarkers.Any(marker => value.Contains(marker, StringComparison.OrdinalIgnoreCase)))
             {
                 throw new ArgumentException("Persistence input contains a prohibited secret-bearing value.", nameof(values));
@@ -1150,8 +1150,8 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
         return ContainsSensitiveSyntaxWithBoundedDecoding(candidate, ContainsSensitiveUriParameterName);
     }
 
-    private static bool ContainsSensitiveBareAssignment(string value) =>
-        ContainsSensitiveSyntaxWithBoundedDecoding(value, ContainsSensitiveBareAssignmentSyntax);
+    private static bool ContainsSensitiveAssignment(string value) =>
+        ContainsSensitiveSyntaxWithBoundedDecoding(value, ContainsSensitiveAssignmentSyntax);
 
     private static bool ContainsSensitiveSyntaxWithBoundedDecoding(
         string candidate,
@@ -1207,12 +1207,12 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
         return false;
     }
 
-    private static bool ContainsSensitiveBareAssignmentSyntax(string value)
+    private static bool ContainsSensitiveAssignmentSyntax(string value)
     {
         for (int candidateStart = 0; candidateStart < value.Length; candidateStart++)
         {
             if (!IsSensitiveParameterNameCharacter(value[candidateStart]) ||
-                candidateStart > 0 && !IsBareAssignmentBoundary(value[candidateStart - 1]))
+                candidateStart > 0 && !IsAssignmentBoundary(value[candidateStart - 1]))
             {
                 continue;
             }
@@ -1225,13 +1225,21 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
             }
 
             int assignmentDelimiter = parameterNameEnd;
+            if (candidateStart > 0 &&
+                assignmentDelimiter < value.Length &&
+                value[candidateStart - 1] is '"' or '\'' &&
+                value[assignmentDelimiter] == value[candidateStart - 1])
+            {
+                assignmentDelimiter++;
+            }
+
             while (assignmentDelimiter < value.Length && IsAsciiWhitespace(value[assignmentDelimiter]))
             {
                 assignmentDelimiter++;
             }
 
             if (assignmentDelimiter < value.Length &&
-                value[assignmentDelimiter] == '=' &&
+                value[assignmentDelimiter] is '=' or ':' &&
                 SensitiveParameterNames.Contains(value[candidateStart..parameterNameEnd]))
             {
                 return true;
@@ -1246,8 +1254,8 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
     private static bool IsSensitiveParameterNameCharacter(char value) =>
         char.IsAsciiLetterOrDigit(value) || value is '_' or '-';
 
-    private static bool IsBareAssignmentBoundary(char value) =>
-        !char.IsLetterOrDigit(value) && value is not ('_' or '-');
+    private static bool IsAssignmentBoundary(char value) =>
+        !char.IsAsciiLetterOrDigit(value) && value is not ('_' or '-');
 
     private static bool IsAsciiWhitespace(char value) =>
         value is ' ' or '\t' or '\r' or '\n' or '\f' or '\v';

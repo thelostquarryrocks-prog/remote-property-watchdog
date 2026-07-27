@@ -1255,7 +1255,76 @@ public sealed class SqliteAgentJournalTests
     }
 
     [Fact]
-    public async Task SharedSensitiveKeyPolicyRejectsUrlParametersAndBareAssignments()
+    public async Task ReviewedColonCredentialAssignmentsAreRejectedBeforeEventOutboxOrSequenceMutationAndAbsentFromArtifacts()
+    {
+        using TestDatabase database = new();
+        ListLogger<SqliteAgentJournal> logger = new();
+        using SqliteAgentJournal journal = CreateJournal(database.Path, logger: logger);
+        await AddSessionAsync(journal);
+        string[] prohibitedAssignments =
+        [
+            "api_key: synthetic-value",
+            "token: synthetic-value",
+            "\"api_key\": \"synthetic-value\"",
+            "{\"token\":\"synthetic-value\"}"
+        ];
+
+        for (int index = 0; index < prohibitedAssignments.Length; index++)
+        {
+            await AssertCredentialValidationRejectedAsync(
+                () => journal.AppendMaterialEventAsync(
+                    Event($"event-colon-credential-{index:D2}") with
+                    {
+                        TargetLabel = prohibitedAssignments[index]
+                    },
+                    CancellationToken.None));
+        }
+
+        Assert.Equal(AgentJournalHealthState.Healthy, journal.Health.State);
+        Assert.DoesNotContain(logger.Entries, entry => entry.EventId is 101 or 104);
+        Assert.All(
+            prohibitedAssignments,
+            assignment => Assert.DoesNotContain(
+                logger.Entries,
+                entry => entry.Message.Contains(assignment, StringComparison.Ordinal)));
+        Assert.DoesNotContain(
+            logger.Entries,
+            entry => entry.Message.Contains("synthetic-value", StringComparison.Ordinal));
+        await AssertCountsAsync(database, materialEvents: 0, outbox: 0);
+        Assert.Equal(0L, await ReadProbeSampleCountAsync(database));
+        await using (SqliteConnection connection = await database.OpenAsync())
+        {
+            Assert.Equal(0L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM local_state;"));
+        }
+
+        await journal.AppendProbeSampleAsync(Probe("sample-after-colon-credential-rejection"), CancellationToken.None);
+        MaterialEventCommit next = await journal.AppendMaterialEventAsync(
+            Event("event-after-colon-credential-rejection"),
+            CancellationToken.None);
+        Assert.Equal(1, next.AgentSequence);
+        Assert.Single(await journal.ReadPendingOutboxAsync("agent-synthetic", 10, CancellationToken.None));
+        Assert.Equal(1L, await ReadProbeSampleCountAsync(database));
+        Assert.Equal(AgentJournalHealthState.Healthy, (await journal.VerifyIntegrityAsync(CancellationToken.None)).State);
+        await CheckpointAsync(database);
+
+        byte[][] prohibitedMarkers =
+        [
+            .. prohibitedAssignments.Select(Encoding.UTF8.GetBytes),
+            Encoding.UTF8.GetBytes("synthetic-value")
+        ];
+        foreach (string path in Directory.EnumerateFiles(database.DirectoryPath, "agent.db*"))
+        {
+            byte[] bytes = await File.ReadAllBytesAsync(path);
+            Assert.All(
+                prohibitedMarkers,
+                marker => Assert.False(
+                    ContainsSequence(bytes, marker),
+                    $"Colon credential assignment content was persisted in {Path.GetFileName(path)}."));
+        }
+    }
+
+    [Fact]
+    public async Task SharedSensitiveKeyPolicyRejectsUrlParametersAndEqualsOrColonAssignments()
     {
         using TestDatabase database = new();
         using SqliteAgentJournal journal = CreateJournal(database.Path);
@@ -1296,13 +1365,15 @@ public sealed class SqliteAgentJournalTests
                 key => new[]
                 {
                     $"https://camera.local/live?mode=preview&{key}=synthetic-value",
-                    $"status=up; {key}=synthetic-value"
+                    $"status=up; {key}=synthetic-value",
+                    $"status: up; {key}: synthetic-value"
                 })
             .ToList();
         prohibitedValues.AddRange(
         [
             "https://camera.local/live?ToKeN=synthetic-value",
             "status=up; ToKeN=synthetic-value",
+            "status: up; ToKeN: synthetic-value",
             "https://camera.local/live?mode=preview&quality=high&API_KEY=synthetic-value",
             "https://camera.local/live#access_token=synthetic-value",
             "https://camera.local/live#route?client_secret=synthetic-value",
@@ -1330,7 +1401,7 @@ public sealed class SqliteAgentJournalTests
     }
 
     [Fact]
-    public async Task BareAssignmentGrammarHandlesPlacementWhitespaceEncodingMalformedInputAndBenignBoundaries()
+    public async Task AssignmentGrammarHandlesDelimitersQuotesPlacementWhitespaceEncodingMalformedInputAndBenignBoundaries()
     {
         using TestDatabase database = new();
         using SqliteAgentJournal journal = CreateJournal(database.Path);
@@ -1348,7 +1419,29 @@ public sealed class SqliteAgentJournalTests
             "token%3Dsynthetic-value",
             "%74oken%253Dsynthetic-value",
             "mode=preview; to%6ben=synthetic-value",
-            "mode=preview; token=synthetic-value%ZZ"
+            "mode=preview; token=synthetic-value%ZZ",
+            "api_key: synthetic-value",
+            "token:synthetic-value",
+            "api_key \t: synthetic-value",
+            "\"api_key\": \"synthetic-value\"",
+            "\"api_key\" \t: \"synthetic-value\"",
+            "{\"token\":\"synthetic-value\"}",
+            "'token': synthetic-value",
+            "prefix text, api_key: synthetic-value",
+            "token:",
+            "token:\u2603",
+            "\"api_key\":",
+            "mode: up; token: synthetic-value",
+            "token: synthetic-value; mode: up",
+            "{\"mode\":\"up\",\"api_key\":\"synthetic-value\",\"quality\":\"high\"}",
+            "ToKeN: synthetic-value",
+            "%61pi_key: synthetic-value",
+            "%2561pi_key: synthetic-value",
+            "api_key%3Asynthetic-value",
+            "api_key%253Asynthetic-value",
+            "api_%6bey%3Asynthetic-value",
+            "%61pi_key%253Asynthetic-value",
+            "api_key: synthetic-value%ZZ"
         ];
 
         for (int index = 0; index < prohibitedValues.Length; index++)
@@ -1378,7 +1471,24 @@ public sealed class SqliteAgentJournalTests
             "api_keyring=enabled",
             "mode=preview; note=synthetic-value",
             "mode=preview; token%ZZ=synthetic-value",
-            "%252574oken=synthetic-value"
+            "%252574oken=synthetic-value",
+            "tokenizer: enabled",
+            "mytoken: enabled",
+            "prefix-token: enabled",
+            "token_backup: enabled",
+            "benign_key: value",
+            "ordinary prose: monitoring remains available",
+            "{\"mode\":\"token\",\"note\":\"api_key\"}",
+            "https://camera.local:8443/live?mode=preview#status",
+            "2026-07-27T06:32:33Z",
+            "host.local:8443",
+            "urn:synthetic:status",
+            "status: token",
+            "note: api_key",
+            "secretary: present",
+            "api_key%ZZ: synthetic-value",
+            "%252561pi_key: synthetic-value",
+            "api_key%25253Asynthetic-value"
         ];
         for (int index = 0; index < benignValues.Length; index++)
         {
@@ -1442,15 +1552,18 @@ public sealed class SqliteAgentJournalTests
         Assert.Equal(0L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM local_state;"));
     }
 
-    [Fact]
-    public async Task BareCredentialAssignmentValidationCoversEveryPersistedStringSurface()
+    [Theory]
+    [InlineData("token=synthetic-value", "equals")]
+    [InlineData("token: synthetic-value", "colon")]
+    public async Task CredentialAssignmentValidationCoversEveryPersistedStringSurface(
+        string prohibitedAssignment,
+        string delimiterName)
     {
         using TestDatabase database = new();
         using SqliteAgentJournal journal = CreateJournal(database.Path);
         await AddSessionAsync(journal);
-        const string prohibitedAssignment = "token=synthetic-value";
-        ProbeSampleWrite probe = Probe("sample-bare-surface");
-        MaterialEventWrite materialEvent = Event("event-bare-surface");
+        ProbeSampleWrite probe = Probe($"sample-{delimiterName}-surface");
+        MaterialEventWrite materialEvent = Event($"event-{delimiterName}-surface");
         Func<Task>[] prohibitedWrites =
         [
             () => journal.RecordSessionAsync(
