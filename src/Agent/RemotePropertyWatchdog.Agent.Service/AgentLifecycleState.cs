@@ -8,7 +8,14 @@ public sealed record AgentLifecycleState(
     DateTimeOffset? StoppedAtUtc,
     bool PlannedShutdown,
     Guid? PreviousSessionId,
-    bool PreviousSessionEndedCleanly)
+    bool PreviousSessionEndedCleanly,
+    int? JournalOwnershipVersion = null)
 {
-    public bool IsReady => ReadyAtUtc is not null;
+    public bool IsReady =>
+        ReadyAtUtc is not null &&
+        StoppedAtUtc is null &&
+        !PlannedShutdown;
+
+    public bool HasJournalOwnership =>
+        JournalOwnershipVersion == AgentLifecycleMarker.CurrentJournalOwnershipVersion;
 }

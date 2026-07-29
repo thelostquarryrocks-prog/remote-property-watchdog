@@ -6,7 +6,15 @@ public interface IAgentLifecycleCoordinator
 
     Task<AgentLifecycleState> StartAsync(CancellationToken cancellationToken);
 
-    Task<AgentLifecycleState> MarkReadyAsync(CancellationToken cancellationToken);
+    Task<AgentLifecycleState> ClaimJournalOwnershipAsync(CancellationToken cancellationToken);
+
+    Task<AgentLifecycleState> PrepareReadyAsync(CancellationToken cancellationToken);
+
+    Task<AgentLifecycleState> PublishReadyAsync(
+        AgentLifecycleState readyState,
+        CancellationToken cancellationToken);
+
+    Task<AgentLifecycleState> MarkNotReadyAsync(CancellationToken cancellationToken);
 
     Task<AgentLifecycleState> StopAsync(CancellationToken cancellationToken);
 }

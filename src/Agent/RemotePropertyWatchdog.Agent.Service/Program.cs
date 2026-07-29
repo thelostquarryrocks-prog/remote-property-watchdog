@@ -22,9 +22,26 @@ public static class Program
                     .ValidateOnStart();
 
                 services.AddSingleton(TimeProvider.System);
+                services.AddOptions<AgentJournalOptions>()
+                    .Bind(context.Configuration.GetSection(AgentJournalOptions.SectionName))
+                    .Validate(options => string.IsNullOrWhiteSpace(options.DatabasePath) || Path.IsPathFullyQualified(options.DatabasePath), "Journal database path must be absolute when configured.")
+                    .Validate(options => options.BusyTimeout > TimeSpan.Zero, "Journal busy timeout must be positive.")
+                    .Validate(options => options.BusyTimeout <= TimeSpan.FromMinutes(1), "Journal busy timeout must not exceed one minute.")
+                    .ValidateOnStart();
                 services.AddSingleton<IAgentLifecycleFileSystem, DefaultAgentLifecycleFileSystem>();
                 services.AddSingleton<IAgentLifecycleStore, FileAgentLifecycleStore>();
-                services.AddSingleton<IAgentLifecycleCoordinator, AgentLifecycleCoordinator>();
-                services.AddHostedService<AgentWorker>();
+                services.AddSingleton<AgentLifecycleCoordinator>();
+                services.AddSingleton<IAgentLifecycleCoordinator>(
+                    serviceProvider => serviceProvider.GetRequiredService<AgentLifecycleCoordinator>());
+                services.AddSingleton<IAgentJournalDegradationHandler>(
+                    serviceProvider => serviceProvider.GetRequiredService<AgentLifecycleCoordinator>());
+                services.AddSingleton<IAgentReadinessTransitionGate, AgentReadinessTransitionGate>();
+                services.AddSingleton<IAgentJournalFaultInjector>(NoOpAgentJournalFaultInjector.Instance);
+                services.AddSingleton<IAgentJournal, SqliteAgentJournal>();
+                services.AddSingleton<AgentWorker>();
+                services.AddSingleton<IAgentServiceHealth>(
+                    serviceProvider => serviceProvider.GetRequiredService<AgentWorker>());
+                services.AddHostedService<AgentWorker>(
+                    serviceProvider => serviceProvider.GetRequiredService<AgentWorker>());
             });
 }

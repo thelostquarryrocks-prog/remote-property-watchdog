@@ -8,4 +8,8 @@ public sealed record AgentLifecycleMarker(
     DateTimeOffset? StoppedAtUtc,
     bool PlannedShutdown,
     Guid? PreviousSessionId,
-    bool PreviousSessionEndedCleanly);
+    bool PreviousSessionEndedCleanly,
+    int? JournalOwnershipVersion = null)
+{
+    public const int CurrentJournalOwnershipVersion = 1;
+}

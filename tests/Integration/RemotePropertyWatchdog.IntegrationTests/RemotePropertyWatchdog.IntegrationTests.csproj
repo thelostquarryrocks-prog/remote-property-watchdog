@@ -12,6 +12,7 @@
     <PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" Version="10.0.0" />
   </ItemGroup>
   <ItemGroup>
+    <ProjectReference Include="..\..\..\src\Agent\RemotePropertyWatchdog.Agent.Service\RemotePropertyWatchdog.Agent.Service.csproj" />
     <ProjectReference Include="..\..\..\src\Cloud\RemotePropertyWatchdog.Cloud.Host\RemotePropertyWatchdog.Cloud.Host.csproj" />
   </ItemGroup>
 </Project>
