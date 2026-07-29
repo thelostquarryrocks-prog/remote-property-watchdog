@@ -1247,7 +1247,8 @@ public sealed class SqliteAgentJournalTests
         ListLogger<SqliteAgentJournal> logger = new();
         using SqliteAgentJournal journal = CreateJournal(database.Path, logger: logger);
         await AddSessionAsync(journal);
-        const string prohibitedUrl = "https://camera.local/live?token=synthetic-value";
+        const string prohibitedUrl =
+            "camera failed while contacting https://synthetic-user:synthetic-password@camera.invalid/live";
         MaterialEventWrite prohibited = Event("event-credential-url") with { TargetLabel = prohibitedUrl };
 
         await AssertCredentialValidationRejectedAsync(
@@ -1271,13 +1272,36 @@ public sealed class SqliteAgentJournalTests
         await CheckpointAsync(database);
 
         byte[] urlMarker = Encoding.UTF8.GetBytes(prohibitedUrl);
-        byte[] valueMarker = Encoding.UTF8.GetBytes("synthetic-value");
+        byte[] valueMarker = Encoding.UTF8.GetBytes("synthetic-password");
         foreach (string path in Directory.EnumerateFiles(database.DirectoryPath, "agent.db*"))
         {
             byte[] bytes = await File.ReadAllBytesAsync(path);
             Assert.False(ContainsSequence(bytes, urlMarker), $"Credential-bearing URL was persisted in {Path.GetFileName(path)}.");
             Assert.False(ContainsSequence(bytes, valueMarker), $"Synthetic credential value was persisted in {Path.GetFileName(path)}.");
         }
+    }
+
+    [Fact]
+    public async Task EmbeddedCredentialUrlValidationPrecedesReadinessGateAndSqliteAccess()
+    {
+        using TestDatabase database = new();
+        CountingReadinessTransitionGate transitionGate = new();
+        ListLogger<SqliteAgentJournal> logger = new();
+        using SqliteAgentJournal journal = CreateJournal(
+            database.Path,
+            logger: logger,
+            readinessTransitionGate: transitionGate);
+        const string prohibitedUrl = "status https://u:p@camera.invalid/live";
+
+        await AssertCredentialValidationRejectedAsync(
+            () => journal.AppendMaterialEventAsync(
+                Event("event-pre-gate-embedded-url") with { TargetLabel = prohibitedUrl },
+                CancellationToken.None));
+
+        Assert.Equal(0, transitionGate.InvocationCount);
+        Assert.Equal(AgentJournalHealth.NotInitialized, journal.Health);
+        Assert.Empty(logger.Entries);
+        AssertJournalFilesAbsent(database.Path);
     }
 
     [Fact]
@@ -1468,7 +1492,7 @@ public sealed class SqliteAgentJournalTests
             .SelectMany(
                 key => new[]
                 {
-                    $"https://camera.local/live?mode=preview&{key}=synthetic-value",
+                    $"contacting https://camera.local/live?mode=preview&{key}=synthetic-value",
                     $"status=up; {key}=synthetic-value",
                     $"status: up; {key}: synthetic-value",
                     $"{{\"{key}\":\"synthetic-value\"}}",
@@ -1511,6 +1535,88 @@ public sealed class SqliteAgentJournalTests
         await AssertCountsAsync(database, materialEvents: 0, outbox: 0);
         await using SqliteConnection connection = await database.OpenAsync();
         Assert.Equal(0L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM local_state;"));
+    }
+
+    [Fact]
+    public async Task EmbeddedCredentialUrlGrammarCoversPositionsWrappersMultipleCandidatesEncodingAndBenignBoundaries()
+    {
+        using TestDatabase database = new();
+        using SqliteAgentJournal journal = CreateJournal(database.Path);
+        await AddSessionAsync(journal);
+        string[] prohibitedValues =
+        [
+            "https://synthetic-user:synthetic-password@camera.invalid/live failed",
+            "failed https://synthetic-user:synthetic-password@camera.invalid/live again",
+            "failed https://synthetic-user:synthetic-password@camera.invalid/live",
+            "(https://synthetic-user:synthetic-password@camera.invalid/live)",
+            "[https://synthetic-user:synthetic-password@camera.invalid/live]",
+            "{https://synthetic-user:synthetic-password@camera.invalid/live}",
+            "\"https://synthetic-user:synthetic-password@camera.invalid/live\"",
+            "'https://synthetic-user:synthetic-password@camera.invalid/live'",
+            "url=https://synthetic-user:synthetic-password@camera.invalid/live, status=down",
+            "url=https://synthetic-user:synthetic-password@camera.invalid/live.",
+            "https://safe.invalid/live,https://u:p@camera.invalid/live",
+            "https://u:p@camera.invalid/live;https://safe.invalid/live",
+            "contacting HtTpS://u:p@camera.invalid/live",
+            "contacting https://synthetic-user@camera.invalid/live",
+            "contacting https://u:p@camera.invalid/live",
+            "contacting https://camera.invalid/live?token=synthetic-value",
+            "contacting https://camera.invalid/live#signature=synthetic-value",
+            "contacting https%3A%2F%2Fu%3Ap%40camera.invalid%2Flive",
+            "contacting https%253A%252F%252Fu%253Ap%2540camera.invalid%252Flive",
+            "contacting https://camera.invalid/live?%74oken=synthetic-value",
+            "contacting https://camera.invalid/live?%2574oken=synthetic-value",
+            """{\"url\":\"https://u:p@camera.invalid/live\"}""",
+            "contacting (https://u:p@camera.invalid/live"
+        ];
+
+        for (int index = 0; index < prohibitedValues.Length; index++)
+        {
+            await AssertCredentialValidationRejectedAsync(
+                () => journal.AppendMaterialEventAsync(
+                    Event($"event-embedded-url-rejected-{index:D2}") with
+                    {
+                        TargetLabel = prohibitedValues[index]
+                    },
+                    CancellationToken.None));
+        }
+
+        await AssertCountsAsync(database, materialEvents: 0, outbox: 0);
+        await using (SqliteConnection connection = await database.OpenAsync())
+        {
+            Assert.Equal(0L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM local_state;"));
+        }
+
+        string[] benignValues =
+        [
+            "ordinary prose without a URI",
+            "https://camera.invalid/live",
+            "contacting https://camera.invalid/live succeeded",
+            "https://one.invalid/live https://two.invalid/status",
+            "contacting https://camera.invalid:8443/live/main?mode=preview#status",
+            "2026-07-29T12:34:56Z ordinary status: ready",
+            "https//camera.invalid/live",
+            "https://[camera.invalid/live?mode=preview",
+            "contacting https://camera.invalid/live.",
+            "(https://camera.invalid/live)",
+            "\"https://camera.invalid/live\"",
+            "example URL https://camera.invalid/live?mode=token#signature_algorithm",
+            "contacting https%25253A%25252F%25252Fu%25253Ap%252540camera.invalid"
+        ];
+
+        for (int index = 0; index < benignValues.Length; index++)
+        {
+            MaterialEventCommit commit = await journal.AppendMaterialEventAsync(
+                Event($"event-embedded-url-benign-{index:D2}") with
+                {
+                    TargetLabel = benignValues[index]
+                },
+                CancellationToken.None);
+            Assert.Equal(index + 1, commit.AgentSequence);
+        }
+
+        await AssertCountsAsync(database, materialEvents: benignValues.Length, outbox: benignValues.Length);
+        Assert.Equal(AgentJournalHealthState.Healthy, journal.Health.State);
     }
 
     [Fact]
@@ -1650,7 +1756,7 @@ public sealed class SqliteAgentJournalTests
         using TestDatabase database = new();
         using SqliteAgentJournal journal = CreateJournal(database.Path);
         await AddSessionAsync(journal);
-        const string prohibitedUrl = "https://x/?token=v";
+        const string prohibitedUrl = "x https://u:p@x.invalid";
         ProbeSampleWrite probe = Probe("sample-surface");
         MaterialEventWrite materialEvent = Event("event-surface");
         Func<Task>[] prohibitedWrites =
@@ -1826,13 +1932,14 @@ public sealed class SqliteAgentJournalTests
         string path,
         IAgentJournalFaultInjector? faultInjector = null,
         Func<CancellationToken, Task>? beforeForeignKeyCheckRead = null,
-        ILogger<SqliteAgentJournal>? logger = null) =>
+        ILogger<SqliteAgentJournal>? logger = null,
+        IAgentReadinessTransitionGate? readinessTransitionGate = null) =>
         new(
             Options.Create(new AgentJournalOptions { DatabasePath = path, BusyTimeout = TimeSpan.FromSeconds(15) }),
             new FixedTimeProvider(Now),
             faultInjector ?? NoOpAgentJournalFaultInjector.Instance,
             NoOpAgentJournalDegradationHandler.Instance,
-            ImmediateReadinessTransitionGate.Instance,
+            readinessTransitionGate ?? ImmediateReadinessTransitionGate.Instance,
             beforeForeignKeyCheckRead ?? (static _ => Task.CompletedTask),
             logger ?? NullLogger<SqliteAgentJournal>.Instance);
 
@@ -1867,6 +1974,21 @@ public sealed class SqliteAgentJournalTests
             Func<Task<T>> operation,
             CancellationToken cancellationToken)
         {
+            cancellationToken.ThrowIfCancellationRequested();
+            return operation();
+        }
+    }
+
+    private sealed class CountingReadinessTransitionGate : IAgentReadinessTransitionGate
+    {
+        public int InvocationCount { get; private set; }
+
+        public Task<T> ExecuteAsync<T>(
+            AgentReadinessTransitionKind kind,
+            Func<Task<T>> operation,
+            CancellationToken cancellationToken)
+        {
+            InvocationCount++;
             cancellationToken.ThrowIfCancellationRequested();
             return operation();
         }

@@ -172,6 +172,12 @@ public sealed class AgentHostSmokeTests
             "credential-url");
 
     [Fact]
+    public Task EmbeddedCredentialUrlValidationPreservesRealHostReadinessAndLaterJournalWorkWithoutLoggingInput() =>
+        AssertCredentialValidationPreservesRealHostReadinessAndLaterJournalWorkWithoutLoggingInputAsync(
+            "camera failed while contacting https://synthetic-user:synthetic-password@camera.invalid/live",
+            "embedded-credential-url");
+
+    [Fact]
     public Task BareCredentialAssignmentValidationPreservesRealHostReadinessAndLaterJournalWorkWithoutLoggingInput() =>
         AssertCredentialValidationPreservesRealHostReadinessAndLaterJournalWorkWithoutLoggingInputAsync(
             "api_key=synthetic-value",

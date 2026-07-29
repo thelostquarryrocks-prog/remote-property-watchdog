@@ -1089,7 +1089,7 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
     {
         foreach (string value in values.Where(static value => value is not null).Cast<string>())
         {
-            if (IsCredentialBearingAbsoluteUri(value) ||
+            if (ContainsCredentialBearingAbsoluteUri(value) ||
                 ContainsSensitiveAssignment(value) ||
                 ProhibitedSecretMarkers.Any(marker => value.Contains(marker, StringComparison.OrdinalIgnoreCase)))
             {
@@ -1098,16 +1098,56 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
         }
     }
 
-    private static bool IsCredentialBearingAbsoluteUri(string value)
+    private static bool ContainsCredentialBearingAbsoluteUri(string value) =>
+        ContainsSensitiveSyntaxWithBoundedDecoding(value, ContainsCredentialBearingAbsoluteUriInSuppliedForm);
+
+    private static bool ContainsCredentialBearingAbsoluteUriInSuppliedForm(string value)
+    {
+        for (int candidateStart = 0; candidateStart < value.Length; candidateStart++)
+        {
+            if (!char.IsAsciiLetter(value[candidateStart]) ||
+                candidateStart > 0 && IsAbsoluteUriSchemeCharacter(value[candidateStart - 1]))
+            {
+                continue;
+            }
+
+            int schemeEnd = candidateStart + 1;
+            while (schemeEnd < value.Length && IsAbsoluteUriSchemeCharacter(value[schemeEnd]))
+            {
+                schemeEnd++;
+            }
+
+            if (schemeEnd >= value.Length || value[schemeEnd] != ':')
+            {
+                candidateStart = schemeEnd - 1;
+                continue;
+            }
+
+            int candidateEnd = schemeEnd + 1;
+            while (candidateEnd < value.Length && !IsAbsoluteUriCandidateTerminator(value[candidateEnd]))
+            {
+                candidateEnd++;
+            }
+
+            if (IsCredentialBearingAbsoluteUriCandidate(value[candidateStart..candidateEnd]))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool IsCredentialBearingAbsoluteUriCandidate(string value)
     {
         if (Uri.TryCreate(value, UriKind.Absolute, out Uri? uri))
         {
-            return !string.IsNullOrEmpty(uri.UserInfo) ||
-                ContainsSensitiveUriParameter(uri.Query, '?') ||
-                ContainsSensitiveUriParameter(uri.Fragment, '#');
+            if (!string.IsNullOrEmpty(uri.UserInfo))
+            {
+                return true;
+            }
         }
-
-        if (!HasAbsoluteUriScheme(value))
+        else if (!HasAbsoluteUriScheme(value))
         {
             return false;
         }
@@ -1121,6 +1161,14 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
         return ContainsSensitiveUriParameter(query, '?') ||
             ContainsSensitiveUriParameter(fragment, '#');
     }
+
+    private static bool IsAbsoluteUriSchemeCharacter(char value) =>
+        char.IsAsciiLetterOrDigit(value) || value is '+' or '.' or '-';
+
+    private static bool IsAbsoluteUriCandidateTerminator(char value) =>
+        IsAsciiWhitespace(value) ||
+        char.IsControl(value) ||
+        value is '"' or '\'' or '<' or '>';
 
     private static bool HasAbsoluteUriScheme(string value)
     {
@@ -1150,7 +1198,7 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
         }
 
         string candidate = component[0] == prefix ? component[1..] : component;
-        return ContainsSensitiveSyntaxWithBoundedDecoding(candidate, ContainsSensitiveUriParameterName);
+        return ContainsSensitiveUriParameterName(candidate);
     }
 
     private static bool ContainsSensitiveAssignment(string value) =>
