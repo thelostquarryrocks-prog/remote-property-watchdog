@@ -1140,6 +1140,11 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
 
     private static bool IsCredentialBearingAbsoluteUriCandidate(string value)
     {
+        if (ContainsNonEmptyAuthorityUserInfo(value))
+        {
+            return true;
+        }
+
         if (Uri.TryCreate(value, UriKind.Absolute, out Uri? uri))
         {
             if (!string.IsNullOrEmpty(uri.UserInfo))
@@ -1160,6 +1165,27 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
         string fragment = fragmentStart < 0 ? string.Empty : value[fragmentStart..];
         return ContainsSensitiveUriParameter(query, '?') ||
             ContainsSensitiveUriParameter(fragment, '#');
+    }
+
+    private static bool ContainsNonEmptyAuthorityUserInfo(string value)
+    {
+        int schemeEnd = value.IndexOf(':');
+        if (!HasAbsoluteUriScheme(value) ||
+            schemeEnd + 2 >= value.Length ||
+            value[schemeEnd + 1] != '/' ||
+            value[schemeEnd + 2] != '/')
+        {
+            return false;
+        }
+
+        int authorityStart = schemeEnd + 3;
+        int authorityEnd = authorityStart;
+        while (authorityEnd < value.Length && value[authorityEnd] is not ('/' or '\\' or '?' or '#'))
+        {
+            authorityEnd++;
+        }
+
+        return value.AsSpan(authorityStart, authorityEnd - authorityStart).LastIndexOf('@') > 0;
     }
 
     private static bool IsAbsoluteUriSchemeCharacter(char value) =>

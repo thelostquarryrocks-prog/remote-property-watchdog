@@ -1291,7 +1291,7 @@ public sealed class SqliteAgentJournalTests
             database.Path,
             logger: logger,
             readinessTransitionGate: transitionGate);
-        const string prohibitedUrl = "status https://u:p@camera.invalid/live";
+        const string prohibitedUrl = "(https://u:p@camera.invalid)";
 
         await AssertCredentialValidationRejectedAsync(
             () => journal.AppendMaterialEventAsync(
@@ -1302,6 +1302,102 @@ public sealed class SqliteAgentJournalTests
         Assert.Equal(AgentJournalHealth.NotInitialized, journal.Health);
         Assert.Empty(logger.Entries);
         AssertJournalFilesAbsent(database.Path);
+    }
+
+    [Theory]
+    [InlineData("(https://u:p@camera.invalid)")]
+    [InlineData("url=https://u:p@camera.invalid, status=down")]
+    [InlineData("[https://synthetic-user@camera.invalid]")]
+    [InlineData("{https://u:p@camera.invalid}")]
+    [InlineData("\"https://u:p@camera.invalid\"")]
+    [InlineData("'https://u:p@camera.invalid'")]
+    [InlineData("https://u:p@camera.invalid.")]
+    [InlineData("https://u:p@camera.invalid;")]
+    [InlineData("https://u:p@camera.invalid!")]
+    [InlineData("https://u:p@camera.invalid?")]
+    [InlineData("https://u:p@camera.invalid next")]
+    [InlineData("https://u:p@camera.invalid\tstatus")]
+    [InlineData("https://u:p@camera.invalid\u0001status")]
+    [InlineData("https://u:p@camera.invalid")]
+    [InlineData("(https://u:p@camera.invalid:8443)")]
+    [InlineData("https://u:p@camera.invalid/live)")]
+    [InlineData("https://u:p@camera.invalid?mode=preview)")]
+    [InlineData("https://u:p@camera.invalid#status)")]
+    [InlineData("contacting HtTpS://u:p@camera.invalid)")]
+    [InlineData("https://safe.invalid https://u:p@camera.invalid)")]
+    [InlineData("https://u:p@camera.invalid); https://safe.invalid")]
+    [InlineData("https://one.invalid https://two.invalid url=https://u:p@camera.invalid, status=down")]
+    [InlineData("https://safe.invalid,https://u:p@camera.invalid)")]
+    [InlineData("(%68%74%74%70%73%3A%2F%2F%75%3A%70%40camera.invalid)")]
+    [InlineData("(%2568%2574%2574%2570%2573%253A%252F%252F%2575%253A%2570%2540camera.invalid)")]
+    [InlineData("""{\"url\":\"(https://u:p@camera.invalid)\"}""")]
+    [InlineData("contacting (https://u:p@camera.invalid")]
+    public async Task AuthorityOnlyCredentialUrlsWithClosingPunctuationAreRejected(string prohibitedUrl)
+    {
+        using TestDatabase database = new();
+        using SqliteAgentJournal journal = CreateJournal(database.Path);
+        await AddSessionAsync(journal);
+
+        await AssertCredentialValidationRejectedAsync(
+            () => journal.AppendMaterialEventAsync(
+                Event("event-authority-only-credential-url") with { TargetLabel = prohibitedUrl },
+                CancellationToken.None));
+
+        Assert.Equal(AgentJournalHealthState.Healthy, journal.Health.State);
+        await AssertCountsAsync(database, materialEvents: 0, outbox: 0);
+        await using SqliteConnection connection = await database.OpenAsync();
+        Assert.Equal(0L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM local_state;"));
+    }
+
+    [Fact]
+    public async Task ClosingPunctuationCredentialUrlsAreAbsentFromPersistenceArtifactsAndLogs()
+    {
+        using TestDatabase database = new();
+        ListLogger<SqliteAgentJournal> logger = new();
+        using SqliteAgentJournal journal = CreateJournal(database.Path, logger: logger);
+        await AddSessionAsync(journal);
+        string[] prohibitedUrls =
+        [
+            "(https://u:p@camera.invalid)",
+            "url=https://u:p@camera.invalid, status=down",
+            $"https://u:p@camera.invalid{new string(')', 64)}"
+        ];
+
+        for (int index = 0; index < prohibitedUrls.Length; index++)
+        {
+            await AssertCredentialValidationRejectedAsync(
+                () => journal.AppendMaterialEventAsync(
+                    Event($"event-closing-punctuation-{index:D2}") with { TargetLabel = prohibitedUrls[index] },
+                    CancellationToken.None));
+        }
+
+        Assert.Equal(AgentJournalHealthState.Healthy, journal.Health.State);
+        Assert.DoesNotContain(logger.Entries, entry => entry.EventId is 101 or 104);
+        await AssertCountsAsync(database, materialEvents: 0, outbox: 0);
+        await using (SqliteConnection connection = await database.OpenAsync())
+        {
+            Assert.Equal(0L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM local_state;"));
+        }
+
+        MaterialEventCommit next = await journal.AppendMaterialEventAsync(
+            Event("event-after-closing-punctuation-rejection"),
+            CancellationToken.None);
+        Assert.Equal(1, next.AgentSequence);
+        Assert.Single(await journal.ReadPendingOutboxAsync("agent-synthetic", 10, CancellationToken.None));
+        await CheckpointAsync(database);
+
+        byte[] userInfoMarker = Encoding.UTF8.GetBytes("u:p@camera.invalid");
+        foreach (string path in Directory.EnumerateFiles(database.DirectoryPath, "agent.db*"))
+        {
+            byte[] bytes = await File.ReadAllBytesAsync(path);
+            Assert.False(ContainsSequence(bytes, userInfoMarker), $"Credential-bearing authority was persisted in {Path.GetFileName(path)}.");
+        }
+
+        Assert.DoesNotContain(
+            logger.Entries,
+            entry => entry.Message.Contains("u:p@", StringComparison.Ordinal) ||
+                entry.Message.Contains("camera.invalid", StringComparison.Ordinal) ||
+                entry.Message.Contains("ArgumentException", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -1590,10 +1686,29 @@ public sealed class SqliteAgentJournalTests
         string[] benignValues =
         [
             "ordinary prose without a URI",
+            "https://camera.invalid",
+            "https://camera.invalid.",
+            "url=https://camera.invalid, status=up",
+            "(https://camera.invalid)",
+            "[https://camera.invalid]",
+            "{https://camera.invalid}",
+            "\"https://camera.invalid\"",
+            "'https://camera.invalid'",
             "https://camera.invalid/live",
             "contacting https://camera.invalid/live succeeded",
             "https://one.invalid/live https://two.invalid/status",
+            "https://one.invalid https://two.invalid",
             "contacting https://camera.invalid:8443/live/main?mode=preview#status",
+            "contacting https://camera.invalid:8443",
+            "contacting https://camera.invalid/path/user@example.invalid",
+            "contacting https://camera.invalid/path@segment",
+            "contacting https://camera.invalid/live?owner=user@example.invalid",
+            "contacting https://camera.invalid/live#owner=user@example.invalid",
+            "owner=user@example.invalid",
+            "https://@camera.invalid)",
+            "https:///user:p@camera.invalid",
+            "https:status@value",
+            "urn:synthetic:user@example.invalid",
             "2026-07-29T12:34:56Z ordinary status: ready",
             "https//camera.invalid/live",
             "https://[camera.invalid/live?mode=preview",
@@ -1756,7 +1871,7 @@ public sealed class SqliteAgentJournalTests
         using TestDatabase database = new();
         using SqliteAgentJournal journal = CreateJournal(database.Path);
         await AddSessionAsync(journal);
-        const string prohibitedUrl = "x https://u:p@x.invalid";
+        const string prohibitedUrl = "x (https://u:p@x.invalid)";
         ProbeSampleWrite probe = Probe("sample-surface");
         MaterialEventWrite materialEvent = Event("event-surface");
         Func<Task>[] prohibitedWrites =

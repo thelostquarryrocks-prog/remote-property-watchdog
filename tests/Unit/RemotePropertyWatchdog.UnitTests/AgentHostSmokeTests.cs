@@ -178,6 +178,12 @@ public sealed class AgentHostSmokeTests
             "embedded-credential-url");
 
     [Fact]
+    public Task ClosingPunctuationCredentialUrlValidationPreservesRealHostReadinessAndLaterJournalWorkWithoutLoggingInput() =>
+        AssertCredentialValidationPreservesRealHostReadinessAndLaterJournalWorkWithoutLoggingInputAsync(
+            "url=https://u:p@camera.invalid, status=down",
+            "closing-punctuation-credential-url");
+
+    [Fact]
     public Task BareCredentialAssignmentValidationPreservesRealHostReadinessAndLaterJournalWorkWithoutLoggingInput() =>
         AssertCredentialValidationPreservesRealHostReadinessAndLaterJournalWorkWithoutLoggingInputAsync(
             "api_key=synthetic-value",
