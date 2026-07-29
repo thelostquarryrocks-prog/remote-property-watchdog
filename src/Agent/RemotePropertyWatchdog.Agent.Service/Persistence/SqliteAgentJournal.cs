@@ -959,11 +959,15 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
             throw new AgentSessionConflictException("immutable_start_conflict");
         }
 
+        DateTimeOffset? mergedEndedAtUtc = MergeMilestone(
+            stored.EndedAtUtc,
+            incoming.EndedAtUtc,
+            "ended_timestamp_conflict");
         AgentSessionRecord merged = stored with
         {
             ReadyAtUtc = MergeMilestone(stored.ReadyAtUtc, incoming.ReadyAtUtc, "ready_timestamp_conflict"),
-            EndedAtUtc = MergeMilestone(stored.EndedAtUtc, incoming.EndedAtUtc, "ended_timestamp_conflict"),
-            PlannedShutdown = stored.PlannedShutdown || incoming.PlannedShutdown
+            EndedAtUtc = mergedEndedAtUtc,
+            PlannedShutdown = mergedEndedAtUtc.HasValue
         };
         ValidateSessionChronology(merged);
         return merged;
@@ -987,6 +991,12 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
         ValidateOptionalUtc(nameof(session.EndedAtUtc), session.EndedAtUtc);
         RejectSecrets([session.SessionId]);
         ValidateSessionChronology(session);
+        if (session.PlannedShutdown != session.EndedAtUtc.HasValue)
+        {
+            throw new ArgumentException(
+                "Session planned shutdown must match the presence of a session end.",
+                nameof(session));
+        }
     }
 
     private static void ValidateSessionChronology(AgentSessionRecord session)

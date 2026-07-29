@@ -117,6 +117,14 @@ public sealed class SqliteAgentJournalTests
                 "CHECK (planned_shutdown IN (0, 1, 2))"
             },
             {
+                "missing_shutdown_pairing_check",
+                "replace",
+                "table",
+                "agent_sessions",
+                "(planned_shutdown = 0 AND ended_at_utc IS NULL) OR",
+                "1 = 1 OR"
+            },
+            {
                 "missing_foreign_key",
                 "replace",
                 "table",
@@ -217,6 +225,98 @@ public sealed class SqliteAgentJournalTests
         Assert.Equal(SqliteJournalSchema.Indexes, await NamesAsync(connection, "index"));
         Assert.Equal(1L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM schema_migrations WHERE version = 1;"));
         Assert.Equal(1L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM pragma_foreign_key_list('outbox') WHERE \"table\" = 'material_events';"));
+    }
+
+    [Fact]
+    public async Task CorrectedCanonicalSchemaIsAcceptedOnFreshInitializationAndOwnedRestart()
+    {
+        using TestDatabase database = new();
+        using (SqliteAgentJournal fresh = CreateJournal(database.Path))
+        {
+            Assert.Equal(AgentJournalHealthState.Healthy, (await InitializeFreshAsync(fresh)).State);
+        }
+
+        await using (SqliteConnection connection = await database.OpenAsync())
+        {
+            string definition = await ScalarStringAsync(
+                connection,
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'agent_sessions';");
+            Assert.Contains(
+                "(planned_shutdown = 0 AND ended_at_utc IS NULL)",
+                definition,
+                StringComparison.Ordinal);
+            Assert.Contains(
+                "(planned_shutdown = 1 AND ended_at_utc IS NOT NULL)",
+                definition,
+                StringComparison.Ordinal);
+        }
+
+        using SqliteAgentJournal restarted = CreateJournal(database.Path);
+        AgentJournalHealth restartedHealth = await InitializeExistingAsync(restarted);
+        Assert.Equal(AgentJournalHealthState.Healthy, restartedHealth.State);
+        Assert.Equal(SqliteJournalSchema.CurrentVersion, restartedHealth.SchemaVersion);
+    }
+
+    [Theory]
+    [InlineData("insert", true, false)]
+    [InlineData("insert", false, true)]
+    [InlineData("update", true, false)]
+    [InlineData("update", false, true)]
+    public async Task CanonicalSchemaRejectsDirectContradictoryShutdownWrites(
+        string operation,
+        bool plannedShutdown,
+        bool hasEndedAtUtc)
+    {
+        using TestDatabase database = new();
+        using SqliteAgentJournal journal = CreateJournal(database.Path);
+        await InitializeFreshAsync(journal);
+        if (StringComparer.Ordinal.Equals(operation, "update"))
+        {
+            await journal.RecordSessionAsync(Session(), CancellationToken.None);
+        }
+
+        await using SqliteConnection connection = await database.OpenAsync();
+        await using SqliteCommand command = connection.CreateCommand();
+        command.CommandText = StringComparer.Ordinal.Equals(operation, "insert")
+            ? """
+                INSERT INTO agent_sessions(
+                    session_id, started_at_utc, ready_at_utc, ended_at_utc, planned_shutdown)
+                VALUES (
+                    'session-direct', $started_at_utc, NULL, $ended_at_utc, $planned_shutdown);
+                """
+            : """
+                UPDATE agent_sessions
+                SET ended_at_utc = $ended_at_utc,
+                    planned_shutdown = $planned_shutdown
+                WHERE session_id = 'session-synthetic';
+                """;
+        command.Parameters.AddWithValue(
+            "$started_at_utc",
+            Now.ToString("O", CultureInfo.InvariantCulture));
+        command.Parameters.AddWithValue(
+            "$ended_at_utc",
+            hasEndedAtUtc
+                ? Now.AddMinutes(2).ToString("O", CultureInfo.InvariantCulture)
+                : DBNull.Value);
+        command.Parameters.AddWithValue("$planned_shutdown", plannedShutdown ? 1 : 0);
+
+        SqliteException rejection = await Assert.ThrowsAsync<SqliteException>(
+            () => command.ExecuteNonQueryAsync());
+
+        Assert.Equal(19, rejection.SqliteErrorCode);
+        Assert.Equal(AgentJournalHealthState.Healthy, journal.Health.State);
+        if (StringComparer.Ordinal.Equals(operation, "insert"))
+        {
+            Assert.Equal(
+                0L,
+                await ScalarInt64Async(
+                    connection,
+                    "SELECT COUNT(*) FROM agent_sessions WHERE session_id = 'session-direct';"));
+        }
+        else
+        {
+            Assert.Equal(Session(), await ReadSessionAsync(database));
+        }
     }
 
     [Fact]
@@ -685,6 +785,131 @@ public sealed class SqliteAgentJournalTests
         await journal.RecordSessionAsync(completed, CancellationToken.None);
 
         Assert.Equal(completed, await ReadSessionAsync(database));
+    }
+
+    [Theory]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    public async Task InconsistentShutdownMilestonesAreRejectedBeforeGateOrSqliteAccess(
+        bool plannedShutdown,
+        bool hasEndedAtUtc)
+    {
+        using TestDatabase database = new();
+        CountingReadinessTransitionGate transitionGate = new();
+        SessionFaultInjector faultInjector = new(
+            failOnCall: 1,
+            new SyntheticJournalFaultException());
+        ListLogger<SqliteAgentJournal> logger = new();
+        using SqliteAgentJournal journal = CreateJournal(
+            database.Path,
+            faultInjector,
+            logger: logger,
+            readinessTransitionGate: transitionGate);
+        AgentSessionRecord contradictory = Session(
+            endedAtUtc: hasEndedAtUtc ? Now.AddMinutes(2) : null,
+            plannedShutdown: plannedShutdown);
+
+        ArgumentException rejection = await Assert.ThrowsAsync<ArgumentException>(
+            () => journal.RecordSessionAsync(contradictory, CancellationToken.None));
+
+        Assert.Equal("session", rejection.ParamName);
+        Assert.Contains(
+            "Session planned shutdown must match the presence of a session end.",
+            rejection.Message,
+            StringComparison.Ordinal);
+        Assert.Equal(0, transitionGate.InvocationCount);
+        Assert.Equal(0, faultInjector.Calls);
+        Assert.Equal(AgentJournalHealthState.NotInitialized, journal.Health.State);
+        Assert.Empty(logger.Entries);
+        AssertJournalFilesAbsent(database.Path);
+    }
+
+    [Theory]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    public async Task InconsistentShutdownMilestoneMergeIsRejectedWithoutMutationOrDegradation(
+        bool plannedShutdown,
+        bool hasEndedAtUtc)
+    {
+        using TestDatabase database = new();
+        CountingReadinessTransitionGate transitionGate = new();
+        SessionFaultInjector faultInjector = new(
+            failOnCall: 99,
+            new SyntheticJournalFaultException());
+        using SqliteAgentJournal journal = CreateJournal(
+            database.Path,
+            faultInjector,
+            readinessTransitionGate: transitionGate);
+        await InitializeFreshAsync(journal);
+        await journal.RecordSessionAsync(Session(), CancellationToken.None);
+        AgentSessionRecord before = await ReadSessionAsync(database);
+        int gateInvocationsBefore = transitionGate.InvocationCount;
+        int faultCallsBefore = faultInjector.Calls;
+        AgentSessionRecord contradictory = Session(
+            endedAtUtc: hasEndedAtUtc ? Now.AddMinutes(2) : null,
+            plannedShutdown: plannedShutdown);
+
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => journal.RecordSessionAsync(contradictory, CancellationToken.None));
+
+        Assert.Equal(gateInvocationsBefore, transitionGate.InvocationCount);
+        Assert.Equal(faultCallsBefore, faultInjector.Calls);
+        Assert.Equal(before, await ReadSessionAsync(database));
+        Assert.Equal(AgentJournalHealthState.Healthy, journal.Health.State);
+
+        AgentSessionRecord ready = Session(readyAtUtc: Now.AddMinutes(1));
+        await journal.RecordSessionAsync(ready, CancellationToken.None);
+        Assert.Equal(ready, await ReadSessionAsync(database));
+        Assert.Equal(AgentJournalHealthState.Healthy, journal.Health.State);
+    }
+
+    [Fact]
+    public async Task ConcurrentValidSessionMilestonesConvergeWithoutContradictoryShutdownEvidence()
+    {
+        using TestDatabase database = new();
+        using SqliteAgentJournal journal = CreateJournal(database.Path);
+        await InitializeFreshAsync(journal);
+        AgentSessionRecord started = Session();
+        AgentSessionRecord ready = Session(readyAtUtc: Now.AddMinutes(1));
+        AgentSessionRecord stopped = Session(
+            readyAtUtc: Now.AddMinutes(1),
+            endedAtUtc: Now.AddMinutes(2),
+            plannedShutdown: true);
+        AgentSessionRecord[] milestones = [started, ready, stopped];
+
+        await Task.WhenAll(
+            Enumerable.Range(0, 12)
+                .Select(index => journal.RecordSessionAsync(
+                    milestones[index % milestones.Length],
+                    CancellationToken.None)));
+
+        AgentSessionRecord persisted = await ReadSessionAsync(database);
+        Assert.Equal(stopped, persisted);
+        Assert.Equal(persisted.EndedAtUtc.HasValue, persisted.PlannedShutdown);
+        Assert.Equal(AgentJournalHealthState.Healthy, journal.Health.State);
+        await using SqliteConnection connection = await database.OpenAsync();
+        Assert.Equal(1L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM agent_sessions;"));
+    }
+
+    [Fact]
+    public async Task PreCanceledSessionPersistenceIsNonDegradingAndMutationFree()
+    {
+        using TestDatabase database = new();
+        SessionFaultInjector faultInjector = new(
+            failOnCall: 1,
+            new SyntheticJournalFaultException());
+        using SqliteAgentJournal journal = CreateJournal(database.Path, faultInjector);
+        await InitializeFreshAsync(journal);
+        using CancellationTokenSource canceled = new();
+        canceled.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => journal.RecordSessionAsync(Session(), canceled.Token));
+
+        Assert.Equal(0, faultInjector.Calls);
+        Assert.Equal(AgentJournalHealthState.Healthy, journal.Health.State);
+        await using SqliteConnection connection = await database.OpenAsync();
+        Assert.Equal(0L, await ScalarInt64Async(connection, "SELECT COUNT(*) FROM agent_sessions;"));
     }
 
     [Fact]

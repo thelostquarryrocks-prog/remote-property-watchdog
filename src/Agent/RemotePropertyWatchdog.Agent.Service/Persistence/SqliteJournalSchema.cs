@@ -38,7 +38,11 @@ public static class SqliteJournalSchema
             started_at_utc TEXT NOT NULL,
             ready_at_utc TEXT NULL,
             ended_at_utc TEXT NULL,
-            planned_shutdown INTEGER NOT NULL DEFAULT 0 CHECK (planned_shutdown IN (0, 1))
+            planned_shutdown INTEGER NOT NULL DEFAULT 0 CHECK (planned_shutdown IN (0, 1)),
+            CHECK (
+                (planned_shutdown = 0 AND ended_at_utc IS NULL) OR
+                (planned_shutdown = 1 AND ended_at_utc IS NOT NULL)
+            )
         ) STRICT;
 
         CREATE INDEX idx_agent_sessions_started

@@ -305,6 +305,89 @@ public sealed class AgentHostSmokeTests
     }
 
     [Fact]
+    public async Task InconsistentShutdownMilestonesPreserveEveryRealHostReadinessSurfaceAndMarker()
+    {
+        string markerPath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.json");
+        string databasePath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.db");
+        SignalingLogger<AgentWorker> readyLogger = new(eventId: 2);
+        ListLogger<SqliteAgentJournal> journalLogger = new();
+        using IHost host = Program.CreateHostBuilder([
+                "--AgentLifecycle:MarkerPath", markerPath,
+                "--AgentLifecycle:ReadinessTimeout", "00:01:00",
+                "--AgentJournal:DatabasePath", databasePath
+            ])
+            .ConfigureServices(services =>
+            {
+                services.AddSingleton<ILogger<AgentWorker>>(readyLogger);
+                services.AddSingleton<ILogger<SqliteAgentJournal>>(journalLogger);
+            })
+            .Build();
+
+        await host.StartAsync(CancellationToken.None);
+        await readyLogger.WaitAsync();
+        IAgentLifecycleCoordinator coordinator = host.Services.GetRequiredService<IAgentLifecycleCoordinator>();
+        AgentLifecycleState readyState = Assert.IsType<AgentLifecycleState>(coordinator.CurrentState);
+        DateTimeOffset readyAtUtc = Assert.IsType<DateTimeOffset>(readyState.ReadyAtUtc);
+        IAgentJournal journal = host.Services.GetRequiredService<IAgentJournal>();
+        AgentWorker worker = GetAgentWorker(host);
+        IAgentServiceHealth serviceHealth = host.Services.GetRequiredService<IAgentServiceHealth>();
+        FileAgentLifecycleStore lifecycleStore = new(
+            Options.Create(new AgentLifecycleOptions { MarkerPath = markerPath }));
+        AgentLifecycleMarker readyMarker = Assert.IsType<AgentLifecycleMarker>(
+            await lifecycleStore.ReadLastMarkerAsync(CancellationToken.None));
+        AgentSessionRecord persistedBefore = Assert.IsType<AgentSessionRecord>(
+            await ReadJournalSessionAsync(databasePath, readyState.SessionId));
+        int journalLogCount = journalLogger.Entries.Count;
+        AgentSessionRecord[] contradictoryMilestones =
+        [
+            persistedBefore with { PlannedShutdown = true },
+            persistedBefore with
+            {
+                EndedAtUtc = readyAtUtc.AddSeconds(1),
+                PlannedShutdown = false
+            }
+        ];
+
+        foreach (AgentSessionRecord contradictory in contradictoryMilestones)
+        {
+            ArgumentException rejection = await Assert.ThrowsAsync<ArgumentException>(
+                () => journal.RecordSessionAsync(contradictory, CancellationToken.None));
+            Assert.Equal("session", rejection.ParamName);
+        }
+
+        AgentSessionRecord persistedAfter = Assert.IsType<AgentSessionRecord>(
+            await ReadJournalSessionAsync(databasePath, readyState.SessionId));
+        AgentLifecycleMarker markerAfter = Assert.IsType<AgentLifecycleMarker>(
+            await lifecycleStore.ReadLastMarkerAsync(CancellationToken.None));
+        Assert.Equal(persistedBefore, persistedAfter);
+        Assert.Equal(journalLogCount, journalLogger.Entries.Count);
+        Assert.Equal(AgentJournalHealthState.Healthy, journal.Health.State);
+        Assert.Equal(AgentJournalHealthState.Healthy, worker.Health.State);
+        Assert.True(worker.IsReady);
+        Assert.True(serviceHealth.IsReady);
+        Assert.Same(worker, serviceHealth);
+        Assert.Equal(readyState, coordinator.CurrentState);
+        Assert.Equal(readyMarker, markerAfter);
+
+        await journal.RecordSessionAsync(persistedBefore, CancellationToken.None);
+        await journal.AppendProbeSampleAsync(
+            RuntimeProbe(readyState.SessionId, readyAtUtc) with
+            {
+                SampleId = "sample-after-shutdown-milestone-rejection"
+            },
+            CancellationToken.None);
+
+        Assert.Equal(1L, await ReadProbeSampleCountAsync(databasePath));
+        Assert.Equal(AgentJournalHealthState.Healthy, journal.Health.State);
+        Assert.True(serviceHealth.IsReady);
+        Assert.Equal(
+            readyMarker,
+            await lifecycleStore.ReadLastMarkerAsync(CancellationToken.None));
+
+        await host.StopAsync(CancellationToken.None);
+    }
+
+    [Fact]
     public async Task AuthenticR0003UpgradeCreatesJournalThenRequiresAndReusesIt()
     {
         string markerPath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.json");
