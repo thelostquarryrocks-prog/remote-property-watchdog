@@ -39,27 +39,21 @@ public sealed class AgentHostSmokeTests
     {
         string markerPath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.json");
         string databasePath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.db");
+        SignalingLogger<AgentWorker> readyLogger = new(eventId: 2);
         using IHost host = Program.CreateHostBuilder([
             "--AgentLifecycle:MarkerPath", markerPath,
             "--AgentLifecycle:ReadinessTimeout", "00:01:00",
             "--AgentJournal:DatabasePath", databasePath
-        ]).Build();
+        ])
+            .ConfigureServices(services =>
+                services.AddSingleton<ILogger<AgentWorker>>(readyLogger))
+            .Build();
 
         await host.StartAsync(CancellationToken.None);
         IAgentLifecycleCoordinator coordinator = host.Services.GetRequiredService<IAgentLifecycleCoordinator>();
-        AgentLifecycleState? started = null;
-        for (int i = 0; i < 20; i++)
-        {
-            started = coordinator.CurrentState;
-            if (started?.IsReady == true)
-            {
-                break;
-            }
+        await readyLogger.WaitAsync();
+        AgentLifecycleState started = Assert.IsType<AgentLifecycleState>(coordinator.CurrentState);
 
-            await Task.Delay(TimeSpan.FromMilliseconds(25), CancellationToken.None);
-        }
-
-        Assert.NotNull(started);
         Assert.Null(started.PreviousSessionId);
         Assert.True(started.HasJournalOwnership);
         await WaitUntilJournalSessionReadyAsync(databasePath, started.SessionId);
