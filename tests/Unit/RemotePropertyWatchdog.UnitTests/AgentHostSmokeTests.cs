@@ -411,6 +411,139 @@ public sealed class AgentHostSmokeTests
     }
 
     [Fact]
+    public async Task EstablishedLifecycleBlankJournalDegradesEveryReadinessSurfaceWithoutClaimingDatabase()
+    {
+        string markerPath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.json");
+        string databasePath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.db");
+        Guid priorSessionId;
+        using (IHost setupHost = CreateHost(markerPath, databasePath))
+        {
+            await setupHost.StartAsync(CancellationToken.None);
+            IAgentLifecycleCoordinator setupCoordinator =
+                setupHost.Services.GetRequiredService<IAgentLifecycleCoordinator>();
+            await WaitUntilReadyAsync(setupCoordinator);
+            priorSessionId = setupCoordinator.CurrentState!.SessionId;
+            await setupHost.StopAsync(CancellationToken.None);
+        }
+
+        DeleteJournalFiles(databasePath);
+        await using (SqliteConnection blank = new($"Data Source={databasePath};Pooling=False"))
+        {
+            await blank.OpenAsync();
+            await using SqliteCommand userVersion = blank.CreateCommand();
+            userVersion.CommandText = "PRAGMA user_version;";
+            Assert.Equal(
+                0L,
+                Convert.ToInt64(
+                    await userVersion.ExecuteScalarAsync(),
+                    CultureInfo.InvariantCulture));
+        }
+        byte[] originalBytes = await File.ReadAllBytesAsync(databasePath);
+        ListLogger<SqliteAgentJournal> journalLogger = new();
+        ListLogger<AgentWorker> workerLogger = new();
+        using IHost host = Program.CreateHostBuilder([
+                "--AgentLifecycle:MarkerPath", markerPath,
+                "--AgentLifecycle:ReadinessTimeout", "00:01:00",
+                "--AgentJournal:DatabasePath", databasePath
+            ])
+            .ConfigureServices(services =>
+            {
+                services.AddSingleton<ILogger<SqliteAgentJournal>>(journalLogger);
+                services.AddSingleton<ILogger<AgentWorker>>(workerLogger);
+            })
+            .Build();
+
+        await host.StartAsync(CancellationToken.None);
+        IAgentJournal journal = host.Services.GetRequiredService<IAgentJournal>();
+        IAgentLifecycleCoordinator coordinator = host.Services.GetRequiredService<IAgentLifecycleCoordinator>();
+        AgentWorker worker = GetAgentWorker(host);
+        IAgentServiceHealth serviceHealth = host.Services.GetRequiredService<IAgentServiceHealth>();
+        await WaitUntilJournalStateAsync(journal, AgentJournalHealthState.Degraded);
+
+        Assert.Equal("database_not_owned", journal.Health.ReasonCode);
+        Assert.Equal(0, journal.Health.SchemaVersion);
+        Assert.Equal("not_run", journal.Health.IntegrityResult);
+        Assert.Equal(journal.Health, worker.Health);
+        Assert.Equal(journal.Health, serviceHealth.Health);
+        Assert.False(worker.IsReady);
+        Assert.False(serviceHealth.IsReady);
+        Assert.True(coordinator.CurrentState?.HasJournalOwnership);
+        Assert.Equal(priorSessionId, coordinator.CurrentState?.PreviousSessionId);
+        Assert.False(coordinator.CurrentState?.IsReady);
+        Assert.Null(coordinator.CurrentState?.ReadyAtUtc);
+        AgentLifecycleMarker degradedMarker = Assert.IsType<AgentLifecycleMarker>(
+            await new FileAgentLifecycleStore(
+                    Options.Create(new AgentLifecycleOptions { MarkerPath = markerPath }))
+                .ReadLastMarkerAsync(CancellationToken.None));
+        Assert.Equal(AgentLifecycleMarker.CurrentJournalOwnershipVersion, degradedMarker.JournalOwnershipVersion);
+        Assert.Null(degradedMarker.ReadyAtUtc);
+        Assert.False(degradedMarker.PlannedShutdown);
+
+        AgentJournalHealth retry = await journal.InitializeAsync(
+            AgentJournalInitializationMode.CreateIfMissingForFreshLifecycle,
+            CancellationToken.None);
+        Assert.Equal(journal.Health, retry);
+        await AssertBlockedAfterDegradationAsync(
+            journal,
+            new AgentSessionRecord(
+                coordinator.CurrentState!.SessionId.ToString("D"),
+                coordinator.CurrentState.StartedAtUtc),
+            coordinator.CurrentState.SessionId,
+            coordinator.CurrentState.StartedAtUtc,
+            "database_not_owned");
+        Assert.Equal(originalBytes, await File.ReadAllBytesAsync(databasePath));
+        Assert.False(File.Exists($"{databasePath}-wal"));
+        Assert.False(File.Exists($"{databasePath}-shm"));
+        await using (SqliteConnection preserved = new($"Data Source={databasePath};Mode=ReadWrite;Pooling=False"))
+        {
+            await preserved.OpenAsync();
+            await using SqliteCommand inventory = preserved.CreateCommand();
+            inventory.CommandText = """
+                SELECT COUNT(*)
+                FROM sqlite_schema
+                WHERE type IN ('table', 'index', 'view', 'trigger')
+                  AND name NOT GLOB 'sqlite_*';
+                """;
+            Assert.Equal(
+                0L,
+                Convert.ToInt64(await inventory.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+            await using SqliteCommand userVersion = preserved.CreateCommand();
+            userVersion.CommandText = "PRAGMA user_version;";
+            Assert.Equal(
+                0L,
+                Convert.ToInt64(await userVersion.ExecuteScalarAsync(), CultureInfo.InvariantCulture));
+        }
+        Assert.Contains(
+            journalLogger.Entries,
+            entry =>
+                entry.EventId == 101 &&
+                entry.Exception is null &&
+                entry.Message.Contains("database_not_owned", StringComparison.Ordinal));
+        Assert.Contains(
+            workerLogger.Entries,
+            entry =>
+                entry.EventId == 8 &&
+                entry.Exception is null &&
+                entry.Message.Contains("database_not_owned", StringComparison.Ordinal));
+        Assert.All(
+            journalLogger.Entries.Concat(workerLogger.Entries),
+            entry =>
+            {
+                Assert.DoesNotContain(databasePath, entry.Message, StringComparison.OrdinalIgnoreCase);
+                Assert.DoesNotContain("CREATE ", entry.Message, StringComparison.OrdinalIgnoreCase);
+                Assert.DoesNotContain("synthetic", entry.Message, StringComparison.OrdinalIgnoreCase);
+            });
+
+        await host.StopAsync(CancellationToken.None);
+
+        Assert.True(coordinator.CurrentState?.PlannedShutdown);
+        Assert.False(coordinator.CurrentState?.IsReady);
+        Assert.Equal(originalBytes, await File.ReadAllBytesAsync(databasePath));
+        Assert.False(File.Exists($"{databasePath}-wal"));
+        Assert.False(File.Exists($"{databasePath}-shm"));
+    }
+
+    [Fact]
     public async Task MalformedLegacyMarkerCannotAuthorizeJournalCreation()
     {
         string markerPath = Path.Combine(Path.GetTempPath(), "rpw-agent-tests", $"{Guid.NewGuid():N}.json");

@@ -421,7 +421,7 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
             await using SqliteConnection connection = await OpenConnectionAsync(
                 allowCreate: !databaseExists,
                 cancellationToken);
-            int schemaVersion = await MigrateToCurrentVersionAsync(connection, cancellationToken);
+            int schemaVersion = await MigrateToCurrentVersionAsync(connection, mode, cancellationToken);
 
             bool schemaIsValid = await ValidateSchemaAsync(connection, cancellationToken);
             if (!schemaIsValid)
@@ -584,7 +584,10 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
         }
     }
 
-    private async Task<int> MigrateToCurrentVersionAsync(SqliteConnection connection, CancellationToken cancellationToken)
+    private async Task<int> MigrateToCurrentVersionAsync(
+        SqliteConnection connection,
+        AgentJournalInitializationMode initializationMode,
+        CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         await using SqliteTransaction transaction = connection.BeginTransaction(deferred: false);
@@ -596,6 +599,11 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
 
         if (schemaVersion == 0)
         {
+            if (initializationMode != AgentJournalInitializationMode.CreateIfMissingForFreshLifecycle)
+            {
+                throw new UnownedAgentJournalException();
+            }
+
             bool hasApplicationSchema = await HasApplicationSchemaAsync(connection, transaction, cancellationToken);
             if (hasApplicationSchema)
             {

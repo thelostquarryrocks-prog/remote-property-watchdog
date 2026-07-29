@@ -268,7 +268,7 @@ public sealed class SqliteAgentJournalTests
     }
 
     [Fact]
-    public async Task VersionZeroDatabaseUpgradesAndFutureVersionIsNotModified()
+    public async Task FreshModeVersionZeroDatabaseUpgradesAndFutureVersionIsNotModified()
     {
         using TestDatabase versionZero = new();
         await using (SqliteConnection connection = await versionZero.OpenAsync())
@@ -278,7 +278,17 @@ public sealed class SqliteAgentJournalTests
 
         using (SqliteAgentJournal journal = CreateJournal(versionZero.Path))
         {
-            Assert.Equal(1, (await InitializeExistingAsync(journal)).SchemaVersion);
+            Assert.Equal(1, (await InitializeFreshAsync(journal)).SchemaVersion);
+        }
+        await using (SqliteConnection migrated = await versionZero.OpenAsync())
+        {
+            Assert.Equal(1L, await ScalarInt64Async(migrated, "PRAGMA user_version;"));
+            Assert.Equal(SqliteJournalSchema.Tables, await NamesAsync(migrated, "table"));
+            Assert.Equal(
+                1L,
+                await ScalarInt64Async(
+                    migrated,
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = 1;"));
         }
 
         using TestDatabase future = new();
@@ -297,6 +307,106 @@ public sealed class SqliteAgentJournalTests
         await using SqliteConnection futureConnection = await future.OpenAsync();
         Assert.Equal(2L, await ScalarInt64Async(futureConnection, "PRAGMA user_version;"));
         Assert.Equal(0L, await ScalarInt64Async(futureConnection, "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'material_events';"));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task EstablishedLifecycleRefusesBlankVersionZeroDatabaseWithoutClaimingIt(
+        bool zeroLengthFile)
+    {
+        using TestDatabase database = new();
+        if (zeroLengthFile)
+        {
+            await File.WriteAllBytesAsync(database.Path, []);
+        }
+        else
+        {
+            await using SqliteConnection connection = await database.OpenAsync();
+            Assert.Equal(0L, await ScalarInt64Async(connection, "PRAGMA user_version;"));
+            Assert.Empty(await NamesAsync(connection, "table"));
+            Assert.Empty(await NamesAsync(connection, "index"));
+            Assert.Empty(await NamesAsync(connection, "view"));
+            Assert.Empty(await NamesAsync(connection, "trigger"));
+        }
+        byte[] originalBytes = await File.ReadAllBytesAsync(database.Path);
+
+        using (SqliteAgentJournal canceledJournal = CreateJournal(database.Path))
+        using (CancellationTokenSource canceled = new())
+        {
+            canceled.Cancel();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                () => canceledJournal.InitializeAsync(
+                    AgentJournalInitializationMode.RequireExistingForPriorLifecycle,
+                    canceled.Token));
+            Assert.Equal(AgentJournalHealthState.NotInitialized, canceledJournal.Health.State);
+        }
+        Assert.Equal(originalBytes, await File.ReadAllBytesAsync(database.Path));
+
+        ListLogger<SqliteAgentJournal> firstLogger = new();
+        ListLogger<SqliteAgentJournal> secondLogger = new();
+        using SqliteAgentJournal first = CreateJournal(database.Path, logger: firstLogger);
+        using SqliteAgentJournal second = CreateJournal(database.Path, logger: secondLogger);
+        TaskCompletionSource start = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task<AgentJournalHealth>[] initializations = new[] { first, second }
+            .Select(journal => Task.Run(async () =>
+            {
+                await start.Task;
+                return await InitializeExistingAsync(journal);
+            }))
+            .ToArray();
+        start.SetResult();
+        AgentJournalHealth[] results = await Task.WhenAll(initializations);
+
+        Assert.All(results, health =>
+        {
+            Assert.Equal(AgentJournalHealthState.Degraded, health.State);
+            Assert.Equal(0, health.SchemaVersion);
+            Assert.Equal("database_not_owned", health.ReasonCode);
+            Assert.Equal("not_run", health.IntegrityResult);
+        });
+        Assert.Equal(results[0], await InitializeExistingAsync(first));
+        Assert.Equal(
+            results[0],
+            await first.InitializeAsync(
+                AgentJournalInitializationMode.CreateIfMissingForFreshLifecycle,
+                CancellationToken.None));
+        AgentSessionRecord session = Session();
+        AgentJournalDegradedException sessionFailure = await Assert.ThrowsAsync<AgentJournalDegradedException>(
+            () => first.RecordSessionAsync(session, CancellationToken.None));
+        AgentJournalDegradedException probeFailure = await Assert.ThrowsAsync<AgentJournalDegradedException>(
+            () => first.AppendProbeSampleAsync(Probe("sample-blocked"), CancellationToken.None));
+        AgentJournalDegradedException eventFailure = await Assert.ThrowsAsync<AgentJournalDegradedException>(
+            () => first.AppendMaterialEventAsync(Event("event-blocked"), CancellationToken.None));
+        AgentJournalDegradedException outboxFailure = await Assert.ThrowsAsync<AgentJournalDegradedException>(
+            () => first.ReadPendingOutboxAsync("agent-synthetic", 10, CancellationToken.None));
+        AgentJournalDegradedException integrityFailure = await Assert.ThrowsAsync<AgentJournalDegradedException>(
+            () => first.VerifyIntegrityAsync(CancellationToken.None));
+        Assert.All(
+            [sessionFailure, probeFailure, eventFailure, outboxFailure, integrityFailure],
+            failure => Assert.Equal(results[0], failure.Health));
+        Assert.All(
+            firstLogger.Entries.Concat(secondLogger.Entries),
+            entry =>
+            {
+                Assert.Null(entry.Exception);
+                Assert.DoesNotContain(database.Path, entry.Message, StringComparison.OrdinalIgnoreCase);
+                Assert.DoesNotContain("CREATE ", entry.Message, StringComparison.OrdinalIgnoreCase);
+                Assert.DoesNotContain("synthetic", entry.Message, StringComparison.OrdinalIgnoreCase);
+            });
+        Assert.True(File.Exists(database.Path));
+        Assert.Equal(originalBytes, await File.ReadAllBytesAsync(database.Path));
+        Assert.False(File.Exists($"{database.Path}-wal"));
+        Assert.False(File.Exists($"{database.Path}-shm"));
+        if (!zeroLengthFile)
+        {
+            await using SqliteConnection preserved = await database.OpenAsync();
+            Assert.Equal(0L, await ScalarInt64Async(preserved, "PRAGMA user_version;"));
+            Assert.Empty(await NamesAsync(preserved, "table"));
+            Assert.Empty(await NamesAsync(preserved, "index"));
+            Assert.Empty(await NamesAsync(preserved, "view"));
+            Assert.Empty(await NamesAsync(preserved, "trigger"));
+        }
     }
 
     [Fact]
@@ -324,7 +434,7 @@ public sealed class SqliteAgentJournalTests
         }
 
         using SqliteAgentJournal journal = CreateJournal(database.Path);
-        AgentJournalHealth health = await InitializeExistingAsync(journal);
+        AgentJournalHealth health = await InitializeFreshAsync(journal);
 
         Assert.Equal(AgentJournalHealthState.Degraded, health.State);
         Assert.Equal("database_not_owned", health.ReasonCode);
@@ -358,7 +468,7 @@ public sealed class SqliteAgentJournalTests
         }
 
         using SqliteAgentJournal journal = CreateJournal(database.Path);
-        AgentJournalHealth health = await InitializeExistingAsync(journal);
+        AgentJournalHealth health = await InitializeFreshAsync(journal);
 
         Assert.Equal(AgentJournalHealthState.Degraded, health.State);
         Assert.Equal("database_not_owned", health.ReasonCode);
@@ -398,7 +508,7 @@ public sealed class SqliteAgentJournalTests
         }
 
         using SqliteAgentJournal journal = CreateJournal(database.Path);
-        AgentJournalHealth health = await InitializeExistingAsync(journal);
+        AgentJournalHealth health = await InitializeFreshAsync(journal);
 
         Assert.Equal(AgentJournalHealthState.Healthy, health.State);
         Assert.Equal(SqliteJournalSchema.CurrentVersion, health.SchemaVersion);
