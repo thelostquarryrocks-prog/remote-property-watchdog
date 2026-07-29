@@ -608,7 +608,73 @@ The `caps` values and units are exactly:
 
 `growth` contains `working_set`, `private_bytes`, `handles`, and `threads` in that order. Each contains `first_window_median`, `final_window_median`, `absolute_increase`, `percent_increase`, `noise_floor`, `unit`, and `result`; `unit` is `bytes` for memory metrics and `count` for handle/thread metrics. Each result is `pass` or `fail`.
 
-`attempts.by_probe_kind` and `attempts.by_outcome` are arrays of `{ "code", "count" }` objects in ordinal code order. `violations` is an ordinal-sorted array containing only these stable bounded codes when applicable:
+Both `attempts.by_probe_kind` and `attempts.by_outcome` use a common entry shape. Every entry has exactly these properties in this order:
+
+1. `code`
+2. `count`
+
+`code` is one of the closed values defined below. `count` is a nonnegative JSON integer; floating-point and negative counts are forbidden. Unknown or extension codes are forbidden in `r0-005-resource-report/v1`. Every defined code appears exactly once, including mandatory zero-count entries. Additional properties are forbidden. The arrays use the exact fixed orders below, which are also ordinal code order; implementations must not depend on locale, dictionary iteration, discovery order, or runtime sorting.
+
+`attempts.by_probe_kind` counts transport invocations that actually started. It contains exactly five entries in this order:
+
+| `code` | Definition |
+| --- | --- |
+| `dns` | One admitted system-resolver transport invocation. |
+| `gateway_icmp` | One admitted ICMP transport invocation. |
+| `https` | One admitted HTTPS provider transport invocation. Each provider request counts separately. |
+| `tcp` | One admitted TCP-connect transport invocation. |
+| `unknown` | A started invocation whose method cannot be mapped to one of the four supported methods. |
+
+`unknown` exists only so a failing report remains completely accountable and deterministic. Any `unknown` count greater than zero adds violation `unknown_probe_method`; the zero-valued entry remains present. Local route/interface discovery is not a transport attempt and is not counted. Work rejected or canceled before transport invocation is not counted by probe kind. The sum of all five `by_probe_kind.count` values equals scalar `attempts.started`.
+
+`attempts.by_outcome` contains exactly five entries in this order:
+
+| `code` | Definition |
+| --- | --- |
+| `canceled` | A started invocation observed cancellation before success, ordinary failure, or timeout classification. |
+| `failed` | A started invocation reached a bounded non-timeout, non-cancellation failure classification. |
+| `incomplete` | A started invocation did not reach any of the four terminal classifications before attempt accounting closed. |
+| `succeeded` | A started transport invocation reached its method-specific success classification. |
+| `timed_out` | A started invocation reached its defined transport timeout. |
+
+These categories are mutually exclusive, and every started invocation is assigned to exactly one outcome entry. Scheduler-level logical rounds that become incomplete before a transport starts do not increment transport-attempt counts; they remain scheduler outcomes, not `attempts.by_outcome` entries.
+
+The scalar attempt properties have these exact definitions:
+
+| Property | Definition |
+| --- | --- |
+| `started` | Total started transport invocations. |
+| `completed` | `succeeded + failed + timed_out + canceled`. |
+| `succeeded` | Identical to the `by_outcome` entry `succeeded`. |
+| `failed` | Identical to `by_outcome.failed`; excludes timeouts, cancellations, and incomplete attempts. |
+| `timed_out` | Identical to `by_outcome.timed_out`. |
+| `canceled` | Identical to `by_outcome.canceled`. |
+| `incomplete` | Identical to `by_outcome.incomplete`. |
+
+The report must satisfy these exact identities:
+
+```text
+started =
+  sum(attempts.by_probe_kind[*].count)
+
+started =
+  succeeded
+  + failed
+  + timed_out
+  + canceled
+  + incomplete
+
+completed =
+  succeeded
+  + failed
+  + timed_out
+  + canceled
+
+started =
+  completed + incomplete
+```
+
+`violations` is an ordinal-sorted array containing only these stable bounded codes when applicable:
 
 - `acceptance_cleanup_failed`
 - `attempt_accounting_incomplete`
