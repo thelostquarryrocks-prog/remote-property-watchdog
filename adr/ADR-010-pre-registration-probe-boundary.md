@@ -25,12 +25,14 @@ R0-005 is a pre-registration, local-only probe stage:
 - Durable evidence integration waits for authenticated identity and explicit migration/replay requirements in a later task.
 - Target CRUD, durable target configuration, management APIs, and UI remain with R0-013.
 
-External HTTPS connectivity defaults to two independently operated providers over strict HTTPS:
+External HTTPS connectivity defaults to two reviewed, separately operated providers over strict HTTPS:
 
-- Google `https://www.google.com/generate_204`, requiring HTTP 204;
-- Cloudflare `https://www.cloudflare.com/cdn-cgi/trace`, requiring HTTP 200 with no body rule.
+- Google `https://www.google.com/generate_204`, declared as operator `google` and requiring HTTP 204;
+- Cloudflare `https://www.cloudflare.com/cdn-cgi/trace`, declared as operator `cloudflare` and requiring HTTP 200 with no body rule.
 
 Redirects, certificate exceptions, HTTP fallback, authentication, cookies, uploads, and customer identifiers are prohibited. The Cloudflare trace body is not parsed or retained because it can contain public-IP and location/colo metadata.
+
+Provider overrides require a truthful configuration-author declaration of operator identity. Runtime structurally enforces distinct provider IDs, endpoint hosts, registrable domains, and declared operators; it cannot prove real-world corporate ownership through domain comparison or network probing. The built-in declarations are reviewed architecture defaults. A false custom declaration is configuration-author error, and registrable-domain separation alone is not evidence of independently operated providers.
 
 The exact execution, privacy, aggregation, and override rules are binding in `docs/R0-005-probe-requirements.md`.
 
@@ -41,7 +43,7 @@ Positive:
 - Tenant and evidence integrity are not weakened to make task sequencing convenient.
 - R0-005 can validate local probe behavior without prematurely committing a durable schema.
 - Restart semantics and acceptance evidence are deterministic.
-- External connectivity uses TLS and provider diversity while minimizing response data.
+- External connectivity uses TLS and structurally enforceable declared-operator/domain diversity while minimizing response data.
 
 Tradeoffs:
 
@@ -49,6 +51,7 @@ Tradeoffs:
 - No probe history is journaled or delivered to the cloud in R0-005.
 - A later identity-aware task must define durable storage, migration, idempotency, and replay boundaries.
 - Static configuration requires service restart and provides no management experience.
+- Runtime cannot independently verify the truth of a custom provider ownership declaration.
 
 ## Alternatives
 

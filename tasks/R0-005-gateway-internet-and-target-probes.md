@@ -15,9 +15,9 @@ The implementation must follow [the binding R0-005 requirements](../docs/R0-005-
 1. **Probe states:** use `unknown`, `baselining`, `healthy`, `suspect`, `offline`, and `recovering` with the exact transition table and compatibility mappings in the requirements.
 2. **Identity and persistence:** before R0-006, do not fabricate agent, property, tenant, enrollment, or cloud identity. Keep probe configuration and runtime state in memory and do not append probe samples or material events.
 3. **Configuration:** bind and atomically validate static .NET startup configuration. A restart applies changes. No CRUD, UI, HTTP management API, SQLite configuration, or cloud configuration is in scope.
-4. **External endpoints:** default to exactly Google `generate_204` and Cloudflare `cdn-cgi/trace`, using strict HTTPS, hostname validation, no redirects, and the endpoint-specific status rules. Do not retain or inspect the Cloudflare response body.
-5. **Scheduling and transitions:** use the exact intervals, timeouts, jitter, concurrency, token-bucket, deadline, cancellation, thresholds, recovery, and flapping rules in the requirements.
-6. **Resource acceptance:** the future implementation must supply the specified 25-target, 30-minute resource sampler and pass all approved caps plus the explicit growth/noise-floor rules.
+4. **External endpoints:** default to exactly Google `generate_204` and Cloudflare `cdn-cgi/trace`, with reviewed `google` and `cloudflare` operator declarations, strict HTTPS, hostname validation, no redirects, and endpoint-specific status rules. Overrides must satisfy the exact ID, host, registrable-domain, and declared-operator validation without claiming runtime proof of corporate ownership. Do not retain or inspect the Cloudflare response body.
+5. **Scheduling and transitions:** use the exact intervals, timeouts, jitter, concurrency, 60-attempt/minute and charged-network startup budgets, rotating fair dispatch, token consumption, deadline, cancellation, thresholds, recovery, and flapping rules in the requirements.
+6. **Resource acceptance:** the future implementation must supply the exact 25-target, 30-complete-steady-state-minute Windows sampler contract, formulas, attribution boundaries, deterministic `r0-005-resource-report/v1` output, and pass/failure rules.
 7. **Backlog boundary:** pull forward only static TCP definitions, TCP connect execution, local operational states, and bounded flapping evidence. R0-013 retains target CRUD, persistent target configuration, richer selection, and UI.
 
 ## In scope
@@ -48,9 +48,12 @@ The implementation must follow [the binding R0-005 requirements](../docs/R0-005-
 - A single HTTPS endpoint failure produces bounded `partial_endpoint_failure` evidence without incrementing the aggregate failure counter or creating an incident signal.
 - Probe work starts only after R0-004 readiness and stops promptly on cancellation or journal/service degradation, with no collection continuing silently.
 - Invalid startup configuration prevents probe scheduling and reports only bounded, non-sensitive validation errors.
+- HTTPS configuration proves only structural diversity across distinct declared operators and registrable domains; separately operated providers and truthful custom `operator_id` declarations remain operator responsibilities.
+- Atomic startup validation rejects aggregate attempt demand above 60/minute or charged-network demand at or above 100,000 bytes/minute before scheduling.
+- Due gateway, DNS, HTTPS aggregate, and TCP logical targets use deterministic rotating fair dispatch so no target or multi-provider HTTPS round monopolizes tokens or execution slots.
 - The implementation neither creates identity nor calls `AppendProbeSampleAsync` or `AppendMaterialEventAsync`.
 - Unit, local integration, security/privacy, lifecycle, and native Windows tests in the binding requirements pass.
-- The 25-target, 30-minute sampling run passes every approved resource cap and growth rule.
+- The 25-target sampler observes the exact PID for 30 complete steady-state minutes and passes every measurement, attribution, growth, accounting, JSON, privacy, and cleanup rule in the binding requirements.
 
 ## Required validation
 
@@ -73,10 +76,10 @@ Live public endpoints are not a CI dependency. Automated HTTPS tests must use fa
 ## Required evidence
 
 - deterministic state-transition and aggregate-outcome test results;
-- configuration and privacy/security test results;
+- declared-operator, aggregate rate/network-budget, fair-dispatch, configuration, and privacy/security test results;
 - lifecycle/degradation and cancellation test results;
 - native Windows gateway-method evidence;
-- the resource sampler's bounded human summary and JSON report from ignored `artifacts/r0-005/`;
+- the resource sampler's bounded human summary and matching `r0-005-resource-report/v1` JSON report from ignored `artifacts/r0-005/`;
 - exact validation commands, totals, warnings, errors, and limitations.
 
 ## Codex completion report
