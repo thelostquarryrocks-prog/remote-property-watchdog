@@ -85,7 +85,7 @@ internal static class SqliteJournalSchemaValidator
             SELECT type, name, sql
             FROM sqlite_schema
             WHERE type IN ('table', 'index', 'view', 'trigger')
-              AND name NOT LIKE 'sqlite_%'
+              AND name NOT GLOB 'sqlite_*'
             ORDER BY type, name;
             """;
         await using SqliteDataReader reader = await command.ExecuteReaderAsync(cancellationToken);

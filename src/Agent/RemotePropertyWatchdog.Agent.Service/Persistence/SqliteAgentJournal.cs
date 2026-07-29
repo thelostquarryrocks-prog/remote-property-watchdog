@@ -31,6 +31,7 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
         "api_token",
         "apikey",
         "auth_token",
+        "authorization",
         "client_secret",
         "connection-string-password",
         "connection_string_password",
@@ -56,6 +57,8 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
     };
 
     private const int MaximumParameterDecodingPasses = 2;
+    private const int MaximumJsonQuoteWrapperEscapeDepth = 2;
+    private const int MaximumJsonQuoteWrapperBackslashes = (1 << MaximumJsonQuoteWrapperEscapeDepth) - 1;
 
     private readonly SemaphoreSlim initializationGate = new(1, 1);
     private readonly AgentJournalOptions options;
@@ -638,7 +641,7 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
                 SELECT 1
                 FROM sqlite_schema
                 WHERE type IN ('table', 'index', 'view', 'trigger')
-                  AND name NOT LIKE 'sqlite_%'
+                  AND name NOT GLOB 'sqlite_*'
             );
             """;
         object? result = await command.ExecuteScalarAsync(cancellationToken);
@@ -1224,14 +1227,10 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
                 parameterNameEnd++;
             }
 
-            int assignmentDelimiter = parameterNameEnd;
-            if (candidateStart > 0 &&
-                assignmentDelimiter < value.Length &&
-                value[candidateStart - 1] is '"' or '\'' &&
-                value[assignmentDelimiter] == value[candidateStart - 1])
-            {
-                assignmentDelimiter++;
-            }
+            int assignmentDelimiter = SkipAssignmentKeyClosingQuoteWrapper(
+                value,
+                candidateStart,
+                parameterNameEnd);
 
             while (assignmentDelimiter < value.Length && IsAsciiWhitespace(value[assignmentDelimiter]))
             {
@@ -1249,6 +1248,47 @@ public sealed partial class SqliteAgentJournal : IAgentJournal, IDisposable
         }
 
         return false;
+    }
+
+    private static int SkipAssignmentKeyClosingQuoteWrapper(
+        string value,
+        int candidateStart,
+        int parameterNameEnd)
+    {
+        if (candidateStart == 0 || value[candidateStart - 1] is not ('"' or '\''))
+        {
+            return parameterNameEnd;
+        }
+
+        char openingQuote = value[candidateStart - 1];
+        int maximumBackslashes = openingQuote == '"'
+            ? MaximumJsonQuoteWrapperBackslashes
+            : 0;
+        for (int backslashCount = 0; backslashCount <= maximumBackslashes; backslashCount++)
+        {
+            int quoteIndex = parameterNameEnd + backslashCount;
+            if (quoteIndex >= value.Length || value[quoteIndex] != openingQuote)
+            {
+                continue;
+            }
+
+            bool containsOnlyBackslashes = true;
+            for (int index = parameterNameEnd; index < quoteIndex; index++)
+            {
+                if (value[index] != '\\')
+                {
+                    containsOnlyBackslashes = false;
+                    break;
+                }
+            }
+
+            if (containsOnlyBackslashes)
+            {
+                return quoteIndex + 1;
+            }
+        }
+
+        return parameterNameEnd;
     }
 
     private static bool IsSensitiveParameterNameCharacter(char value) =>

@@ -183,6 +183,12 @@ public sealed class AgentHostSmokeTests
             "\"api_key\": \"synthetic-value\"",
             "colon-credential-assignment");
 
+    [Fact]
+    public Task EscapedAuthorizationAssignmentValidationPreservesRealHostReadinessAndLaterJournalWorkWithoutLoggingInput() =>
+        AssertCredentialValidationPreservesRealHostReadinessAndLaterJournalWorkWithoutLoggingInputAsync(
+            "{\\\"authorization\\\":\\\"Basic synthetic-value\\\"}",
+            "escaped-authorization-assignment");
+
     private static async Task AssertCredentialValidationPreservesRealHostReadinessAndLaterJournalWorkWithoutLoggingInputAsync(
         string prohibitedValue,
         string eventName)

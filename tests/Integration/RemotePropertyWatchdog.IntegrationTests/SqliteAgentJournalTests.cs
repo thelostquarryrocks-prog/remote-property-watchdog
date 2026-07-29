@@ -12,6 +12,18 @@ namespace RemotePropertyWatchdog.IntegrationTests;
 public sealed class SqliteAgentJournalTests
 {
     private static readonly DateTimeOffset Now = new(2026, 7, 19, 12, 0, 0, TimeSpan.Zero);
+    private static readonly string SyntheticBasicAuthorizationValue =
+        string.Concat("Basic", " ", "synthetic-value");
+
+    public static TheoryData<string> SqliteWildcardConfusionObjectNames { get; } =
+        new()
+        {
+            "sqlitedata",
+            "sqliteXdata",
+            "sqlite-data",
+            "asqlite_data",
+            "application_table"
+        };
 
     public static TheoryData<string, string, string, string, string, string> SchemaTamperingCases { get; } =
         new()
@@ -159,6 +171,14 @@ public sealed class SqliteAgentJournalTests
                 "",
                 "",
                 "CREATE TABLE unexpected_evidence(value TEXT) STRICT; CREATE INDEX unexpected_evidence_index ON unexpected_evidence(value);"
+            },
+            {
+                "sqlite_wildcard_confusion_application_object",
+                "sql",
+                "",
+                "",
+                "",
+                "CREATE TABLE sqlitedata(value TEXT NOT NULL) STRICT; INSERT INTO sqlitedata(value) VALUES ('retained');"
             },
             {
                 "incorrect_migration_evidence",
@@ -319,6 +339,77 @@ public sealed class SqliteAgentJournalTests
         Assert.Equal(["unrelated_trigger"], await NamesAsync(preserved, "trigger"));
         Assert.False(File.Exists($"{database.Path}-wal"));
         Assert.False(File.Exists($"{database.Path}-shm"));
+    }
+
+    [Theory]
+    [MemberData(nameof(SqliteWildcardConfusionObjectNames))]
+    public async Task VersionZeroSqliteWildcardConfusionObjectIsRefusedWithoutAdoption(
+        string objectName)
+    {
+        using TestDatabase database = new();
+        string originalJournalMode;
+        await using (SqliteConnection connection = await database.OpenAsync())
+        {
+            await ExecuteAsync(
+                connection,
+                $"CREATE TABLE [{objectName}](value TEXT NOT NULL); INSERT INTO [{objectName}](value) VALUES ('retained');");
+            Assert.Equal(0L, await ScalarInt64Async(connection, "PRAGMA user_version;"));
+            originalJournalMode = await ScalarStringAsync(connection, "PRAGMA journal_mode;");
+        }
+
+        using SqliteAgentJournal journal = CreateJournal(database.Path);
+        AgentJournalHealth health = await InitializeExistingAsync(journal);
+
+        Assert.Equal(AgentJournalHealthState.Degraded, health.State);
+        Assert.Equal("database_not_owned", health.ReasonCode);
+        Assert.Equal("not_run", health.IntegrityResult);
+        await using SqliteConnection preserved = await database.OpenAsync();
+        Assert.Equal(0L, await ScalarInt64Async(preserved, "PRAGMA user_version;"));
+        Assert.Equal(originalJournalMode, await ScalarStringAsync(preserved, "PRAGMA journal_mode;"));
+        Assert.Equal("retained", await ScalarStringAsync(preserved, $"SELECT value FROM [{objectName}];"));
+        Assert.Equal([objectName], await NamesAsync(preserved, "table"));
+        Assert.Empty(await NamesAsync(preserved, "index"));
+        Assert.Empty(await NamesAsync(preserved, "view"));
+        Assert.Empty(await NamesAsync(preserved, "trigger"));
+        Assert.DoesNotContain(SqliteJournalSchema.Tables, table => StringComparer.Ordinal.Equals(table, objectName));
+        Assert.False(File.Exists($"{database.Path}-wal"));
+        Assert.False(File.Exists($"{database.Path}-shm"));
+    }
+
+    [Fact]
+    public async Task GenuineSqliteReservedPrefixObjectDoesNotBlockEmptyVersionZeroMigration()
+    {
+        using TestDatabase database = new();
+        await using (SqliteConnection connection = await database.OpenAsync())
+        {
+            await ExecuteAsync(
+                connection,
+                """
+                CREATE TABLE transient_sequence_source(id INTEGER PRIMARY KEY AUTOINCREMENT);
+                DROP TABLE transient_sequence_source;
+                """);
+            Assert.Equal(0L, await ScalarInt64Async(connection, "PRAGMA user_version;"));
+            Assert.Equal(
+                1L,
+                await ScalarInt64Async(
+                    connection,
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'sqlite_sequence';"));
+            Assert.Empty(await NamesAsync(connection, "table"));
+        }
+
+        using SqliteAgentJournal journal = CreateJournal(database.Path);
+        AgentJournalHealth health = await InitializeExistingAsync(journal);
+
+        Assert.Equal(AgentJournalHealthState.Healthy, health.State);
+        Assert.Equal(SqliteJournalSchema.CurrentVersion, health.SchemaVersion);
+        await using SqliteConnection migrated = await database.OpenAsync();
+        Assert.Equal(1L, await ScalarInt64Async(migrated, "PRAGMA user_version;"));
+        Assert.Equal(SqliteJournalSchema.Tables, await NamesAsync(migrated, "table"));
+        Assert.Equal(
+            1L,
+            await ScalarInt64Async(
+                migrated,
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'sqlite_sequence';"));
     }
 
     [Fact]
@@ -1266,7 +1357,15 @@ public sealed class SqliteAgentJournalTests
             "api_key: synthetic-value",
             "token: synthetic-value",
             "\"api_key\": \"synthetic-value\"",
-            "{\"token\":\"synthetic-value\"}"
+            "{\"token\":\"synthetic-value\"}",
+            $"authorization={SyntheticBasicAuthorizationValue}",
+            $"authorization: {SyntheticBasicAuthorizationValue}",
+            $"\"authorization\":\"{SyntheticBasicAuthorizationValue}\"",
+            $"{{\"authorization\":\"{SyntheticBasicAuthorizationValue}\"}}",
+            """{\"api_key\":\"synthetic-value\"}""",
+            BuildEscapedJsonAssignment("authorization", SyntheticBasicAuthorizationValue, 1),
+            """{\\\"token\\\":\\\"synthetic-value\\\"}""",
+            BuildEscapedJsonAssignment("authorization", SyntheticBasicAuthorizationValue, 3)
         ];
 
         for (int index = 0; index < prohibitedAssignments.Length; index++)
@@ -1336,6 +1435,7 @@ public sealed class SqliteAgentJournalTests
             "api_token",
             "apikey",
             "auth_token",
+            "authorization",
             "client_secret",
             "connection-string-password",
             "connection_string_password",
@@ -1359,14 +1459,23 @@ public sealed class SqliteAgentJournalTests
             "x-goog-credential",
             "x-goog-signature"
         ];
+        Assert.Equal(28, sensitiveKeys.Length);
+        Assert.Equal(28, sensitiveKeys.Distinct(StringComparer.OrdinalIgnoreCase).Count());
 
+        string onceEscapedQuote = "\\\"";
+        string twiceEscapedQuote = $"{new string('\\', 3)}\"";
         List<string> prohibitedValues = sensitiveKeys
             .SelectMany(
                 key => new[]
                 {
                     $"https://camera.local/live?mode=preview&{key}=synthetic-value",
                     $"status=up; {key}=synthetic-value",
-                    $"status: up; {key}: synthetic-value"
+                    $"status: up; {key}: synthetic-value",
+                    $"{{\"{key}\":\"synthetic-value\"}}",
+                    $"{{{onceEscapedQuote}{key}{onceEscapedQuote}:{onceEscapedQuote}synthetic-value{onceEscapedQuote}}}",
+                    $"{{{twiceEscapedQuote}{key}{twiceEscapedQuote}:{twiceEscapedQuote}synthetic-value{twiceEscapedQuote}}}",
+                    $"{onceEscapedQuote}{key}{onceEscapedQuote}=synthetic-value",
+                    $"{twiceEscapedQuote}{key}{twiceEscapedQuote}:synthetic-value"
                 })
             .ToList();
         prohibitedValues.AddRange(
@@ -1381,7 +1490,11 @@ public sealed class SqliteAgentJournalTests
             "https://camera.local/live?%2574oken=synthetic-value",
             "https://camera.local/live?mode=preview%26api_key%3Dsynthetic-value",
             "https://camera.local/live?mode=preview%2526api_key%253Dsynthetic-value",
-            "https://camera.local/live?token=synthetic-value%ZZ"
+            "https://camera.local/live?token=synthetic-value%ZZ",
+            $"AuThOrIzAtIoN={SyntheticBasicAuthorizationValue}",
+            $"\"AuThOrIzAtIoN\":\"{SyntheticBasicAuthorizationValue}\"",
+            "%7B%5C%22authorization%5C%22%3A%5C%22Basic%20synthetic-value%5C%22%7D",
+            "%257B%255C%2522authorization%255C%2522%253A%255C%2522Basic%2520synthetic-value%255C%2522%257D"
         ]);
 
         for (int index = 0; index < prohibitedValues.Count; index++)
@@ -1441,7 +1554,24 @@ public sealed class SqliteAgentJournalTests
             "api_key%253Asynthetic-value",
             "api_%6bey%3Asynthetic-value",
             "%61pi_key%253Asynthetic-value",
-            "api_key: synthetic-value%ZZ"
+            "api_key: synthetic-value%ZZ",
+            """{\"api_key\":\"synthetic-value\"}""",
+            """{\\\"token\\\":\\\"synthetic-value\\\"}""",
+            """{\"token\"=synthetic-value}""",
+            """{\\\"api_key\\\"=synthetic-value}""",
+            """{"api_key\":\"synthetic-value\"}""",
+            """{\"api_key":"synthetic-value"}""",
+            """{\"mode\":\"up\",\"api_key\":\"synthetic-value\",\"quality\":\"high\"}""",
+            """{\\\"mode\\\":\\\"up\\\",\\\"token\\\":\\\"synthetic-value\\\"}""",
+            """{\\"api_key\\":\\"synthetic-value\\"}""",
+            "%7B%5C%22api_key%5C%22%3A%5C%22synthetic-value%5C%22%7D",
+            "%257B%255C%2522token%255C%2522%253A%255C%2522synthetic-value%255C%2522%257D",
+            $"authorization={SyntheticBasicAuthorizationValue}",
+            $"authorization: {SyntheticBasicAuthorizationValue}",
+            $"\"authorization\":\"{SyntheticBasicAuthorizationValue}\"",
+            $"{{\"authorization\":\"{SyntheticBasicAuthorizationValue}\"}}",
+            BuildEscapedJsonAssignment("authorization", SyntheticBasicAuthorizationValue, 1),
+            BuildEscapedJsonAssignment("AuThOrIzAtIoN", SyntheticBasicAuthorizationValue, 3)
         ];
 
         for (int index = 0; index < prohibitedValues.Length; index++)
@@ -1488,7 +1618,16 @@ public sealed class SqliteAgentJournalTests
             "secretary: present",
             "api_key%ZZ: synthetic-value",
             "%252561pi_key: synthetic-value",
-            "api_key%25253Asynthetic-value"
+            "api_key%25253Asynthetic-value",
+            """{\"mode\":\"preview\",\"note\":\"api_key\"}""",
+            """ordinary escaped prose says \"token\" without an assignment""",
+            "\\\"token\\\"",
+            """{\"note\":\"authorization\"}""",
+            """{\"token_backup\":\"enabled\"}""",
+            """{\"tokenizer\":\"enabled\"}""",
+            """{\"prefix-token\":\"enabled\"}""",
+            """{\\\"note\":\"value\"}""",
+            "%25257B%25255C%252522api_key%25255C%252522%25253Asynthetic-value%25257D"
         ];
         for (int index = 0; index < benignValues.Length; index++)
         {
@@ -1555,6 +1694,7 @@ public sealed class SqliteAgentJournalTests
     [Theory]
     [InlineData("token=synthetic-value", "equals")]
     [InlineData("token: synthetic-value", "colon")]
+    [InlineData("{\\\"token\\\":\\\"v\\\"}", "escaped-json")]
     public async Task CredentialAssignmentValidationCoversEveryPersistedStringSurface(
         string prohibitedAssignment,
         string delimiterName)
@@ -1794,6 +1934,15 @@ public sealed class SqliteAgentJournalTests
             StringComparison.Ordinal);
     }
 
+    private static string BuildEscapedJsonAssignment(
+        string key,
+        string value,
+        int wrapperBackslashCount)
+    {
+        string quoteWrapper = $"{new string('\\', wrapperBackslashCount)}\"";
+        return $"{{{quoteWrapper}{key}{quoteWrapper}:{quoteWrapper}{value}{quoteWrapper}}}";
+    }
+
     private static async Task CheckpointAsync(TestDatabase database)
     {
         await using SqliteConnection connection = await database.OpenAsync();
@@ -1961,7 +2110,7 @@ public sealed class SqliteAgentJournalTests
             command.CommandText = """
                 SELECT type, name, COALESCE(sql, '<null>')
                 FROM sqlite_schema
-                WHERE name NOT LIKE 'sqlite_%'
+                WHERE name NOT GLOB 'sqlite_*'
                 ORDER BY type, name;
                 """;
             await using SqliteDataReader reader = await command.ExecuteReaderAsync();
@@ -2044,7 +2193,7 @@ public sealed class SqliteAgentJournalTests
     private static async Task<IReadOnlyList<string>> NamesAsync(SqliteConnection connection, string type)
     {
         await using SqliteCommand command = connection.CreateCommand();
-        command.CommandText = "SELECT name FROM sqlite_schema WHERE type = $type AND name NOT LIKE 'sqlite_%' ORDER BY name;";
+        command.CommandText = "SELECT name FROM sqlite_schema WHERE type = $type AND name NOT GLOB 'sqlite_*' ORDER BY name;";
         command.Parameters.AddWithValue("$type", type);
         List<string> names = [];
         await using SqliteDataReader reader = await command.ExecuteReaderAsync();
