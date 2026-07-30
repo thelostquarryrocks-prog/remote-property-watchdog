@@ -337,18 +337,18 @@ The TCP offline threshold is two consecutive counted failures.
 
 ### 4.1 Activation and degradation
 
-The scheduler may activate only after R0-004 reports both journal readiness and formal service readiness. A configured logical target is constructed as `unknown`. Activation moves it from `unknown` to `baselining`, clears every failure streak, recovery progress, and flapping history, and makes its first round due immediately through the same global controls as later work. No transport round may be dispatched or reduced while a target remains `unknown`; a round result observed for an `unknown` target is an implementation invariant failure, not an operational transition.
+The scheduler may activate only after R0-004 reports both journal readiness and formal service readiness. A configured logical target is constructed as `unknown`. At the exact injected-monotonic timestamp of successful scheduler activation, activation moves every enabled target from `unknown` to `baselining`, clears every failure streak, recovery progress, and flapping history, makes every first round due immediately through the same global controls as later work, and creates the scheduler's one process-local token bucket with exactly eight token-seconds of credit and that activation timestamp as its refill anchor. No transport round may be dispatched or reduced while a target remains `unknown`; a round result observed for an `unknown` target is an implementation invariant failure, not an operational transition.
 
 If journal health or formal service readiness becomes false:
 
 - stop admitting new rounds;
 - cancel queued and active attempts promptly;
-- clear schedules, token-bucket state, counters, recovery progress, and flapping history;
+- clear schedules, discard the complete token-bucket credit and refill anchor, and clear counters, recovery progress, and flapping history;
 - keep the process alive under R0-004's existing degraded-service behavior;
 - do not collect, log, buffer, persist, or emit observations while degraded;
 - do not recreate the journal, restore readiness, or invent writes from R0-005.
 
-Recovery of probe execution requires a healthy process restart. On restart, all enabled targets are reconstructed as `unknown` and enter `baselining` only through scheduler activation after readiness.
+Recovery of probe execution requires a healthy process restart. No token credit or anchor survives degradation or restart. On restart, all enabled targets are reconstructed as `unknown` and enter `baselining` only through scheduler activation after readiness; that later valid activation creates a new full eight-token bucket and a new injected-monotonic activation anchor.
 
 Known R0-004 limitation: a simultaneous journal failure and lifecycle-marker write failure can leave the durable readiness marker stale until restart, although in-process readiness is false. R0-005 must trust the in-process false state and stop.
 
@@ -379,18 +379,32 @@ Nominal threshold × base-interval calculations are not elapsed-time guarantees 
 | Each HTTPS endpoint | 5 seconds |
 | Any logical round, including capacity/rate waiting | 10 seconds |
 
-There is no retry within a round. A timed-out transport that was actually started is a counted failure. Each HTTPS child timeout runs independently from that child's transport-start instant, while the ten-second deadline runs once from HTTPS logical-round admission and includes all child slot/token waiting. A child terminal classification timestamped at or before the round deadline is included; when a child timeout and the round deadline have the same monotonic timestamp, the child timeout classification is applied before testing round completion. No child may start after the round deadline. A logical round that expires before all required attempts can start or complete is a scheduler-level incomplete outcome and does not change operational state-machine counters or state. A required transport that never starts does not enter attempt accounting; any transport invocation that did start remains subject to the attempt-level closure rules in section 8.8.
+There is no retry within a round. A timed-out transport that was actually started is a counted failure. Each HTTPS child timeout runs independently from that child's transport-start instant, while the ten-second deadline runs once from HTTPS logical-round admission and includes all child slot/token waiting. Token availability is evaluated by the continuous lazy-refill rules in section 4.4 at exact injected-monotonic instants; neither a coarse refill tick nor an operating-system timer cadence may delay a token that has accrued exactly one token-second of credit. A child terminal classification timestamped at or before the round deadline is included; when a child timeout and the round deadline have the same monotonic timestamp, the child timeout classification is applied before testing round completion. No child may start after the round deadline. A logical round that expires before all required attempts can start or complete is a scheduler-level incomplete outcome and does not change operational state-machine counters or state. A required transport that never starts does not enter attempt accounting or consume a token; any transport invocation that did start remains subject to the attempt-level closure rules in section 8.8 and never receives a token refund.
 
 ### 4.4 Capacity, configured budgets, and token consumption
 
 - At most four network attempts are active process-wide.
 - Gateway, DNS, and each TCP logical target have at most one active transport attempt.
 - The HTTPS aggregate has at most one active logical round; inside it, at most one child transport attempt per configured provider may be active, and up to four distinct provider children may overlap subject to the process-wide cap.
-- The token bucket refills at 60 tokens per minute and has burst capacity 8.
-- ICMP sends, DNS queries, HTTPS endpoint requests, and TCP connects each consume one token.
+- The active scheduler owns exactly one process-local token bucket shared by every probe method. Its refill rate is exactly one token per monotonic second, equivalent to 60 tokens per minute, and its capacity is exactly eight tokens.
+- ICMP sends, DNS queries, HTTPS endpoint requests, and TCP connects each consume exactly one token at transport start. A started attempt is never refunded, regardless of success, failure, timeout, cancellation, or incomplete accounting.
 - Local route/interface discovery consumes no token and no network-attempt slot.
 - Waiting for a slot or token is cancelable and counts against the ten-second logical-round deadline.
 - Rate-limited or capacity-delayed work that cannot start in time is incomplete, not failed.
+
+Token credit uses exact monotonic-duration arithmetic or an equivalent fixed-point/rational representation. One token is exactly one second of refill credit, and capacity is exactly eight seconds of credit. Binary floating-point accumulation, rounded token counts, periodic timer ticks, a background refill loop, operating-system timer cadence, wall-clock time, and scheduler tick counts are not permitted inputs.
+
+The bucket is initialized only by successful scheduler activation under section 4.1: credit is exactly eight token-seconds and the refill anchor is the exact injected-monotonic activation timestamp. Refill is continuous and evaluated lazily whenever availability or consumption is tested. At an evaluation timestamp `now`, the dispatcher:
+
+1. obtains `now` only from the injected monotonic clock;
+2. fails an implementation invariant if `now` is earlier than the prior refill anchor;
+3. adds exactly `now - prior_refill_anchor` to credit;
+4. caps credit at exactly eight token-seconds; and
+5. advances the refill anchor to `now`.
+
+Fractional credit is retained exactly. One-half second contributes one-half token but cannot start a transport by itself. A token becomes available at the exact instant cumulative credit reaches one token-second. Multiple eligibility evaluations at the same monotonic timestamp receive no refill between evaluations and remain ordered by section 4.5. Sleep, suspend, scheduler delay, or other long elapsed time can refill only to capacity; it creates no catch-up balance beyond eight tokens.
+
+Credit and the refill anchor remain process-local internal scheduler state. They are not persisted or exposed through a public contract, schema, cloud evidence, health output, support output, logs, or metrics and contain no target, provider, endpoint, or customer value.
 
 Configuration validation calculates the worst-case demand atomically before scheduling any probe. The minimum possible scheduled interval is 27 seconds for gateway, DNS, and HTTPS aggregate rounds, which is 90% of their 30-second base interval. For each enabled TCP target:
 
@@ -419,14 +433,16 @@ worst_case_attempts_per_minute =
 
 Configuration is valid only when `worst_case_attempts_per_minute <= 60`. Excess demand rejects the entire configuration before scheduling with bounded code `probe_rate_budget_exceeded`.
 
-A second deterministic startup budget uses these conservative charged amounts for each admitted attempt:
+A second deterministic startup budget and all runtime acceptance accounting use one closed exact charge table for each started attempt:
 
-| Probe method | Charged bytes |
+| Probe method | Exact charged bytes per started attempt |
 | --- | ---: |
-| ICMP | 128 |
+| Gateway ICMP | 128 |
 | DNS | 1,024 |
 | TCP connect | 1,024 |
 | HTTPS endpoint | 8,192 |
+
+For a recognized method, `charged_method_bytes` is derived exclusively from this table and equals the table value exactly. It is not a lower bound, configuration value, adapter estimate, transport-provided value, measured-wire value, or implementation-selected uplift. Transport adapters may provide measured application bytes sent and received where available, but they must not provide, override, increase, or decrease `charged_method_bytes`. Concurrent HTTPS provider children are distinct started attempts and each derives exactly 8,192 charged bytes. Startup formulas and runtime acceptance must use the same table definition rather than duplicated or independently configurable values. Per-attempt lookup and runtime byte summation use deterministic integer semantics independent of platform and culture; configured-demand multiplication retains the explicitly specified double-precision comparison below.
 
 ```text
 gateway_charged_network_demand =
@@ -449,13 +465,13 @@ worst_case_charged_network_bytes_per_minute =
   + tcp_charged_network_demand
 ```
 
-Configuration is valid only when `worst_case_charged_network_bytes_per_minute < 100,000`. A value at or above the approved decimal cap rejects the entire configuration before scheduling with bounded code `probe_network_budget_exceeded`. This charged-byte model is deterministic conservative accounting for configuration and acceptance; it is not packet capture or a claim of exact physical-wire traffic.
+Configuration is valid only when `worst_case_charged_network_bytes_per_minute < 100,000`. A value at or above the approved decimal cap rejects the entire configuration before scheduling with bounded code `probe_network_budget_exceeded`. This exact charged-byte model is deterministic conservative accounting for configuration and acceptance; it is not packet capture or a claim of exact physical-wire traffic.
 
 A disabled DNS probe creates no DNS scheduler target, consumes no DNS token or network-attempt slot, and contributes zero DNS demand to both startup budgets. HTTPS provider DNS resolution remains charged as part of each HTTPS provider attempt; disabling the independent DNS probe does not remove or reduce HTTPS demand. Configuration validation remains atomic, and neither budget error may echo target IDs, intervals, hosts, ports, provider details, operator identifiers, endpoints, calculated customer-specific values, or other sensitive configuration.
 
 A 15-second TCP interval remains individually permitted only when the complete configured set passes both global budgets. With DNS enabled and the two default HTTPS providers, 25 targets at 15 seconds are invalid: worst-case demand is approximately 108.89 attempts/minute and 141,368.89 charged bytes/minute. The same 25 targets at a 60-second configured interval are valid: worst-case demand is approximately 36.67 attempts/minute and 67,413.33 charged bytes/minute. Different provider counts and the DNS enabled state can change configuration validity.
 
-After a transport attempt becomes eligible through the fair-dispatch rules, it may start only when its applicable target/round/provider guard, one global execution slot, and one token are all available. The dispatcher must not hold a global slot while waiting for a token or consume a token while waiting for a slot. At one measurement boundary it atomically claims the guards and slot, captures the monotonic transport-start timestamp, consumes one token, and immediately invokes the transport. Cancellation before that boundary consumes no token. Once transport invocation starts, the attempt consumes its token regardless of success, failure, or timeout. Each HTTPS provider child performs this acquisition and accounting independently even when multiple children start in the same dispatch cycle. Acceptance phase membership uses each child's own transport-start timestamp, never fair-queue admission or aggregate-round admission.
+After a transport attempt becomes eligible through the fair-dispatch rules, it may start only when its applicable target/round/provider guard, one global execution slot, and at least one exact token-second of credit are all available. The dispatcher must not hold a global slot while waiting for token credit and must not subtract credit while waiting for a slot. At one deterministic atomic transport-start boundary it obtains one injected-monotonic `now`, uses that same value for lazy refill and `transport_start`, claims the guards and slot, subtracts exactly one token-second, records `transport_start = now`, and immediately invokes the transport. Cancellation before that boundary consumes no token. Once transport invocation starts, its token is never refunded. Each HTTPS provider child performs this acquisition and accounting independently even when multiple children start at the same timestamp in one dispatch cycle; same-timestamp children receive no intervening refill and follow the captured stable provider/fair-dispatch order. Acceptance phase membership uses each child's own transport-start timestamp, never fair-queue admission or aggregate-round admission.
 
 ### 4.5 Deterministic fair dispatch
 
@@ -464,8 +480,8 @@ The dispatcher uses a deterministic rotating fair queue over due logical targets
 - The dispatcher maintains a rotating cursor over stable key order.
 - Gateway, DNS, and each due TCP logical target contribute at most one attempt per pass.
 - When an HTTPS logical round is admitted, its provider children are sorted by stable provider ID using `.NET StringComparer.Ordinal`. The captured order is immutable for that round and is never logged or reported.
-- On the HTTPS target's dispatch turn, the dispatcher offers every not-yet-started provider child in that stable order during one bounded fan-out. Every child for which a slot and token are available starts without waiting for an earlier provider to complete and without waiting for a complete pass over all other logical targets.
-- If the initial fan-out leaves provider children pending because a slot or token was unavailable, subsequent dispatch opportunities alternate one pending child with one next due non-HTTPS logical target, beginning with the pending child and skipping an empty lane. Pending provider children therefore remain bound to the same round and deadline but are never moved behind a complete pass over all other logical targets.
+- On the HTTPS target's dispatch turn, the dispatcher offers every not-yet-started provider child in that stable order during one bounded fan-out. Every child for which a slot and at least one exact token-second of credit are available starts without waiting for an earlier provider to complete and without waiting for a complete pass over all other logical targets. Children evaluated at the same timestamp consume available credit in that stable order with no intervening refill.
+- If the initial fan-out leaves provider children pending because a slot or token credit was unavailable, subsequent dispatch opportunities alternate one pending child with one next due non-HTTPS logical target, beginning with the pending child and skipping an empty lane. Waiting for credit never reserves a global slot, and waiting for a slot never reserves or subtracts credit. Pending provider children therefore remain bound to the same round and deadline but are never moved behind a complete pass over all other logical targets.
 - Child completion order does not affect aggregation. The round completes only after every configured provider has exactly one terminal child result; reduction reads results in the captured stable provider order.
 - Cancellation stops new child starts and promptly cancels active children. Deadline expiry stops new child starts, applies every terminal child result timestamped at or before the deadline, and then reduces the round as `incomplete` if any required child never started or lacks a terminal classification.
 - Canceled, disabled, or no-longer-due work is skipped.
@@ -481,6 +497,7 @@ On shutdown:
 
 - stop admitting new work first;
 - cancel queued and active attempts;
+- discard token credit and its refill anchor after no further transport start can occur;
 - dispose transports;
 - complete scheduler shutdown within five seconds.
 
@@ -623,7 +640,7 @@ pwsh ./scripts/r0-005-resource-sampling.ps1 `
 
 The run uses 25 synthetic TCP targets and fake or loopback endpoints, never real customer or network data. It exercises the gateway, DNS, HTTPS aggregate, and TCP scheduling abstractions.
 
-`-DurationMinutes 30` means 30 complete steady-state minutes after the service first reaches monitoring-ready. Initialization time is additional and does not reduce that window.
+`-DurationMinutes 30` means 30 complete steady-state minutes after the service first reaches monitoring-ready and the steady-state baseline bundle below is committed. Initialization and the complete start barrier are additional and do not reduce that window.
 
 - Initialization begins immediately before the service process is started and ends when monitoring-ready is first observed. Immediately before process launch, the sampler creates or verifies the dedicated monitored runtime directory and captures the complete recursive process-start runtime-file snapshot used for startup disk attribution. Failure to reach readiness within 60 seconds fails the run.
 - The exact service PID is captured after process creation.
@@ -638,11 +655,15 @@ After monitoring-ready, the acceptance coordinator establishes a clean steady-st
 1. Pause all new network-attempt admissions.
 2. Cancel queued attempts that have not started as scheduler-level non-counting/incomplete work. They consume no token and do not enter a transport-attempt array.
 3. Allow every started attempt to reach one terminal attempt outcome.
-4. Fail the run with `measurement_boundary_timeout` if the pre-steady-state drain exceeds 10 monotonic seconds.
-5. After no started attempt remains, reset acceptance-only attempt and network accounting, capture the complete recursive start-barrier runtime-file snapshot, and capture the process-CPU baseline.
-6. Choose the next fixed five-second monotonic sampling boundary as `steady_state_start`, begin the 30 complete steady-state minutes there, and resume admissions.
+4. After no started attempt remains and while admissions remain paused, establish one steady-state baseline bundle containing the complete consistent recursive runtime-file snapshot, the exact process-CPU baseline, the acceptance-only attempt/network-accounting reset, and one injected-monotonic boundary timestamp. The reset seals the separately reported startup attempt/network totals and initializes the steady-state attempt/network accumulators to zero; it does not erase startup evidence.
+5. Capture the process-CPU baseline immediately before the monotonic bundle-commit timestamp. Commit the bundle atomically; `steady_state_start` is exactly that successful commit timestamp. There is no wait for a later pre-existing sampling-grid boundary.
+6. Resume admissions only after the baseline bundle and `steady_state_start` exist. Begin the requested 30 complete steady-state minutes at that exact timestamp.
 
-`steady_state_start_barrier_elapsed_ms` measures from the admission pause immediately after readiness through `steady_state_start`. For report attribution, `startup` spans process start through `steady_state_start` and therefore includes both initialization and the start barrier. Startup CPU, disk, network, and attempt totals cover that full span; startup attempt totals include every transport invocation whose transport-start instant precedes `steady_state_start`.
+The complete start-barrier operation, from the admission pause through successful baseline-bundle commit, has one ten-monotonic-second deadline. Exceeding it adds `measurement_boundary_timeout` and fails the run; drain completion does not start a new allowance. The runtime-file component must be a stable complete snapshot. If the monitored tree changes during capture and consistency cannot be proven, the sampler may retry only within the same bounded barrier. If no stable complete snapshot can be committed before the deadline, the sampler fails with `runtime_file_snapshot_incomplete` and `measurement_boundary_timeout` as independently applicable rather than accepting an ambiguous baseline.
+
+The acceptance pause does not initialize, reset, discard, or refund scheduler token-bucket credit. While admissions are paused, exact elapsed monotonic duration may lazily refill the active bucket only up to eight token-seconds under section 4.4. The next eligible starts after resume use that existing bucket and anchor. Only scheduler activation, readiness degradation, restart, or shutdown has the token-bucket lifecycle effects defined in sections 4.1 and 4.6.
+
+`steady_state_start_barrier_elapsed_ms` measures from the admission pause immediately after readiness through the baseline-bundle commit at `steady_state_start`. For report attribution, `startup` spans process start up to that commit and therefore includes both initialization and the complete start barrier. All process CPU consumed before the committed CPU baseline, all runtime-file growth present in the committed snapshot, and every transport invocation whose transport-start instant precedes `steady_state_start` are startup-only. Steady-state CPU begins from the same committed CPU baseline, steady-state disk begins from the same committed runtime-file snapshot, and steady-state attempts/network begin at the same monotonic boundary. No CPU or disk interval is omitted, double-counted, or assigned to both phases.
 
 Steady-state membership is the half-open interval:
 
@@ -661,7 +682,7 @@ At exact `steady_state_end`, the acceptance coordinator establishes the end barr
 
 No invocation may start at or after `steady_state_end`. Such a start adds `measurement_boundary_violation` and fails the run. `steady_state_end_drain_elapsed_ms` measures from exact `steady_state_end` until every started steady-state attempt has a terminal accounting outcome or the drain deadline expires.
 
-The top-level `attempts` object represents steady-state attempts only. Steady-state network attribution includes the full bytes of every steady-state attempt, including an attempt that completes during the end drain. After the end drain, the sampler captures the complete recursive final runtime-file snapshot. Startup disk attribution compares the process-start snapshot with the start-barrier snapshot; steady-state disk attribution compares the start-barrier snapshot with the final snapshot. The steady-state CPU numerator includes process CPU through end-drain completion, while its denominator remains the exact requested 30 steady-state minutes. Working-set absolute-cap enforcement continues through end drain. Growth medians use only steady-state minutes 1–5 and 26–30 and never include drain samples.
+The top-level `attempts` object represents steady-state attempts only. Steady-state network attribution includes the full bytes of every steady-state attempt, including an attempt that completes during the end drain. After the end drain, the sampler captures the complete recursive final runtime-file snapshot. Startup disk attribution compares the process-start snapshot with the runtime-file snapshot committed in the steady-state baseline bundle; steady-state disk attribution compares that same committed snapshot with the final snapshot. Startup CPU ends at the bundle's committed CPU baseline; the steady-state CPU numerator begins at that identical baseline and includes process CPU through end-drain completion, while its denominator remains the exact requested 30 steady-state minutes. Working-set absolute-cap enforcement continues through end drain. Growth medians use only steady-state minutes 1–5 and 26–30 and never include drain samples.
 
 The 30-minute run is an R0-005 merge gate. A seven-day soak with zero false Critical alerts and no unplanned termination remains a later R0 release-exit/controlled-acceptance gate because R0-005 creates no alerts.
 
@@ -692,9 +713,9 @@ The 30-minute result is evidence for the exact executable on the recorded profil
 
 ### 8.3 Clock and sampling
 
-Elapsed time and sampling deadlines use a monotonic clock. The fixed-rate schedule is anchored at initialization start, immediately before process launch, with boundaries at five-second monotonic increments. Boundaries after the exact process is created require a process sample; the first boundary chosen after the start-barrier drain becomes `steady_state_start`. UTC wall-clock timestamps may be recorded for correlation, but no calculation uses wall-clock elapsed time.
+Elapsed time and sampling deadlines use a monotonic clock. Pre-steady-state initialization/barrier sampling may use a separately reported fixed-rate grid anchored at initialization start, immediately before process launch; those samples remain subject to the absolute working-set cap but do not define the steady-state boundary, CPU baseline, disk baseline, complete-minute windows, or acceptance accounting reset. `steady_state_start` is the baseline-bundle commit itself. The steady-state fixed-rate grid is re-anchored there: the first steady-state sample boundary is exactly `steady_state_start + 5 seconds`, and every later boundary is an exact five-second multiple from `steady_state_start`. `steady_state_end` is exactly `steady_state_start + requested_steady_state_duration`. UTC wall-clock timestamps may be recorded for correlation, but no calculation uses wall-clock elapsed time.
 
-The sampler uses a fixed-rate monotonic schedule with one sample every five seconds and no catch-up burst, continuing through end-drain completion. `valid_sample_count` and `missing_sample_count` cover every required process sample after process creation through that completion. A sample is missing when no valid sample is collected within ten seconds of its scheduled deadline or when any complete steady-state minute contains fewer than 11 valid samples. Any missing sample fails the run. Only samples in the 30-minute half-open steady-state interval participate in the complete-minute growth windows.
+The sampler uses fixed-rate monotonic schedules with one sample every five seconds and no catch-up burst, continuing through end-drain completion. `valid_sample_count` and `missing_sample_count` cover every required process sample after process creation through that completion, across the separately anchored pre-steady-state and steady-state schedules without duplicating a sample. A sample is missing when no valid sample is collected within ten seconds of its scheduled deadline or when any complete steady-state minute contains fewer than 11 valid samples. Any missing sample fails the run. Only samples at steady-state boundaries derived from `steady_state_start` and within the 30-minute half-open steady-state interval participate in complete-minute growth windows.
 
 At each valid sample, the sampler refreshes the exact service process and records:
 
@@ -717,13 +738,13 @@ normalized_cpu_percent =
 
 Negative processor-time deltas, zero or negative wall-time deltas, PID changes, and counter resets fail the run. Only after raw inputs have been validated may a reported sampled percentage be bounded to 0–100.
 
-Steady-state average CPU uses the process-CPU delta from the post-start-barrier baseline through end-drain completion with the same logical-processor normalization. The denominator remains the exact requested 30 steady-state minutes; drain duration does not extend it. The pass condition is `steady_state_average_cpu_percent < 2.0`. Startup observation duration, startup total CPU time, and startup maximum sampled normalized CPU are reported separately; a startup peak neither replaces nor relaxes the steady-state rule.
+The baseline bundle captures one process-CPU value immediately before its monotonic commit. Startup CPU attribution ends at that value, and steady-state average CPU uses the process-CPU delta from that identical committed baseline through end-drain completion with the same logical-processor normalization. No CPU interval between drain completion and `steady_state_start` exists outside those phases because the commit is the boundary. The denominator remains the exact requested 30 steady-state minutes; drain duration does not extend it. The pass condition is `steady_state_average_cpu_percent < 2.0`. Startup observation duration, startup total CPU time, and startup maximum sampled normalized CPU are reported separately; a startup peak neither replaces nor relaxes the steady-state rule.
 
 ### 8.5 Memory, handles, threads, and growth
 
 Every valid working-set sample after process creation must be less than 150,000,000 bytes. Reaching or exceeding that decimal-byte cap fails independently of growth calculations.
 
-Growth calculations use complete steady-state per-minute medians. Each sample is assigned to exactly one complete steady-state minute. For each minute, values are sorted without rounding; an odd count uses the middle value and an even count uses the arithmetic mean of the two middle values. The first-window value is the median of the five per-minute medians for steady-state minutes 1–5. The final-window value is the median of the five per-minute medians for minutes 26–30.
+Growth calculations use complete steady-state per-minute medians anchored to `steady_state_start`. Each steady-state sample is assigned to exactly one complete half-open minute window derived from that boundary. For each minute, values are sorted without rounding; an odd count uses the middle value and an even count uses the arithmetic mean of the two middle values. The first-window value is the median of the five per-minute medians for steady-state minutes 1–5. The final-window value is the median of the five per-minute medians for minutes 26–30.
 
 | Metric | Noise floor |
 | --- | ---: |
@@ -749,9 +770,9 @@ Disk evidence measures attributable positive file-size growth beneath the dedica
 
 Network or device I/O therefore cannot change either disk value.
 
-Published binaries, immutable input configuration, and sampler-owned evidence/report files must remain outside the monitored runtime directory. The process-start, start-barrier, and final snapshots recursively enumerate every file beneath that directory. A snapshot keys each file only by its normalized bounded relative path and records a nonnegative integer length. No absolute path enters a report. Enumeration or normalization must not skip or filter a runtime file; a path that escapes the monitored directory, including through traversal or a reparse target, fails rather than being followed or omitted.
+Published binaries, immutable input configuration, and sampler-owned evidence/report files must remain outside the monitored runtime directory. The process-start snapshot, the snapshot committed in the steady-state baseline bundle, and the final snapshot recursively enumerate every file beneath that directory. A snapshot keys each file only by its normalized bounded relative path and records a nonnegative integer length. No absolute path enters a report. Enumeration or normalization must not skip or filter a runtime file; a path that escapes the monitored directory, including through traversal or a reparse target, fails rather than being followed or omitted.
 
-The same calculation applies to the process-start/start-barrier pair for `startup.attributed_disk_bytes` and the start-barrier/final pair for `steady_state.attributed_disk_bytes`:
+The steady-state-start snapshot is committed atomically with the CPU baseline, accounting reset, and monotonic `steady_state_start`. It must be complete and consistent: monitored-tree changes during capture require a bounded retry under section 8.1, and failure to prove a stable snapshot within that barrier fails rather than creating an ambiguous baseline. The same calculation applies to the process-start/steady-state-start pair for `startup.attributed_disk_bytes` and the steady-state-start/final pair for `steady_state.attributed_disk_bytes`:
 
 ```text
 positive_runtime_file_growth_bytes(baseline, ending) =
@@ -762,11 +783,11 @@ positive_runtime_file_growth_bytes(baseline, ending) =
 startup.attributed_disk_bytes =
   positive_runtime_file_growth_bytes(
     process_start_snapshot,
-    start_barrier_snapshot)
+    steady_state_start_snapshot)
 
 steady_state.attributed_disk_bytes =
   positive_runtime_file_growth_bytes(
-    start_barrier_snapshot,
+    steady_state_start_snapshot,
     final_snapshot)
 
 disk_mb_per_day =
@@ -787,13 +808,13 @@ R0-005 intentionally persists no probe evidence. Any unexpected runtime artifact
 
 System-wide adapter counters, packet capture, payload capture, addresses, interface values, and endpoint values are prohibited. The implementation exposes acceptance-only aggregate accounting through its injected probe transport boundaries.
 
-For every admitted attempt, accounting records only probe kind, measured application bytes sent, measured application bytes received, and the deterministic conservative charged-byte amount from section 4.4. No payload or endpoint value is retained. Measured application bytes are exact byte counts crossing the injected transport boundary where available, and the charged amount is at least the fixed method value.
+For every started attempt, accounting records only probe kind, measured application bytes sent, measured application bytes received, and `charged_method_bytes` derived exclusively from the closed exact table in section 4.4. No payload or endpoint value is retained. Measured application bytes are exact byte counts crossing the injected transport boundary where available. For a recognized method, the charged value is exactly 128 for Gateway ICMP, 1,024 for DNS, 1,024 for TCP connect, or 8,192 for an HTTPS provider request. It is never supplied or overridden by a transport adapter, configuration, measurement, or platform-specific uplift.
 
 Concurrent HTTPS provider children are never coalesced. Each provider invocation has its own internal round/provider identity, token consumption, transport-start timestamp, sent/received/charged byte values, outcome, and phase membership. The reports aggregate those records without exposing provider IDs or endpoint values; concurrency changes neither the per-attempt formula nor completeness requirements.
 
 ```text
 attributed_attempt_network_bytes =
-  max(measured_sent + measured_received, charged_method_bytes)
+  max(measured_sent + measured_received, exact_charged_method_bytes)
 
 attributed_network_bytes =
   sum(attributed_attempt_network_bytes
@@ -804,7 +825,9 @@ network_bytes_per_minute =
   attributed_network_bytes / steady_state_minutes
 ```
 
-The pass condition is `network_bytes_per_minute < 100,000`, using decimal bytes/minute. Bytes from a steady-state attempt are included in full even when it completes during end drain; bytes are never split between phases. This is deterministic conservative probe-traffic attribution, not a claim of exact physical-wire or TLS/IP overhead measurement. Attempt counts are reported separately and packet capture remains prohibited. Counter overflow, negative byte values, missing accounting for a started attempt, or an unknown probe method fails the run.
+The pass condition is `network_bytes_per_minute < 100,000`, using decimal bytes/minute. Bytes from a steady-state attempt are included in full even when it completes during end drain; bytes are never split between phases. Different adapters that report identical measured sent/received counts must produce byte-identical attributed totals and reports. This is deterministic conservative probe-traffic attribution, not a claim of exact physical-wire or TLS/IP overhead measurement. Attempt counts are reported separately and packet capture remains prohibited.
+
+An unknown probe method has no table charge and can never pass acceptance. To keep the failing report and aggregate totals complete without inventing a charge, its internal accounting record uses the contract-defined zero sentinel for `charged_method_bytes`, includes its nonnegative measured sent plus received bytes in `attributed_network_bytes`, counts once under `attempts.by_probe_kind["unknown"]`, and adds `unknown_probe_method`. The zero sentinel is not a recognized charge and is not configurable or adapter-supplied. Missing, malformed, negative, nonintegral, adapter-supplied, overridden, or conflicting charged values for a recognized method add `attempt_accounting_incomplete` and fail; the report builder still derives the exact table value for deterministic totals. Counter overflow, negative or missing measured bytes, missing accounting for a started attempt, or any unknown method also fails. Human and JSON reports are rendered from the same derived charge table, attempt records, and totals.
 
 ### 8.8 Deterministic reports
 
@@ -840,7 +863,7 @@ The JSON has these exact top-level properties in this order:
 | `caps` | `readiness_ms`, `working_set_bytes`, `average_cpu_percent`, `disk_mb_per_day`, `network_bytes_per_minute`, `growth_percent`, `working_set_growth_noise_bytes`, `private_bytes_growth_noise_bytes`, `handle_growth_noise_count`, `thread_growth_noise_count` |
 | `result` | the string `pass` or `fail` |
 
-The table is normative for nested property presence and property order. `configuration.logical_processor_count` must exactly equal `host_profile.logical_processor_count`. The two new timing durations are nonnegative JSON integers in milliseconds. `startup.attributed_disk_bytes` and `steady_state.attributed_disk_bytes` are the nonnegative JSON integer results of the two snapshot pairs in section 8.6; `steady_state.disk_mb_per_day` is calculated only from the latter. `startup.attempts_*` values are nonnegative JSON integers for startup transport invocations and satisfy the same started/completed/outcome identities as the top-level steady-state attempt scalars. Queued work canceled before transport start appears in neither set of transport-attempt counts.
+The table is normative for nested property presence and property order. `configuration.logical_processor_count` must exactly equal `host_profile.logical_processor_count`. The two barrier timing durations are nonnegative JSON integers in milliseconds. `timing.steady_state_start_utc` represents the UTC correlation value captured for the exact monotonic baseline-bundle commit; `steady_state_end_utc` correlates to exactly the requested duration after that commit. `startup.total_cpu_ms`, `steady_state.average_normalized_cpu_percent`, `startup.attributed_disk_bytes`, and `steady_state.attributed_disk_bytes` all use the one committed boundary model in sections 8.1, 8.4, and 8.6. The disk integers are the results of the process-start/steady-state-start and steady-state-start/final snapshot pairs; `steady_state.disk_mb_per_day` is calculated only from the latter. `startup.attempts_*` values are nonnegative JSON integers for startup transport invocations and satisfy the same started/completed/outcome identities as the top-level steady-state attempt scalars. Queued work canceled before transport start appears in neither set of transport-attempt counts. The human report uses the identical baseline-bundle timestamp, CPU baseline, snapshot pairs, phase membership, exact method-charge derivation, and totals.
 
 ```text
 startup.attempts_completed =
@@ -986,6 +1009,8 @@ The top-level `attempts` object is scoped only to invocations whose transport-st
 
 Every HTTPS provider child counts as one `https` invocation even when children start concurrently. Concurrent children retain distinct internal attempt records through byte and outcome accounting; neither start-time equality nor a shared aggregate-round identity permits records, tokens, bytes, outcomes, or phase membership to be merged.
 
+For each recognized `by_probe_kind` invocation, the report model derives its exact charged bytes from the one section 4.4 table: `gateway_icmp` 128, `dns` 1,024, `tcp` 1,024, and `https` 8,192. The report never accepts an adapter-provided charge. An `unknown` invocation uses only the fixed zero sentinel and measured bytes defined in section 8.7, so totals serialize deterministically while the run remains failed. These derivations do not add per-attempt customer, provider, endpoint, or payload fields to the JSON contract.
+
 `attempts.by_outcome` contains exactly five entries in this order:
 
 | `code` | Definition |
@@ -1118,6 +1143,9 @@ Violation `attempt_accounting_incomplete` is mandatory when any of the following
 - one invocation is assigned to more than one outcome;
 - a started invocation has no outcome;
 - an outcome exists without a corresponding started invocation;
+- a recognized invocation lacks its exact table-derived charged value;
+- a recognized charged value is malformed, negative, nonintegral, adapter-supplied, overridden, or conflicts with the closed method table;
+- the configured-budget and acceptance-accounting charge tables differ;
 - `incomplete` is greater than zero.
 
 Violation `unknown_probe_method` is mandatory whenever `attempts.by_probe_kind["unknown"] > 0`. Both `attempt_accounting_incomplete` and `unknown_probe_method` appear when both conditions apply. Every applicable violation appears exactly once, and the `violations` array remains in ordinal code order.
@@ -1134,17 +1162,17 @@ The sampler exits nonzero when:
 - any static acceptance-host requirement is unsupported, required host metadata is missing, or a prohibited shared/CPU-quota-limited host is used;
 - the 60-second host preflight is missing a required sample, has average non-agent system CPU greater than or equal to 10.0%, or ends with less than 2,000,000,000 bytes available physical memory;
 - the process exits, the PID changes, or a replacement/restart occurs;
-- the start-barrier or end-drain deadline exceeds 10 seconds;
+- the complete start barrier from admission pause through baseline-bundle commit, or the end drain, exceeds 10 seconds;
 - an invocation starts at or after `steady_state_end`;
 - a sample is missing;
 - a required non-disk counter or network-accounting value is unavailable, negative, reset, or overflows;
-- a recursive runtime-file snapshot is incomplete, unreadable, contains an invalid length, overflows during subtraction or summation, escapes the monitored directory, or loses a baseline file;
+- a recursive runtime-file snapshot is incomplete, unstable within the bounded start barrier, unreadable, contains an invalid length, overflows during subtraction or summation, escapes the monitored directory, or loses a baseline file;
 - working set reaches or exceeds 150,000,000 bytes;
 - steady-state average CPU reaches or exceeds 2.0%;
 - disk reaches or exceeds 100 decimal MB/day;
 - network reaches or exceeds 100,000 bytes/minute;
 - any growth rule fails;
-- attempt accounting is incomplete under any mandatory `attempt_accounting_incomplete` condition in section 8.8;
+- attempt accounting, exact recognized-method charge derivation, or configured-budget/acceptance table consistency is incomplete under any mandatory `attempt_accounting_incomplete` condition in section 8.8;
 - an unknown probe method is encountered;
 - report serialization violates schema, property or array ordering, type, numeric, or privacy requirements;
 - synthetic-listener or acceptance cleanup fails.
@@ -1175,8 +1203,16 @@ Use fake transports, an injected clock, and deterministic jitter to cover:
 - every remaining state transition and each method threshold;
 - a documentation or generated-constant consistency check that fails if any cadence or threshold in the source-reconciliation table differs from the binding interval and threshold sections;
 - ordinary scheduler-level incomplete/canceled/rate-limited/method-unavailable outcomes not advancing operational state counters, including pre-start incomplete rounds remaining absent from attempt arrays;
-- no overlap of Gateway/DNS/TCP attempts or HTTPS aggregate rounds, fixed-delay scheduling, jitter bounds, no catch-up, timeouts, deadline, global concurrency, per-provider concurrency, and token-bucket burst/refill;
-- worst-case attempt-demand and charged-network formulas, DNS enabled/disabled behavior, provider-count effects, and double-precision boundaries immediately below, exactly at, and immediately above 60 attempts/minute and 100,000 charged bytes/minute as applicable;
+- no overlap of Gateway/DNS/TCP attempts or HTTPS aggregate rounds, fixed-delay scheduling, jitter bounds, no catch-up, timeouts, deadline, global concurrency, and per-provider concurrency;
+- successful activation creating exactly eight available tokens and an activation-time refill anchor, with the ninth otherwise eligible same-timestamp attempt unable to start;
+- exact lazy monotonic refill with zero credit before one full second when starting empty, one token available at exactly one second, exact fractional-credit retention, same-timestamp evaluations receiving no refill, and long elapsed duration capping at eight tokens;
+- one started attempt consuming exactly one token with no refund for any outcome, pre-start cancellation consuming none, slot waiting reserving no credit, token waiting reserving no slot, and monotonic reversal failing as an implementation invariant;
+- degradation and shutdown discarding token-bucket state, healthy restart/activation creating a new full bucket and anchor, and no prior credit surviving;
+- four concurrent HTTPS children using four initial tokens while respecting global concurrency four, stable same-timestamp provider order, deterministic starvation-free sustainable mixed demand under an injected clock, and coarse operating-system timer cadence having no effect;
+- worst-case attempt-demand and exact charged-network formulas, DNS enabled/disabled behavior, provider-count effects, and double-precision boundaries immediately below, exactly at, and immediately above 60 attempts/minute and 100,000 charged bytes/minute as applicable;
+- exact fixed charge for each supported method, a shared configured-budget/acceptance table with no drift, adapter charge overrides rejected, measured bytes below the exact charge using the table value, measured bytes above it using measured bytes, and integer/culture/platform-stable arithmetic;
+- two adapters with identical measured sent/received counts producing byte-identical totals and reports, each concurrent HTTPS provider receiving its own exact 8,192-byte charge, and deterministic totals immediately below, exactly at, and above 100,000 bytes/minute;
+- unknown methods always failing with the deterministic zero-sentinel/measured-byte representation, and missing, malformed, negative, nonintegral, supplied, overridden, or conflicting recognized-method charges failing deterministically;
 - exact budget boundaries with DNS enabled and disabled, including a configuration that is valid only when DNS is disabled;
 - rejection of 25 targets at 15 seconds, acceptance of a 25-target configuration with sufficiently long intervals, and the valid two-default-provider 25-target/60-second example;
 - all provider children in valid two-, three-, and four-provider HTTPS rounds starting without serial five-second waits when the required slots and tokens are available;
@@ -1208,8 +1244,8 @@ Use disposable local endpoints or fakes only. Cover:
 - local HTTPS status/body/redirect/streaming behavior with test certificates as appropriate;
 - two-, three-, and four-provider local HTTPS fan-out with concurrent all-timeout completion, partial success, global/per-provider limits, non-overlapping aggregate rounds, contention incompleteness, and sustained mixed-work fairness;
 - system-resolver adapter success/failure through a controlled abstraction;
-- scheduler activation after readiness and stop on readiness degradation;
-- restart rebinds static configuration, reconstructs enabled probes as `unknown`, and moves them to `baselining` only through scheduler activation after readiness;
+- scheduler activation after readiness creating one full process-local bucket, exact monotonic lazy refill during local fake/endpoint work, and prompt stop plus bucket discard on readiness degradation;
+- restart rebinds static configuration, reconstructs enabled probes as `unknown`, moves them to `baselining` only through scheduler activation after readiness, and creates a new full bucket/anchor without prior credit;
 - no probe journal/outbox calls and no database/schema artifacts;
 - no response body, DNS answer, endpoint, target, interface, or exception leakage.
 
@@ -1237,6 +1273,8 @@ Native acceptance must verify:
 - ICMP success when permitted and `icmp_unavailable` behavior when it is not;
 - cancellation and service stop complete within five seconds;
 - the 25-target resource sampler passes;
+- the start barrier commits one stable steady-state baseline bundle while admissions remain paused, with `steady_state_start` equal to that commit and no later pre-existing sampling-grid wait;
+- steady-state sampling is anchored at exact `steady_state_start + 5n seconds`, and startup/steady-state CPU and disk attribution share the committed boundary without an omitted or double-counted interval;
 - monitoring-ready is achieved within 60 seconds after network availability;
 - no inbound listener or firewall rule is added;
 - every synthetic listener and service acceptance artifact is cleaned up.
@@ -1248,16 +1286,18 @@ Changing Windows services, firewall policy, ICMP policy, certificates, or machin
 Deterministic automated tests must cover:
 
 - every CPU, growth, disk, network, rate-demand, and unit-conversion formula at values below, exactly at, and above each pass boundary, including values immediately below, exactly at, and immediately above 100 decimal MB/day;
-- fixed-rate five-second scheduling, no catch-up burst, the ten-second collection deadline, and fewer than 11 valid samples in a complete minute;
-- initialization/steady-state phase boundaries, all 30 complete minute assignments, and first/final five-minute median windows including the even-count median rule;
+- separately anchored pre-steady-state sampling and exact steady-state fixed-rate boundaries at `steady_state_start + 5n seconds`, no catch-up burst, the ten-second collection deadline, and fewer than 11 valid samples in a complete minute;
+- initialization/steady-state phase boundaries, `steady_state_start` equal to baseline-bundle commit rather than a later grid point, all 30 complete minute assignments anchored to that commit, and first/final five-minute median windows including the even-count median rule;
 - admission before start with transport start after `steady_state_start`, admission before end with transport start exactly at `steady_state_end`, and transport start one monotonic tick before `steady_state_end`;
-- start-drain success and timeout, end-drain success and timeout, exact half-open interval behavior, and deterministic `measurement_boundary_timeout` and `measurement_boundary_violation` codes;
+- a drain ending between pre-existing five-second grid points producing no baseline gap, complete start-barrier success/timeout including bounded stable-snapshot retry, end-drain success/timeout, exact half-open interval behavior, and deterministic `measurement_boundary_timeout` and `measurement_boundary_violation` codes;
+- start/end admission pauses consuming no pre-start token, issuing no refund, preserving the active bucket/anchor, and allowing elapsed barrier time to refill lazily only to the eight-token cap before post-resume dispatch;
 - no byte splitting, full bytes from a steady-state attempt that completes during end drain, startup attempts excluded from top-level attempts, and queued pre-start/end work excluded from transport-attempt arrays;
-- process CPU and network attribution through end drain, disk attribution through the process-start/start-barrier/final recursive snapshots, and growth windows excluding drain samples;
+- process CPU and network attribution through end drain, disk attribution through the process-start/committed-steady-state-start/final recursive snapshots, and growth windows excluding drain samples;
+- CPU consumed before baseline-bundle commit counted startup-only, CPU consumed after commit counted steady-state-only, file growth before the committed snapshot counted startup-only, file growth after it counted steady-state-only, and no CPU or file-growth interval omitted, duplicated, or assigned to both phases;
 - 80,000 process/network write bytes per minute with zero runtime-file growth producing zero `attributed_disk_bytes` and zero `disk_mb_per_day`, proving that aggregate process I/O counters are not disk inputs;
 - new-file and existing-file growth summing correctly, unchanged and same-size rewritten files contributing zero, file shrinkage contributing zero, and a disappearing baseline file failing;
-- startup and steady-state disk attribution using their separate snapshot pairs, with identical disk values/calculations in JSON and human reports;
-- unreadable or incomplete snapshots, invalid lengths, arithmetic overflow, directory escape/reparse escape, and each corresponding bounded runtime-file violation;
+- startup and steady-state disk attribution using their separate pairs around the one committed snapshot, with timing, CPU, disk, attempts, network, and phase-boundary values/calculations identical in JSON and human reports;
+- an unstable/incomplete steady-state-start snapshot, unreadable or incomplete snapshots, invalid lengths, arithmetic overflow, directory escape/reparse escape, bounded retry/deadline exhaustion, and each corresponding bounded runtime-file violation;
 - PID change, process exit, restart, negative/zero/reset/unavailable/overflowed non-disk counters, unknown methods, and missing started-attempt accounting;
 - decimal-byte, decimal-MB/day, bytes/minute, millisecond, percentage, and logical-processor normalization;
 - every stable resource violation code and ordinal violation ordering;
@@ -1272,15 +1312,18 @@ Deterministic automated tests must cover:
 - mutually exclusive probe-kind assignment and mutually exclusive outcome assignment for every invocation;
 - every started invocation receiving exactly one outcome and rejection of an outcome without a corresponding started invocation;
 - separate accounting for every HTTPS provider request;
+- exact fixed charge derivation for every supported method, adapter charge input/override rejection, measured-below-table and measured-above-table attribution, and one shared configured-budget/acceptance table without drift;
+- byte-identical totals and reports from different adapters with identical measured bytes, one exact 8,192-byte charge per concurrent HTTPS provider, and deterministic network totals immediately below, exactly at, and above the 100,000-byte/minute boundary;
 - route/interface discovery remaining outside transport-invocation counts;
 - cancellation before transport invocation not counting as started and cancellation after start counting only as `canceled`;
 - timeout counting only as `timed_out` and ordinary failure counting only as `failed`;
 - attempt-level incomplete adding `attempt_accounting_incomplete` and failing acceptance;
 - scheduler-level pre-start incomplete remaining absent from both attempt arrays and not incrementing `attempts.started`;
-- an unknown method counting under `unknown` and adding `unknown_probe_method`;
+- an unknown method counting under `unknown`, using the deterministic zero-sentinel/measured-byte failing representation, adding `unknown_probe_method`, and never passing acceptance;
+- missing, malformed, negative, nonintegral, adapter-supplied, overridden, and conflicting charged values for recognized methods adding `attempt_accounting_incomplete` while totals remain table-derived;
 - both `attempt_accounting_incomplete` and `unknown_probe_method` appearing exactly once and in ordinal order when both apply;
 - byte-for-byte stable JSON for identical report models;
-- identical attempt counts in the human and JSON reports;
+- identical attempt counts, exact method-charge-derived network totals, timing boundaries, startup values, steady-state values, and disk values in the human and JSON reports;
 - privacy exclusion of machine names, usernames, domain membership, serials, device UUIDs, product keys, MAC/IP addresses, disk serials, cloud instance IDs, arbitrary environment variables, absolute paths, endpoints, targets, interfaces, DNS answers, DNS-correlation snapshot fields, payloads, headers, bodies, exception text, credentials, and customer identifiers, including identical exclusions in JSON and human disk evidence;
 - deterministic `host_profile` property order and rejection of missing or additional host-profile fields;
 - synthetic-listener and acceptance cleanup success/failure.
