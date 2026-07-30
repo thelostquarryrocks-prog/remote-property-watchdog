@@ -54,7 +54,7 @@ R0-005 runs before R0-006 registration. Therefore:
 - It must not call `AppendProbeSampleAsync` or `AppendMaterialEventAsync`.
 - It must not create schema version 2, add probe tables, repurpose session identifiers as cloud identity, or write probe state into the R0-004 journal/outbox.
 - Static configuration, schedules, state, counters, transition history, and flapping evidence exist in process memory only.
-- On every process restart, configuration is rebound from startup sources, every enabled probe returns to `baselining`, and all failure, recovery, rate, and flapping counters reset.
+- On every process restart, configuration is rebound from startup sources and every enabled probe is reconstructed as `unknown`. Scheduler activation after readiness moves it to `baselining` and clears all failure, recovery, rate, and flapping counters.
 - Durable probe evidence begins only after authenticated identity and tenant/property association are available in a later task. That later task must define migration and replay semantics rather than retroactively adopting pre-registration observations.
 
 This deliberate non-persistence is recorded in [ADR-010](../adr/ADR-010-pre-registration-probe-boundary.md).
@@ -207,9 +207,9 @@ ICMP is the only network reachability method in R0-005. The implementation must 
 - ICMP timeout or unreachable: counted failure;
 - ICMP unavailable because the platform, API, or permissions do not permit it: `icmp_unavailable`, not a failure.
 
-`icmp_unavailable` retains route evidence and cannot by itself move a target to `offline`. Before any successful method result, the state remains `baselining` (`Unknown` projection). From `healthy`, it lowers confidence to `suspect` (`Degraded` projection) without incrementing the failure counter. From `suspect` or `recovering`, state and counters remain unchanged. An already `offline` state remains offline until an actual success begins recovery.
+`icmp_unavailable` retains route evidence and cannot by itself move a target to `offline`. When `icmp_unavailable` occurs before any successful method result while the target is `baselining`, the state remains `baselining` (`Unknown` projection). From `healthy`, it lowers confidence to `suspect` (`Degraded` projection) without incrementing either gateway failure streak. From `baselining`, `suspect`, `recovering`, or `offline`, state and counters remain unchanged. An already `offline` state remains offline until an actual success begins recovery.
 
-The missing-active-interface/default-route threshold is two consecutive rounds. The ICMP timeout/unreachable threshold is three consecutive counted failures. A success by the applicable method resets its counter; switching failure classifications does not combine the two thresholds.
+The missing-active-interface/default-route threshold is two consecutive rounds. The ICMP timeout/unreachable threshold is three consecutive counted failures. A successful gateway round resets both gateway failure streaks. A missing-route failure resets the ICMP streak before incrementing the missing-route streak, and an ICMP timeout/unreachable resets the missing-route streak before incrementing the ICMP streak. The two classifications therefore form separate consecutive streaks and never combine toward either threshold.
 
 ### 3.2 DNS
 
@@ -235,7 +235,7 @@ Aggregation is deterministic:
 
 1. If cancellation, the deadline, or capacity prevents even one configured endpoint from starting, or prevents an admitted endpoint from producing a classified transport result, the logical round is `incomplete`; operational state-machine counters and state do not change. An endpoint invocation that never starts does not enter attempt accounting. An invocation that starts is still accounted separately at attempt level: a classified timeout is `timed_out`, while an invocation with no terminal outcome when accounting closes is attempt-level `incomplete` and fails acceptance under section 8.7.
 2. If every endpoint completes and at least one succeeds, the aggregate round succeeds.
-3. If every endpoint completes, at least one succeeds, and at least one fails, emit `partial_endpoint_failure`; reset the aggregate failure counter and apply a success transition. Do not create an incident or change the user-facing state because of the failed provider.
+3. If every endpoint completes, at least one succeeds, and at least one fails, emit `partial_endpoint_failure`; reset the aggregate failure streak and apply a success transition. Do not create an incident or change the user-facing state because of the failed provider.
 4. If every endpoint completes and all fail exclusively during DNS resolution while the independent DNS probe is failing, emit `blocked_by_dns`; the HTTPS aggregate round is incomplete, not failed, and its counter/state do not change.
 5. If every endpoint completes and none succeeds for any other combination of reasons, the aggregate round fails.
 
@@ -253,7 +253,7 @@ The TCP offline threshold is two consecutive counted failures.
 
 ### 4.1 Activation and degradation
 
-The scheduler may activate only after R0-004 reports both journal readiness and formal service readiness. Enabled targets then enter `baselining`, and their first rounds become due immediately through the same global controls as later work.
+The scheduler may activate only after R0-004 reports both journal readiness and formal service readiness. A configured logical target is constructed as `unknown`. Activation moves it from `unknown` to `baselining`, clears every failure streak, recovery progress, and flapping history, and makes its first round due immediately through the same global controls as later work. No transport round may be dispatched or reduced while a target remains `unknown`; a round result observed for an `unknown` target is an implementation invariant failure, not an operational transition.
 
 If journal health or formal service readiness becomes false:
 
@@ -264,7 +264,7 @@ If journal health or formal service readiness becomes false:
 - do not collect, log, buffer, persist, or emit observations while degraded;
 - do not recreate the journal, restore readiness, or invent writes from R0-005.
 
-Recovery of probe execution requires a healthy process restart. On restart, all enabled targets begin at `baselining`.
+Recovery of probe execution requires a healthy process restart. On restart, all enabled targets are reconstructed as `unknown` and enter `baselining` only through scheduler activation after readiness.
 
 Known R0-004 limitation: a simultaneous journal failure and lifecycle-marker write failure can leave the durable readiness marker stale until restart, although in-process readiness is false. R0-005 must trust the in-process false state and stop.
 
@@ -377,24 +377,75 @@ No fixed unbounded sleep or real multi-minute wait is allowed. Timing-sensitive 
 
 ## 5. State machine
 
-Every enabled logical target starts `unknown`, moves to `baselining` when the ready scheduler activates it, and then uses this exact transition table:
+### 5.1 State variables and activation invariant
 
-| Current state | Round result | Next state | Counter effect |
-| --- | --- | --- | --- |
-| `baselining` | success | `healthy` | reset failures |
-| `baselining` | counted failure below threshold | `suspect` | increment failures |
-| `baselining` or `suspect` | counted failure reaches threshold | `offline` | increment failures |
-| `healthy` | counted failure | `suspect` | set failures to 1 |
-| `suspect` | success | `healthy` | reset failures |
-| `offline` | success | `recovering` | reset failures; recovery successes = 1 |
-| `recovering` | success | `healthy` | recovery successes = 2; reset |
-| `recovering` | counted failure | `offline` | reset recovery; set consecutive failures to 1 |
-| Gateway `healthy` | `icmp_unavailable` | `suspect` | failure counter unchanged |
-| any | incomplete/non-counting result | unchanged | unchanged |
+The six operational states remain `unknown`, `baselining`, `healthy`, `suspect`, `offline`, and `recovering`.
 
-Every success resets the relevant consecutive-failure counter. Reaching a threshold means `>=` the method-specific threshold.
+DNS, the HTTPS aggregate, and each TCP target maintain one consecutive-failure streak. The streak is bounded by saturation at that method's offline threshold. Gateway maintains two separate streaks: one consecutive missing-route streak with threshold 2 and one consecutive ICMP timeout/unreachable streak with threshold 3. The gateway streaks never combine.
 
-Canceled, rate-limited, superseded, configuration-invalid, deadline-incomplete, capacity-incomplete, and method-unavailable scheduler/state-machine results are not transport failures. Ordinary scheduler-level incomplete rounds, including rounds that become incomplete before any transport begins, do not advance failure or recovery counters. This operational rule does not excuse a started transport invocation from attempt-level outcome accounting. The gateway confidence-only `healthy` to `suspect` transition above is the sole non-counting state change.
+Each logical target also has one recovery-success count. It is meaningful only while the target is `recovering` and is zero in every other state.
+
+Activation is separate from round processing:
+
+- a configured logical target is constructed as `unknown`;
+- scheduler activation after readiness moves it from `unknown` to `baselining`;
+- activation clears all failure streaks, recovery progress, and flapping history;
+- no transport round may be dispatched or reduced while the target remains `unknown`;
+- a round result observed for an `unknown` target is an implementation invariant failure, not another operational transition.
+
+### 5.2 Failure-streak rules and thresholds
+
+The state reducer applies these rules in order:
+
+1. A counted failure increments the applicable failure streak before testing its threshold.
+2. A failure is below threshold when the post-increment applicable streak is less than the threshold.
+3. A failure reaches threshold when the post-increment applicable streak is greater than or equal to the threshold.
+4. Failure streaks saturate at their thresholds and never grow without bound.
+5. For Gateway, a missing-route failure increments the missing-route streak and resets the ICMP timeout/unreachable streak to zero. An ICMP timeout/unreachable increments the ICMP streak and resets the missing-route streak to zero. Changing gateway failure classification therefore starts a new consecutive streak and cannot combine prior failures.
+6. A successful round resets all failure streaks for that logical target.
+7. An incomplete or other non-counting round leaves all failure streaks unchanged.
+8. Any counted failure resets recovery progress to zero.
+9. A successful transition from `offline` sets recovery successes to 1.
+10. The next consecutive success from `recovering` completes recovery and returns the logical target to `healthy`; after the transition, recovery successes reset to zero.
+
+The R0-005 offline thresholds remain:
+
+| Logical target and failure classification | Threshold |
+| --- | ---: |
+| Gateway missing active interface/default route | 2 |
+| Gateway ICMP timeout/unreachable | 3 |
+| DNS | 2 |
+| HTTPS aggregate | 2 |
+| TCP | 2 |
+
+### 5.3 Total active-state transition table
+
+After activation, the reducer uses this total transition table:
+
+| Current state | Round result | Next state | Failure-counter effect | Recovery-counter effect |
+| --- | --- | --- | --- | --- |
+| `baselining` | success | `healthy` | reset all failure streaks | reset to 0 |
+| `baselining` | counted failure below threshold | `suspect` | increment applicable streak; apply gateway exclusivity when applicable | reset to 0 |
+| `baselining` | counted failure reaches threshold | `offline` | increment and saturate applicable streak; apply gateway exclusivity when applicable | reset to 0 |
+| `healthy` | success | `healthy` | reset all failure streaks | reset to 0 |
+| `healthy` | counted failure | `suspect` | set applicable streak to 1; reset incompatible gateway streak | reset to 0 |
+| `suspect` | success | `healthy` | reset all failure streaks | reset to 0 |
+| `suspect` | counted failure below threshold | `suspect` | increment applicable streak; apply gateway exclusivity when applicable | reset to 0 |
+| `suspect` | counted failure reaches threshold | `offline` | increment and saturate applicable streak; apply gateway exclusivity when applicable | reset to 0 |
+| `offline` | success | `recovering` | reset all failure streaks | set to 1 |
+| `offline` | counted failure | `offline` | increment and saturate applicable streak; apply gateway exclusivity when applicable | reset to 0 |
+| `recovering` | success | `healthy` | reset all failure streaks | record second success, then reset to 0 |
+| `recovering` | counted failure | `offline` | set applicable streak to 1; reset incompatible gateway streak | reset to 0 |
+| any active state | incomplete or ordinary non-counting result | unchanged | unchanged | unchanged |
+| Gateway `healthy` | `icmp_unavailable` | `suspect` | unchanged | reset to 0 |
+
+For the final two rows, an active state is exactly `baselining`, `healthy`, `suspect`, `offline`, or `recovering`.
+
+The Gateway `healthy` plus `icmp_unavailable` row is the sole exception to the general non-counting/unchanged row and takes precedence over it. For Gateway `baselining`, `suspect`, `recovering`, or `offline`, `icmp_unavailable` leaves state and counters unchanged. `offline` remains `offline` after every counted failure and can begin recovery only after a successful round. Repeated success in `healthy` remains `healthy`, and repeated below-threshold failures in `suspect` remain `suspect`. These self-transitions do not count as flapping transitions because the state does not change.
+
+Every method-specific successful logical round uses the success rows. This includes partial HTTPS provider failure when at least one provider succeeds, repeated normal success while already `healthy`, success that begins recovery from `offline`, and the second consecutive success that completes recovery.
+
+Cancellation, rate limitation, supersession, configuration invalidity, capacity incompleteness, deadline incompleteness, method unavailability, and scheduler-level incomplete rounds do not advance failure or recovery counters. The only non-counting state change is Gateway `healthy` plus `icmp_unavailable` to `suspect`. This operational rule does not excuse a started transport invocation from attempt-level outcome accounting.
 
 State is observational, not causal. `offline` means repeated technical failure; it does not prove disconnection, sabotage, intrusion, or intent.
 
@@ -404,6 +455,7 @@ A logical target is flapping when at least four state transitions among `healthy
 
 - Entry into `unknown` or `baselining` is not qualifying.
 - Repeated rounds that leave state unchanged are not transitions.
+- In particular, repeated success in `healthy`, below-threshold failure in `suspect`, and counted failure in `offline` do not add flapping transitions.
 - The flag clears after 20 consecutive minutes without a qualifying transition.
 - History is bounded to timestamps needed for the current ten-minute window plus the last qualifying transition.
 - Time comes from the injected clock.
@@ -784,8 +836,24 @@ The sampler exits nonzero when:
 
 Use fake transports, an injected clock, and deterministic jitter to cover:
 
-- every state transition and each method threshold;
-- success counter reset and two-success recovery;
+- table-driven activation from `unknown` to `baselining`;
+- no round dispatch or reduction in `unknown`, with an observed result treated as an invariant failure;
+- `healthy` plus success remaining `healthy`;
+- `suspect` plus a below-threshold counted failure remaining `suspect`;
+- Gateway ICMP failures 1, 2, and 3 producing `suspect`, `suspect`, and `offline`;
+- repeated counted failure while `offline` remaining `offline`;
+- `offline` plus success becoming `recovering`;
+- `recovering` plus success becoming `healthy`;
+- `recovering` plus a counted failure returning to `offline`;
+- failure-streak saturation at every method threshold;
+- success resetting every applicable failure streak;
+- Gateway missing-route and ICMP streaks resetting one another rather than combining;
+- non-counting results preserving state and counters;
+- `icmp_unavailable` precedence from every Gateway active state;
+- self-transitions not adding flapping transitions;
+- every reachable active-state/result pair appearing exactly once in the effective transition model;
+- a table-driven completeness test that fails when a reachable pair lacks an explicit rule;
+- every remaining state transition and each method threshold;
 - ordinary scheduler-level incomplete/canceled/rate-limited/method-unavailable outcomes not advancing operational state counters, including pre-start incomplete rounds remaining absent from attempt arrays;
 - no overlap, fixed-delay scheduling, jitter bounds, no catch-up, timeouts, deadline, global concurrency, per-target concurrency, and token-bucket burst/refill;
 - worst-case attempt-demand and charged-network formulas, provider-count effects, and double-precision boundaries immediately below, exactly at, and immediately above 60 attempts/minute and 100,000 charged bytes/minute as applicable;
@@ -810,7 +878,7 @@ Use disposable local endpoints or fakes only. Cover:
 - local HTTPS status/body/redirect/streaming behavior with test certificates as appropriate;
 - system-resolver adapter success/failure through a controlled abstraction;
 - scheduler activation after readiness and stop on readiness degradation;
-- restart rebinds static configuration and returns enabled probes to `baselining`;
+- restart rebinds static configuration, reconstructs enabled probes as `unknown`, and moves them to `baselining` only through scheduler activation after readiness;
 - no probe journal/outbox calls and no database/schema artifacts;
 - no response body, DNS answer, endpoint, target, interface, or exception leakage.
 
@@ -892,7 +960,7 @@ Deferred integration after authenticated identity exists must specify tenant own
 
 ## 11. Known limitation
 
-Pre-registration configuration and all operational evidence are intentionally volatile. Restart or readiness degradation loses counters, transitions, and flapping history and returns enabled targets to `baselining`. In addition, the inherited R0-004 limitation remains: simultaneous journal and lifecycle-marker failure can leave the durable marker stale until restart even though in-process readiness is false. R0-005 must stop on that in-process false state.
+Pre-registration configuration and all operational evidence are intentionally volatile. Restart or readiness degradation loses counters, transitions, and flapping history. Restart reconstructs enabled targets as `unknown`; scheduler activation after readiness moves them to `baselining`. In addition, the inherited R0-004 limitation remains: simultaneous journal and lifecycle-marker failure can leave the durable marker stale until restart even though in-process readiness is false. R0-005 must stop on that in-process false state.
 
 ## 12. Delivery boundary
 
