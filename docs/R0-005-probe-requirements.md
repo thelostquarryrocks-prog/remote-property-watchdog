@@ -21,9 +21,31 @@ The implementation must not silently broaden these decisions.
 
 ### Source precedence and reconciliation
 
-This resolution applies repository precedence in this order: `AGENTS.md`, the assigned task and dependency tasks, repository Markdown, accepted ADRs, executable contracts/tests, and the three approved planning references (Technical Feasibility, Data Model/API, and MVP Backlog). The reference files were inspected structurally and were not modified.
+This resolution applies repository precedence in this order: `AGENTS.md`, the assigned task and dependency tasks, repository Markdown, accepted ADRs, executable contracts/tests, and the three approved planning references (Technical Feasibility, Data Model/API, and MVP Backlog). The reference files were inspected structurally and were not modified. In particular, this document does not modify or claim to rewrite the approved `Remote_Property_Watchdog_Technical_Feasibility_Prototype_Spec_v0.1.docx` source.
 
-No unresolved conflict was found. The deliberate reconciliations are:
+Technical Feasibility section 7.2 contains prototype planning heuristics that are deliberately superseded by this binding contract for R0-005 only. The material cadence and threshold differences are:
+
+| Concern | Technical Feasibility prototype | Binding R0-005 decision |
+| --- | --- | --- |
+| Gateway cadence | 15 seconds | 30-second base interval with ±10% jitter |
+| Gateway threshold | 3 failures | missing route 2; ICMP timeout/unreachable 3 |
+| DNS threshold | 3 failures | 2 counted failures |
+| HTTPS threshold | all endpoints fail for 3 rounds | aggregate counted failure for 2 rounds |
+| TCP-service threshold | 3 failures | 2 counted failures |
+
+These are deliberate R0-005 decisions affecting detection latency and false-positive tradeoffs. The feasibility document is a prototype planning source, not the executable R0-005 implementation contract. R0-005 must also satisfy constraints and semantics that the earlier heuristic does not define: fixed-delay scheduling from completion, ±10% jitter, a global 60-attempt/minute limit, a strict charged-network budget, up to 25 explicit TCP targets, independent DNS state, multi-provider HTTPS aggregation, partial-success handling, DNS-blocked handling, incomplete-round handling, and the prohibition on user incident or notification emission.
+
+The binding rationales are:
+
+- The 30-second Gateway, DNS, and HTTPS cadence preserves capacity for 25 configured targets under the global attempt and charged-network budgets and reduces always-on background traffic.
+- A missing active interface or default route is higher-confidence local evidence than an ICMP timeout or unreachable response. Missing-route evidence therefore uses threshold 2, while ICMP retains threshold 3.
+- DNS uses threshold 2 because it remains an independently exposed local state and cannot alone declare the HTTPS aggregate offline.
+- HTTPS uses threshold 2 because a counted aggregate failure requires every configured provider attempt to start and complete with no success. Partial provider success, `blocked_by_dns`, correlation-unavailable rounds, cancellation, and capacity/deadline incompleteness do not count toward that threshold.
+- TCP uses threshold 2 because every target is one explicitly configured host/port service and R0-005 creates no user incident or alert. Later notification policy may add user-facing debounce without changing the local technical evidence.
+
+Nominal base-interval multiples are not detection-time service-level agreements. Actual elapsed detection time also includes completion-based scheduling, jitter, admission delay, transport timeout, and logical-round deadlines.
+
+The remaining deliberate reconciliations are:
 
 - Technical Feasibility supplies the approved resource caps, 25-target boundary, three-check “protected” concept, and later seven-day soak. R0-005 adopts the caps and target count but keeps “protected,” alert truth, and the long soak outside its local operational-state merge gate.
 - Data Model/API supplies the broader persisted state vocabulary. R0-005 maps to it without changing contracts and defers durability until authenticated identity exists.
@@ -146,6 +168,44 @@ An operator may override the full HTTPS provider set at startup, subject to all 
 - if an exact body is configured, at most 256 bytes plus one overflow-detection byte are read, compared without normalization, and discarded;
 - endpoint bodies, headers, hostnames, URLs, DNS answers, and `operator_id` values never enter logs, persistence, probe evidence, health output, support output, or metrics.
 
+#### Registrable-domain normalization and pinned suffix data
+
+HTTPS provider hosts must be DNS names. IPv4 and IPv6 literals are invalid for HTTPS providers even though explicit TCP targets may use IP literals. Provider-host normalization is deterministic and occurs before host uniqueness and registrable-domain validation:
+
+1. Trim exactly one optional terminal dot.
+2. Reject an empty result, empty labels, consecutive dots, whitespace, control characters, or other invalid DNS syntax.
+3. Convert each Unicode label independently to ASCII with .NET 10 `System.Globalization.IdnMapping` and `UseStd3AsciiRules = true`.
+4. Lowercase the resulting ASCII form using invariant rules.
+5. Enforce the normal DNS limits after ASCII conversion: each label is 1–63 octets and the complete name is at most 253 ASCII characters excluding the optional terminal dot.
+
+R0-005 pins the following official Public Suffix List snapshot:
+
+| Field | Binding value |
+| --- | --- |
+| Official upstream repository | <https://github.com/publicsuffix/list> |
+| Full upstream commit SHA | `e1b8015c3b2f0f4f8c18659c2480fc1a22c07b20` |
+| Source file | `public_suffix_list.dat` |
+| File SHA-256 | `fe6adc7fb8014f57d28d69b18d0aa3e581efb432544922e12131a5d4a87bd954` |
+| License | Mozilla Public License 2.0 (`MPL-2.0`) |
+| Included sections | ICANN and PRIVATE |
+
+This source was independently verified on 2026-07-30: the official repository's Git `HEAD` and GitHub API `main` commit both resolved to the full SHA above; the raw file bytes produced the recorded SHA-256; the file contained one complete ICANN section and one complete PRIVATE section; and the repository `LICENSE` and GitHub license metadata identified MPL-2.0.
+
+The future implementation must vendor the exact `public_suffix_list.dat` bytes identified by that commit and SHA-256. Suffix processing performs no startup download, background refresh, network access, or automatic data update. Configuration validity therefore cannot change without a reviewed repository update.
+
+Public-suffix matching must implement the official Public Suffix List algorithm:
+
+- process exact, wildcard, and exception rules;
+- choose the prevailing rule according to the official algorithm;
+- include both the ICANN and PRIVATE sections;
+- apply the implicit `*` rule only as defined by that algorithm.
+
+The registrable domain is the label immediately preceding the prevailing public suffix plus that suffix. A host that is itself a public suffix, or that has no registrable label, is invalid. All configured provider hosts must produce distinct normalized registrable domains under ordinal case-insensitive comparison.
+
+This pinned snapshot remains binding for R0-005. Any suffix-data update requires a reviewed requirements change, a new full upstream commit SHA, a new file SHA-256, license review, security review, and full configuration-boundary regression tests. Existing deployed configuration must not be silently reinterpreted by a live list update.
+
+This documentation correction authorizes no new production package. If implementation requires a parser dependency instead of a repository-owned parser, stop for explicit package, license, security, and vulnerability approval. No dependency may fetch suffix data at runtime.
+
 Runtime validation deterministically enforces unique provider IDs, unique endpoint hosts, at least two registrable domains, and at least two distinct declared operators. Configuration errors remain bounded and must not echo an operator identifier, endpoint, host, URL, or other customer-controlled value.
 
 This validation is intentionally structural. Runtime can enforce declared-operator and registrable-domain diversity, but registrable-domain separation alone does not prove provider independence and network probing cannot prove real-world corporate ownership. The configuration author is responsible for declaring `operator_id` accurately. The built-in Google and Cloudflare declarations are reviewed defaults; a custom override that falsely declares ownership is configuration-author error that the agent cannot discover through probing. Separately operated providers remain an architectural and operator responsibility.
@@ -219,9 +279,27 @@ Success requires a valid A or AAAA result within two seconds. Timeout, resolver 
 
 A DNS-only failure cannot declare the HTTPS aggregate or total internet state offline. Consumers must be able to see DNS state independently.
 
+After every completed DNS logical round, the DNS reducer atomically publishes one immutable process-local DNS-correlation snapshot. It contains only:
+
+- a strictly increasing process-local DNS round sequence;
+- the monotonic DNS round-completion timestamp;
+- the DNS round classification: `success`, `counted_failure`, or `non_counting`;
+- the resulting DNS operational state.
+
+These fields are internal coordination data. They must not enter logs, health output, resource reports, durable evidence, support output, or metrics. When the DNS probe is disabled, no DNS-correlation snapshot is published or expected.
+
 ### 3.3 HTTPS aggregate
 
 One logical HTTPS round attempts every configured provider, subject to global limits and the logical-round deadline.
+
+At the HTTPS logical-round start timestamp, the reducer captures exactly one immutable copy of the most recent published DNS snapshot whose completion timestamp is less than or equal to the HTTPS round start. A DNS round that completes after the HTTPS round starts can never alter that HTTPS round. Snapshot age uses only the injected monotonic clock:
+
+```text
+dns_snapshot_age =
+  https_round_start - dns_snapshot_completion
+```
+
+A captured snapshot is fresh when `dns_snapshot_age <= 60 seconds`; the exact 60-second boundary is fresh. A negative age, timestamp reversal, or non-increasing DNS round sequence is an implementation invariant failure, not an inferred operational classification.
 
 An endpoint succeeds only when:
 
@@ -233,11 +311,17 @@ An endpoint succeeds only when:
 
 Aggregation is deterministic:
 
-1. If cancellation, the deadline, or capacity prevents even one configured endpoint from starting, or prevents an admitted endpoint from producing a classified transport result, the logical round is `incomplete`; operational state-machine counters and state do not change. An endpoint invocation that never starts does not enter attempt accounting. An invocation that starts is still accounted separately at attempt level: a classified timeout is `timed_out`, while an invocation with no terminal outcome when accounting closes is attempt-level `incomplete` and fails acceptance under section 8.7.
+1. If cancellation, the deadline, or capacity prevents even one configured endpoint from starting, or prevents an admitted endpoint from producing a classified transport result, the logical round is `incomplete`; operational state-machine counters and state do not change. An endpoint invocation that never starts does not enter attempt accounting. An invocation that starts is still accounted separately at attempt level: a classified timeout is `timed_out`, while an invocation with no terminal outcome when accounting closes is attempt-level `incomplete` and fails acceptance under section 8.8.
 2. If every endpoint completes and at least one succeeds, the aggregate round succeeds.
 3. If every endpoint completes, at least one succeeds, and at least one fails, emit `partial_endpoint_failure`; reset the aggregate failure streak and apply a success transition. Do not create an incident or change the user-facing state because of the failed provider.
-4. If every endpoint completes and all fail exclusively during DNS resolution while the independent DNS probe is failing, emit `blocked_by_dns`; the HTTPS aggregate round is incomplete, not failed, and its counter/state do not change.
-5. If every endpoint completes and none succeeds for any other combination of reasons, the aggregate round fails.
+4. If every endpoint completes and all providers fail exclusively during DNS resolution, apply exactly one of these mutually exclusive reductions using the snapshot captured at HTTPS round start:
+   - DNS probe disabled: no snapshot is expected and `blocked_by_dns` is unavailable; reduce the HTTPS aggregate as an ordinary counted HTTPS failure.
+   - No snapshot or stale snapshot: classify the HTTPS logical round as incomplete with `dns_correlation_unavailable`; do not advance HTTPS failure or recovery counters.
+   - Fresh snapshot classified `non_counting`: classify the HTTPS logical round as incomplete with `dns_correlation_unavailable`; do not advance HTTPS counters.
+   - Fresh snapshot classified `counted_failure` whose resulting DNS state is `suspect` or `offline`: classify the HTTPS round as `blocked_by_dns`; do not advance HTTPS counters.
+   - Fresh snapshot classified `success`: reduce the all-provider DNS-resolution failure as an ordinary counted HTTPS failure.
+   - Any snapshot classification/resulting-state combination not permitted above is an implementation invariant failure rather than an inferred classification.
+5. If every endpoint completes and none succeeds for any other combination of reasons, the aggregate round is an ordinary counted HTTPS failure.
 
 The HTTPS aggregate offline threshold is two consecutive counted failures. A single provider can never independently declare the aggregate offline.
 
@@ -283,6 +367,8 @@ After a round finishes, its next due time is:
 
 Jitter comes from an injected deterministic source in tests. Scheduling uses fixed delay from completion, does not overlap the same logical target, and does not catch up or burst after delay, sleep, or backpressure.
 
+Nominal threshold × base-interval calculations are not elapsed-time guarantees or service-level agreements because completion-based delay, jitter, admission delay, transport timeouts, and the logical-round deadline also contribute.
+
 ### 4.3 Timeouts and deadline
 
 | Operation | Timeout |
@@ -293,7 +379,7 @@ Jitter comes from an injected deterministic source in tests. Scheduling uses fix
 | Each HTTPS endpoint | 5 seconds |
 | Any logical round, including capacity/rate waiting | 10 seconds |
 
-There is no retry within a round. A timed-out transport that was actually started is a counted failure. A logical round that expires before all required attempts can start or complete is a scheduler-level incomplete outcome and does not change operational state-machine counters or state. A required transport that never starts does not enter attempt accounting; any transport invocation that did start remains subject to the attempt-level closure rules in section 8.7.
+There is no retry within a round. A timed-out transport that was actually started is a counted failure. A logical round that expires before all required attempts can start or complete is a scheduler-level incomplete outcome and does not change operational state-machine counters or state. A required transport that never starts does not enter attempt accounting; any transport invocation that did start remains subject to the attempt-level closure rules in section 8.8.
 
 ### 4.4 Capacity, configured budgets, and token consumption
 
@@ -312,16 +398,22 @@ Configuration validation calculates the worst-case demand atomically before sche
 Using double-precision arithmetic without rounding down before comparison:
 
 ```text
-gateway_demand = 60 / 27
-dns_demand = 60 / 27
-https_demand = provider_count × (60 / 27)
-tcp_target_demand = 60 / minimum_possible_tcp_interval_seconds
+dns_enabled_indicator =
+  1 when DNS probe is enabled
+  0 when DNS probe is disabled
+
+gateway_attempt_demand = 60 / 27
+dns_attempt_demand = dns_enabled_indicator × (60 / 27)
+https_attempt_demand = provider_count × (60 / 27)
+tcp_attempt_demand =
+  sum(60 / minimum_possible_tcp_interval_seconds
+      for every enabled TCP target)
 
 worst_case_attempts_per_minute =
-    gateway_demand
-  + dns_demand
-  + https_demand
-  + sum(all enabled tcp_target_demand values)
+    gateway_attempt_demand
+  + dns_attempt_demand
+  + https_attempt_demand
+  + tcp_attempt_demand
 ```
 
 Configuration is valid only when `worst_case_attempts_per_minute <= 60`. Excess demand rejects the entire configuration before scheduling with bounded code `probe_rate_budget_exceeded`.
@@ -336,18 +428,33 @@ A second deterministic startup budget uses these conservative charged amounts fo
 | HTTPS endpoint | 8,192 |
 
 ```text
+gateway_charged_network_demand =
+  gateway_attempt_demand × 128
+
+dns_charged_network_demand =
+  dns_enabled_indicator × 1,024 × (60 / 27)
+
+https_charged_network_demand =
+  https_attempt_demand × 8,192
+
+tcp_charged_network_demand =
+  sum((60 / minimum_possible_tcp_interval_seconds) × 1,024
+      for every enabled TCP target)
+
 worst_case_charged_network_bytes_per_minute =
-    gateway_demand × 128
-  + dns_demand × 1,024
-  + https_demand × 8,192
-  + sum(all enabled tcp_target_demand values × 1,024)
+    gateway_charged_network_demand
+  + dns_charged_network_demand
+  + https_charged_network_demand
+  + tcp_charged_network_demand
 ```
 
 Configuration is valid only when `worst_case_charged_network_bytes_per_minute < 100,000`. A value at or above the approved decimal cap rejects the entire configuration before scheduling with bounded code `probe_network_budget_exceeded`. This charged-byte model is deterministic conservative accounting for configuration and acceptance; it is not packet capture or a claim of exact physical-wire traffic.
 
-Neither budget error may echo target IDs, intervals, hosts, ports, provider details, operator identifiers, endpoints, or calculated customer-specific values. A 15-second TCP interval remains individually permitted only when the complete configured set passes both global budgets. With the two default HTTPS providers, 25 targets at 15 seconds are invalid: worst-case demand is approximately 108.89 attempts/minute and 141,368.89 charged bytes/minute. The same 25 targets at a 60-second configured interval are valid: worst-case demand is approximately 36.67 attempts/minute and 67,413.33 charged bytes/minute. Different provider counts can require different target intervals.
+A disabled DNS probe creates no DNS scheduler target, consumes no DNS token or network-attempt slot, and contributes zero DNS demand to both startup budgets. HTTPS provider DNS resolution remains charged as part of each HTTPS provider attempt; disabling the independent DNS probe does not remove or reduce HTTPS demand. Configuration validation remains atomic, and neither budget error may echo target IDs, intervals, hosts, ports, provider details, operator identifiers, endpoints, calculated customer-specific values, or other sensitive configuration.
 
-After a logical target is selected by the fair queue, the dispatcher acquires the global and per-target execution slots, then consumes one token immediately before invoking the transport. Cancellation before transport invocation consumes no token. Once transport invocation starts, the attempt consumes its token regardless of success, failure, or timeout.
+A 15-second TCP interval remains individually permitted only when the complete configured set passes both global budgets. With DNS enabled and the two default HTTPS providers, 25 targets at 15 seconds are invalid: worst-case demand is approximately 108.89 attempts/minute and 141,368.89 charged bytes/minute. The same 25 targets at a 60-second configured interval are valid: worst-case demand is approximately 36.67 attempts/minute and 67,413.33 charged bytes/minute. Different provider counts and the DNS enabled state can change configuration validity.
+
+After a logical target is selected by the fair queue, the dispatcher acquires the global and per-target execution slots. At one measurement boundary it captures the monotonic transport-start timestamp and consumes one token, immediately before invoking the transport. Cancellation before that boundary consumes no token. Once transport invocation starts, the attempt consumes its token regardless of success, failure, or timeout. Acceptance phase membership uses that timestamp, never fair-queue admission.
 
 ### 4.5 Deterministic fair dispatch
 
@@ -482,7 +589,7 @@ Allowed evidence codes:
 | Common | `round_succeeded`, `round_incomplete`, `cancelled`, `rate_limited`, `capacity_unavailable`, `deadline_exceeded`, `superseded`, `configuration_invalid` |
 | Gateway | `active_interface_missing`, `default_route_missing`, `gateway_address_missing`, `icmp_succeeded`, `icmp_timeout`, `icmp_unreachable`, `icmp_unavailable` |
 | DNS | `dns_succeeded`, `dns_timeout`, `dns_no_address`, `dns_resolution_failed` |
-| HTTPS | `https_succeeded`, `https_dns_failed`, `https_connect_failed`, `https_tls_failed`, `https_timeout`, `https_redirect_rejected`, `https_unexpected_status`, `https_body_mismatch`, `https_body_too_large`, `endpoint_not_started`, `partial_endpoint_failure`, `blocked_by_dns` |
+| HTTPS | `https_succeeded`, `https_dns_failed`, `https_connect_failed`, `https_tls_failed`, `https_timeout`, `https_redirect_rejected`, `https_unexpected_status`, `https_body_mismatch`, `https_body_too_large`, `endpoint_not_started`, `partial_endpoint_failure`, `blocked_by_dns`, `dns_correlation_unavailable` |
 | TCP | `tcp_connect_succeeded`, `tcp_connect_refused`, `tcp_connect_timeout`, `tcp_connect_failed` |
 
 Codes are not user-facing causal claims. Production logs and metrics may include the probe kind, code, aggregate counts, state names, and bounded duration. They must not contain:
@@ -490,6 +597,7 @@ Codes are not user-facing causal claims. Production logs and metrics may include
 - exception text, stack traces from expected transport failures, or operating-system error strings;
 - IDs, labels, hostnames, IP addresses, ports, URLs, query names, DNS answers, headers, bodies, interface descriptions, route details, or machine paths;
 - payloads, credentials, authorization, user information, cookies, customer identifiers, or provider trace metadata;
+- DNS-correlation sequence, completion timestamp, round classification, or captured resulting state;
 - raw configuration or entire serialized outcomes.
 
 Unexpected exceptions may be correlated through an existing bounded correlation ID, but sensitive exception content remains out of ordinary logs and support artifacts.
@@ -514,19 +622,75 @@ The run uses 25 synthetic TCP targets and fake or loopback endpoints, never real
 `-DurationMinutes 30` means 30 complete steady-state minutes after the service first reaches monitoring-ready. Initialization time is additional and does not reduce that window.
 
 - Initialization begins immediately before the service process is started and ends when monitoring-ready is first observed. Failure to reach readiness within 60 seconds fails the run.
-- The exact service PID is captured after process creation. The steady-state phase begins at the first five-second monotonic sampling boundary after readiness and lasts 30 complete minutes.
+- The exact service PID is captured after process creation.
 - Process exit, PID change, automatic restart, or unplanned termination after initial PID capture fails immediately. The sampler must not resume against a replacement PID.
-- Initialization CPU is reported separately and is excluded only from the approved steady-state average CPU calculation.
-- Every successfully collected working-set sample after process creation, including initialization samples, remains subject to the absolute working-set cap.
-- Disk and network caps use the complete steady-state phase. Initialization disk and network totals are reported separately.
+- Startup CPU is reported separately and is excluded from the approved steady-state average CPU calculation.
+- Every successfully collected working-set sample after process creation, including initialization, barrier, steady-state, and drain samples, remains subject to the absolute working-set cap.
+
+The transport-start instant is the monotonic timestamp captured at the same point the token is consumed, immediately before invoking the transport. Admission time, queue time, slot-wait time, and token-wait time do not determine resource-phase membership.
+
+After monitoring-ready, the acceptance coordinator establishes a clean steady-state start barrier:
+
+1. Pause all new network-attempt admissions.
+2. Cancel queued attempts that have not started as scheduler-level non-counting/incomplete work. They consume no token and do not enter a transport-attempt array.
+3. Allow every started attempt to reach one terminal attempt outcome.
+4. Fail the run with `measurement_boundary_timeout` if the pre-steady-state drain exceeds 10 monotonic seconds.
+5. After no started attempt remains, reset acceptance-only attempt and network accounting and capture the disk and process-CPU baselines.
+6. Choose the next fixed five-second monotonic sampling boundary as `steady_state_start`, begin the 30 complete steady-state minutes there, and resume admissions.
+
+`steady_state_start_barrier_elapsed_ms` measures from the admission pause immediately after readiness through `steady_state_start`. For report attribution, `startup` spans process start through `steady_state_start` and therefore includes both initialization and the start barrier. Startup CPU, disk, network, and attempt totals cover that full span; startup attempt totals include every transport invocation whose transport-start instant precedes `steady_state_start`.
+
+Steady-state membership is the half-open interval:
+
+```text
+steady_state_start <= transport_start < steady_state_end
+```
+
+An invocation started before `steady_state_start` is startup work. An invocation started within the half-open interval is steady-state work. Each started invocation belongs to exactly one phase, and its bytes and outcome are never split across phases.
+
+At exact `steady_state_end`, the acceptance coordinator establishes the end barrier:
+
+1. Pause new network-attempt admissions before another token can be consumed.
+2. Cancel attempts admitted but not started before the endpoint as scheduler-level non-counting work. They consume no token and do not enter steady-state attempt accounting.
+3. Allow attempts started before the endpoint to drain to one terminal result. They remain steady-state attempts and contribute their complete sent, received, and charged bytes plus exactly one complete outcome even when completion occurs during the drain.
+4. Fail the run if the end drain exceeds 10 monotonic seconds. A started invocation without a terminal result at that deadline becomes attempt-level `incomplete`, adds `attempt_accounting_incomplete`, and fails the run.
+
+No invocation may start at or after `steady_state_end`. Such a start adds `measurement_boundary_violation` and fails the run. `steady_state_end_drain_elapsed_ms` measures from exact `steady_state_end` until every started steady-state attempt has a terminal accounting outcome or the drain deadline expires.
+
+The top-level `attempts` object represents steady-state attempts only. Steady-state network attribution includes the full bytes of every steady-state attempt, including an attempt that completes during the end drain. Steady-state disk attribution uses the baseline captured after the start barrier and a final value captured after end drain. The steady-state CPU numerator includes process CPU through end-drain completion, while its denominator remains the exact requested 30 steady-state minutes. Working-set absolute-cap enforcement continues through end drain. Growth medians use only steady-state minutes 1–5 and 26–30 and never include drain samples.
 
 The 30-minute run is an R0-005 merge gate. A seven-day soak with zero false Critical alerts and no unplanned termination remains a later R0 release-exit/controlled-acceptance gate because R0-005 creates no alerts.
 
-### 8.2 Clock and sampling
+### 8.2 Merge-gate Windows acceptance-host profile
 
-Elapsed time and sampling deadlines use a monotonic clock. The fixed-rate schedule is anchored at initialization start, immediately before process launch, with boundaries at five-second monotonic increments. Boundaries after the exact process is created require a process sample; the first boundary after readiness starts the steady-state phase. UTC wall-clock timestamps may be recorded for correlation, but no calculation uses wall-clock elapsed time.
+The merge-gate profile identifier is exactly `r0-005-windows11-x64/v1`. The required host is:
 
-The sampler uses a fixed-rate monotonic schedule with one sample every five seconds and no catch-up burst. A sample is missing when no valid sample is collected within ten seconds of its scheduled deadline or when any complete steady-state minute contains fewer than 11 valid samples. Any missing sample fails the run.
+- Windows 11, OS build 26100 or later;
+- x64 operating system and x64 agent process;
+- .NET runtime major version 10;
+- Release configuration;
+- 4 through 32 logical processors, inclusive;
+- at least 8,000,000,000 bytes total physical memory;
+- AC power with battery saver disabled;
+- Windows Balanced power scheme GUID `381b4222-f694-41f0-9685-ff5bb260df2e`;
+- agent process priority `Normal`;
+- no debugger attached;
+- no managed or native profiler attached;
+- no concurrent repository build or test process during sampling.
+
+A physical machine or dedicated virtual machine may be used, but virtualization status must be recorded. Shared or CPU-quota-limited runners are not valid native merge-gate hosts.
+
+Before starting the agent, the sampler runs a 60-monotonic-second host preflight. It collects exactly 12 samples at the fixed 5-, 10-, ..., 60-second boundaries. The average non-agent system CPU across those samples must be less than 10.0%, and available physical memory at the final sample must be at least 2,000,000,000 bytes. A missing preflight sample fails. An unsupported static profile or unavailable required metadata adds `host_profile_unsupported`; a failed idle/resource preflight adds `host_profile_preflight_failed`.
+
+Every required host-profile field in section 8.8 must be available. Processor vendor, family, model, and stepping are bounded hardware-class metadata, not arbitrary environment dumps. The report must never include machine name, username, domain membership, serial number, BIOS serial, device UUID, Windows product key, MAC address, IP address, disk serial, cloud instance ID, or arbitrary environment variables.
+
+The 30-minute result is evidence for the exact executable on the recorded profile; it is not a universal performance claim for every Windows computer. Another architecture or materially different acceptance profile requires a separate reviewed profile and resource report. Exact bounded OS, runtime, build, and hardware-class metadata remains in the evidence so later runs can be compared.
+
+### 8.3 Clock and sampling
+
+Elapsed time and sampling deadlines use a monotonic clock. The fixed-rate schedule is anchored at initialization start, immediately before process launch, with boundaries at five-second monotonic increments. Boundaries after the exact process is created require a process sample; the first boundary chosen after the start-barrier drain becomes `steady_state_start`. UTC wall-clock timestamps may be recorded for correlation, but no calculation uses wall-clock elapsed time.
+
+The sampler uses a fixed-rate monotonic schedule with one sample every five seconds and no catch-up burst, continuing through end-drain completion. `valid_sample_count` and `missing_sample_count` cover every required process sample after process creation through that completion. A sample is missing when no valid sample is collected within ten seconds of its scheduled deadline or when any complete steady-state minute contains fewer than 11 valid samples. Any missing sample fails the run. Only samples in the 30-minute half-open steady-state interval participate in the complete-minute growth windows.
 
 At each valid sample, the sampler refreshes the exact service process and records:
 
@@ -537,7 +701,7 @@ At each valid sample, the sampler refreshes the exact service process and record
 - thread count;
 - monotonic sample time and bounded UTC correlation time.
 
-### 8.3 CPU
+### 8.4 CPU
 
 `logical_processor_count = Environment.ProcessorCount` is captured once at run start. For consecutive valid process samples, with processor time and monotonic wall time expressed in the same unit:
 
@@ -549,9 +713,9 @@ normalized_cpu_percent =
 
 Negative processor-time deltas, zero or negative wall-time deltas, PID changes, and counter resets fail the run. Only after raw inputs have been validated may a reported sampled percentage be bounded to 0–100.
 
-Steady-state average CPU uses the total process-CPU delta over the complete steady-state window with the same logical-processor normalization. The pass condition is `steady_state_average_cpu_percent < 2.0`. Startup observation duration, startup total CPU time, and startup maximum sampled normalized CPU are reported separately; a startup peak neither replaces nor relaxes the steady-state rule.
+Steady-state average CPU uses the process-CPU delta from the post-start-barrier baseline through end-drain completion with the same logical-processor normalization. The denominator remains the exact requested 30 steady-state minutes; drain duration does not extend it. The pass condition is `steady_state_average_cpu_percent < 2.0`. Startup observation duration, startup total CPU time, and startup maximum sampled normalized CPU are reported separately; a startup peak neither replaces nor relaxes the steady-state rule.
 
-### 8.4 Memory, handles, threads, and growth
+### 8.5 Memory, handles, threads, and growth
 
 Every valid working-set sample after process creation must be less than 150,000,000 bytes. Reaching or exceeding that decimal-byte cap fails independently of growth calculations.
 
@@ -573,9 +737,9 @@ percent_increase = 100 × absolute_increase / first_window_median
 
 Zero first-window medians use deterministic boundary handling: zero-to-zero is 0% growth; zero-to-positive is treated as exceeding 20% for rule evaluation and serializes `percent_increase` as JSON `null`, never NaN or infinity. A metric fails when the final-window median is more than 20% above the first-window median and the absolute increase is greater than or equal to its noise floor. Noise floors excuse bounded measurement noise only and do not relax any absolute cap.
 
-### 8.5 Disk attribution
+### 8.6 Disk attribution
 
-The sampler reads the Windows process I/O `WriteTransferCount` through `GetProcessIoCounters` for the exact service PID at steady-state start and end and computes a nonnegative delta.
+The sampler reads the Windows process I/O `WriteTransferCount` through `GetProcessIoCounters` for the exact service PID after the start-barrier drain and again after end-drain completion and computes a nonnegative delta.
 
 It also measures positive file-size growth beneath the dedicated acceptance runtime directory. New files have an initial size of zero. The calculation excludes pre-existing published binaries, immutable input configuration, and sampler-owned evidence/report files, which must be stored outside the monitored runtime directory. A monitored file that disappears during the phase fails the run.
 
@@ -593,7 +757,7 @@ For the required run, `steady_state_minutes = 30`. The pass condition is `disk_m
 
 R0-005 intentionally persists no probe evidence. Any unexpected runtime artifact creation must be reported only by bounded relative artifact name/category, never by private absolute path; disk growth attributable to probe results fails even if the aggregate cap would otherwise pass.
 
-### 8.6 Network attribution
+### 8.7 Network attribution
 
 System-wide adapter counters, packet capture, payload capture, addresses, interface values, and endpoint values are prohibited. The implementation exposes acceptance-only aggregate accounting through its injected probe transport boundaries.
 
@@ -604,15 +768,17 @@ attributed_attempt_network_bytes =
   max(measured_sent + measured_received, charged_method_bytes)
 
 attributed_network_bytes =
-  sum(attributed_attempt_network_bytes for attempts admitted during steady state)
+  sum(attributed_attempt_network_bytes
+      for attempts whose transport_start is in
+      [steady_state_start, steady_state_end))
 
 network_bytes_per_minute =
   attributed_network_bytes / steady_state_minutes
 ```
 
-The pass condition is `network_bytes_per_minute < 100,000`, using decimal bytes/minute. This is deterministic conservative probe-traffic attribution, not a claim of exact physical-wire or TLS/IP overhead measurement. Attempt counts are reported separately and packet capture remains prohibited. Counter overflow, negative byte values, missing accounting for a started attempt, or an unknown probe method fails the run.
+The pass condition is `network_bytes_per_minute < 100,000`, using decimal bytes/minute. Bytes from a steady-state attempt are included in full even when it completes during end drain; bytes are never split between phases. This is deterministic conservative probe-traffic attribution, not a claim of exact physical-wire or TLS/IP overhead measurement. Attempt counts are reported separately and packet capture remains prohibited. Counter overflow, negative byte values, missing accounting for a started attempt, or an unknown probe method fails the run.
 
-### 8.7 Deterministic reports
+### 8.8 Deterministic reports
 
 The sampler emits a bounded human-readable report and UTF-8 JSON from the same in-memory report model under ignored `artifacts/r0-005/`. The JSON schema identifier is `r0-005-resource-report/v1`. It uses invariant-culture numeric formatting, ISO-8601 UTC timestamps, fixed property names, stable enum/code values, deterministic array ordering, and no NaN or infinity.
 
@@ -621,14 +787,15 @@ The JSON has these exact top-level properties in this order:
 1. `schema_version`
 2. `source`
 3. `configuration`
-4. `timing`
-5. `startup`
-6. `steady_state`
-7. `growth`
-8. `attempts`
-9. `caps`
-10. `violations`
-11. `result`
+4. `host_profile`
+5. `timing`
+6. `startup`
+7. `steady_state`
+8. `growth`
+9. `attempts`
+10. `caps`
+11. `violations`
+12. `result`
 
 `schema_version` is exactly `r0-005-resource-report/v1`. Required nested properties are:
 
@@ -636,12 +803,122 @@ The JSON has these exact top-level properties in this order:
 | --- | --- |
 | `source` | `commit_sha`, `configuration_name`, `executable_sha256` |
 | `configuration` | `target_count`, `https_provider_count`, `logical_processor_count`, `sampling_interval_seconds`, `requested_steady_state_minutes` |
-| `timing` | `process_start_utc`, `readiness_utc`, `startup_elapsed_ms`, `steady_state_start_utc`, `steady_state_end_utc`, `valid_sample_count`, `missing_sample_count` |
-| `startup` | `cpu_observation_duration_ms`, `total_cpu_ms`, `maximum_normalized_cpu_percent`, `maximum_working_set_bytes`, `attributed_disk_bytes`, `attributed_network_bytes` |
+| `host_profile` | `profile_id`, `os_product`, `os_version`, `os_build`, `os_revision`, `os_architecture`, `process_architecture`, `framework_description`, `runtime_version`, `runtime_identifier`, `gc_mode`, `logical_processor_count`, `total_physical_memory_bytes`, `processor_vendor`, `processor_family`, `processor_model`, `processor_stepping`, `virtualization`, `power_source`, `power_scheme_guid`, `battery_saver_enabled`, `process_priority`, `debugger_attached`, `profiler_attached`, `idle_preflight_average_cpu_percent`, `idle_preflight_available_memory_bytes` |
+| `timing` | `process_start_utc`, `readiness_utc`, `startup_elapsed_ms`, `steady_state_start_barrier_elapsed_ms`, `steady_state_start_utc`, `steady_state_end_utc`, `steady_state_end_drain_elapsed_ms`, `valid_sample_count`, `missing_sample_count` |
+| `startup` | `cpu_observation_duration_ms`, `total_cpu_ms`, `maximum_normalized_cpu_percent`, `maximum_working_set_bytes`, `attributed_disk_bytes`, `attributed_network_bytes`, `attempts_started`, `attempts_completed`, `attempts_succeeded`, `attempts_failed`, `attempts_timed_out`, `attempts_canceled`, `attempts_incomplete` |
 | `steady_state` | `average_normalized_cpu_percent`, `maximum_working_set_bytes`, `maximum_private_bytes`, `maximum_handle_count`, `maximum_thread_count`, `attributed_disk_bytes`, `disk_mb_per_day`, `attributed_network_bytes`, `network_bytes_per_minute` |
+| `growth` | `working_set`, `private_bytes`, `handles`, `threads` |
 | `attempts` | `by_probe_kind`, `by_outcome`, `started`, `completed`, `succeeded`, `failed`, `timed_out`, `canceled`, `incomplete` |
 | `caps` | `readiness_ms`, `working_set_bytes`, `average_cpu_percent`, `disk_mb_per_day`, `network_bytes_per_minute`, `growth_percent`, `working_set_growth_noise_bytes`, `private_bytes_growth_noise_bytes`, `handle_growth_noise_count`, `thread_growth_noise_count` |
 | `result` | the string `pass` or `fail` |
+
+The table is normative for nested property presence and property order. `configuration.logical_processor_count` must exactly equal `host_profile.logical_processor_count`. The two new timing durations are nonnegative JSON integers in milliseconds. `startup.attempts_*` values are nonnegative JSON integers for startup transport invocations and satisfy the same started/completed/outcome identities as the top-level steady-state attempt scalars. Queued work canceled before transport start appears in neither set of transport-attempt counts.
+
+```text
+startup.attempts_completed =
+    startup.attempts_succeeded
+  + startup.attempts_failed
+  + startup.attempts_timed_out
+  + startup.attempts_canceled
+
+startup.attempts_started =
+    startup.attempts_completed
+  + startup.attempts_incomplete
+```
+
+`host_profile.profile_id` is exactly `r0-005-windows11-x64/v1`. The bounded host-profile values and types are:
+
+| Property | Required representation |
+| --- | --- |
+| `os_product` | `windows_11` |
+| `os_version` | bounded invariant Windows version string |
+| `os_build` | JSON integer, at least 26100 |
+| `os_revision` | nonnegative JSON integer |
+| `os_architecture`, `process_architecture` | `x64` |
+| `framework_description` | bounded invariant .NET framework-description string |
+| `runtime_version` | bounded invariant runtime-version string whose major version is 10 |
+| `runtime_identifier` | bounded invariant runtime identifier for Windows x64 |
+| `gc_mode` | `workstation` or `server` |
+| `logical_processor_count` | JSON integer from 4 through 32 |
+| `total_physical_memory_bytes` | JSON integer, at least 8,000,000,000 |
+| `processor_vendor` | bounded invariant ASCII CPU-vendor class, at most 32 characters |
+| `processor_family`, `processor_model`, `processor_stepping` | nonnegative JSON integers |
+| `virtualization` | `physical`, `virtual`, or `unknown` |
+| `power_source` | `ac` |
+| `power_scheme_guid` | lowercase `381b4222-f694-41f0-9685-ff5bb260df2e` |
+| `battery_saver_enabled` | JSON Boolean; must be `false` |
+| `process_priority` | `normal` |
+| `debugger_attached`, `profiler_attached` | JSON Boolean; both must be `false` |
+| `idle_preflight_average_cpu_percent` | finite JSON number; must be less than 10.0 |
+| `idle_preflight_available_memory_bytes` | JSON integer; must be at least 2,000,000,000 |
+
+All host-profile strings are derived from the listed bounded OS/runtime/hardware sources, not from arbitrary environment variables. Missing, malformed, or out-of-profile values fail as defined in sections 8.2 and 8.9.
+
+The following synthetic fragment is normative for the adjacency and property order of `configuration`, `host_profile`, `timing`, and `startup`; its concrete measurement values are illustrative:
+
+```json
+"configuration": {
+  "target_count": 25,
+  "https_provider_count": 2,
+  "logical_processor_count": 8,
+  "sampling_interval_seconds": 5,
+  "requested_steady_state_minutes": 30
+},
+"host_profile": {
+  "profile_id": "r0-005-windows11-x64/v1",
+  "os_product": "windows_11",
+  "os_version": "10.0.26100.1",
+  "os_build": 26100,
+  "os_revision": 1,
+  "os_architecture": "x64",
+  "process_architecture": "x64",
+  "framework_description": ".NET 10.0.0",
+  "runtime_version": "10.0.0",
+  "runtime_identifier": "win-x64",
+  "gc_mode": "workstation",
+  "logical_processor_count": 8,
+  "total_physical_memory_bytes": 8000000000,
+  "processor_vendor": "GenuineIntel",
+  "processor_family": 6,
+  "processor_model": 1,
+  "processor_stepping": 1,
+  "virtualization": "unknown",
+  "power_source": "ac",
+  "power_scheme_guid": "381b4222-f694-41f0-9685-ff5bb260df2e",
+  "battery_saver_enabled": false,
+  "process_priority": "normal",
+  "debugger_attached": false,
+  "profiler_attached": false,
+  "idle_preflight_average_cpu_percent": 0.0,
+  "idle_preflight_available_memory_bytes": 2000000000
+},
+"timing": {
+  "process_start_utc": "2026-01-01T00:00:00.0000000Z",
+  "readiness_utc": "2026-01-01T00:00:01.0000000Z",
+  "startup_elapsed_ms": 1000,
+  "steady_state_start_barrier_elapsed_ms": 9000,
+  "steady_state_start_utc": "2026-01-01T00:00:10.0000000Z",
+  "steady_state_end_utc": "2026-01-01T00:30:10.0000000Z",
+  "steady_state_end_drain_elapsed_ms": 0,
+  "valid_sample_count": 362,
+  "missing_sample_count": 0
+},
+"startup": {
+  "cpu_observation_duration_ms": 10000,
+  "total_cpu_ms": 0,
+  "maximum_normalized_cpu_percent": 0.0,
+  "maximum_working_set_bytes": 0,
+  "attributed_disk_bytes": 0,
+  "attributed_network_bytes": 0,
+  "attempts_started": 0,
+  "attempts_completed": 0,
+  "attempts_succeeded": 0,
+  "attempts_failed": 0,
+  "attempts_timed_out": 0,
+  "attempts_canceled": 0,
+  "attempts_incomplete": 0
+}
+```
 
 The `caps` values and units are exactly:
 
@@ -660,14 +937,14 @@ The `caps` values and units are exactly:
 
 `growth` contains `working_set`, `private_bytes`, `handles`, and `threads` in that order. Each contains `first_window_median`, `final_window_median`, `absolute_increase`, `percent_increase`, `noise_floor`, `unit`, and `result`; `unit` is `bytes` for memory metrics and `count` for handle/thread metrics. Each result is `pass` or `fail`.
 
-Both `attempts.by_probe_kind` and `attempts.by_outcome` use a common entry shape. Every entry has exactly these properties in this order:
+The top-level `attempts` object is scoped only to invocations whose transport-start instant is within the steady-state half-open interval. Both `attempts.by_probe_kind` and `attempts.by_outcome` use a common entry shape. Every entry has exactly these properties in this order:
 
 1. `code`
 2. `count`
 
 `code` is one of the closed values defined below. `count` is a nonnegative JSON integer; floating-point and negative counts are forbidden. Unknown or extension codes are forbidden in `r0-005-resource-report/v1`. Every defined code appears exactly once, including mandatory zero-count entries. Additional properties are forbidden. The arrays use the exact fixed orders below, which are also ordinal code order; implementations must not depend on locale, dictionary iteration, discovery order, or runtime sorting.
 
-`attempts.by_probe_kind` counts transport invocations that actually started. It contains exactly five entries in this order:
+`attempts.by_probe_kind` counts steady-state transport invocations that actually started. It contains exactly five entries in this order:
 
 | `code` | Definition |
 | --- | --- |
@@ -701,7 +978,7 @@ The scalar attempt properties have these exact definitions:
 
 | Property | Definition |
 | --- | --- |
-| `started` | Total started transport invocations. |
+| `started` | Total steady-state transport invocations whose transport-start instant is in the half-open membership interval. |
 | `completed` | `succeeded + failed + timed_out + canceled`. |
 | `succeeded` | Identical to the `by_outcome` entry `succeeded`. |
 | `failed` | Identical to `by_outcome.failed`; excludes timeouts, cancellations, and incomplete attempts. |
@@ -772,6 +1049,10 @@ This example is normative for property names, property order, array order, close
 - `counter_unavailable`
 - `disk_cap_exceeded`
 - `handle_growth_exceeded`
+- `host_profile_preflight_failed`
+- `host_profile_unsupported`
+- `measurement_boundary_timeout`
+- `measurement_boundary_violation`
 - `network_cap_exceeded`
 - `pid_changed`
 - `private_bytes_growth_exceeded`
@@ -810,14 +1091,18 @@ Violation `unknown_probe_method` is mandatory whenever `attempts.by_probe_kind["
 
 Schema, property-order, array-order, and type defects also make the report `result` equal `fail` and cause a nonzero sampler exit. This is required even when the report can still serialize a bounded violation list; every other independently applicable violation code also appears exactly once.
 
-The report contains no machine name, username, absolute path, endpoint, target, interface, address, DNS answer, payload, header, body, exception text, credential, or customer identifier. The human report must not apply different calculations or privacy rules.
+The report contains no machine name, username, domain membership, serial number, BIOS serial, device UUID, Windows product key, MAC address, IP address, disk serial, cloud instance ID, arbitrary environment variable, absolute path, endpoint, target, interface, DNS answer, payload, header, body, exception text, credential, customer identifier, or DNS-correlation snapshot field. The human report must contain the same required host-profile, timing, startup-attempt, steady-state-attempt, cap, and violation values and must not apply different calculations, phase membership, property meaning, or privacy rules.
 
-### 8.8 Failure rules
+### 8.9 Failure rules
 
 The sampler exits nonzero when:
 
 - readiness exceeds 60 seconds;
+- any static acceptance-host requirement is unsupported, required host metadata is missing, or a prohibited shared/CPU-quota-limited host is used;
+- the 60-second host preflight is missing a required sample, has average non-agent system CPU greater than or equal to 10.0%, or ends with less than 2,000,000,000 bytes available physical memory;
 - the process exits, the PID changes, or a replacement/restart occurs;
+- the start-barrier or end-drain deadline exceeds 10 seconds;
+- an invocation starts at or after `steady_state_end`;
 - a sample is missing;
 - a required counter is unavailable, negative, reset, or overflows;
 - working set reaches or exceeds 150,000,000 bytes;
@@ -825,7 +1110,7 @@ The sampler exits nonzero when:
 - disk reaches or exceeds 100 decimal MB/day;
 - network reaches or exceeds 100,000 bytes/minute;
 - any growth rule fails;
-- attempt accounting is incomplete under any mandatory `attempt_accounting_incomplete` condition in section 8.7;
+- attempt accounting is incomplete under any mandatory `attempt_accounting_incomplete` condition in section 8.8;
 - an unknown probe method is encountered;
 - report serialization violates schema, property or array ordering, type, numeric, or privacy requirements;
 - synthetic-listener or acceptance cleanup fails.
@@ -854,9 +1139,11 @@ Use fake transports, an injected clock, and deterministic jitter to cover:
 - every reachable active-state/result pair appearing exactly once in the effective transition model;
 - a table-driven completeness test that fails when a reachable pair lacks an explicit rule;
 - every remaining state transition and each method threshold;
+- a documentation or generated-constant consistency check that fails if any cadence or threshold in the source-reconciliation table differs from the binding interval and threshold sections;
 - ordinary scheduler-level incomplete/canceled/rate-limited/method-unavailable outcomes not advancing operational state counters, including pre-start incomplete rounds remaining absent from attempt arrays;
 - no overlap, fixed-delay scheduling, jitter bounds, no catch-up, timeouts, deadline, global concurrency, per-target concurrency, and token-bucket burst/refill;
-- worst-case attempt-demand and charged-network formulas, provider-count effects, and double-precision boundaries immediately below, exactly at, and immediately above 60 attempts/minute and 100,000 charged bytes/minute as applicable;
+- worst-case attempt-demand and charged-network formulas, DNS enabled/disabled behavior, provider-count effects, and double-precision boundaries immediately below, exactly at, and immediately above 60 attempts/minute and 100,000 charged bytes/minute as applicable;
+- exact budget boundaries with DNS enabled and disabled, including a configuration that is valid only when DNS is disabled;
 - rejection of 25 targets at 15 seconds, acceptance of a 25-target configuration with sufficiently long intervals, and the valid two-default-provider 25-target/60-second example;
 - stable rotating fair-queue order, HTTPS endpoint attempts not monopolizing a pass, no systematic starvation under sustained valid demand, cancellation before token consumption, and a started timeout consuming one token;
 - shutdown and degradation cancellation;
@@ -864,9 +1151,12 @@ Use fake transports, an injected clock, and deterministic jitter to cover:
 - configuration bounds, atomic rejection, duplicate IDs, 0/25/26 targets, interval/port limits, credential-like values, and URI/range rejection;
 - missing or invalid `operator_id`, duplicate operator IDs, two domains with the same declared operator, and two declared operators on the same host/domain;
 - valid built-in Google/Cloudflare declarations and valid custom providers with distinct IDs, hosts, registrable domains, and declared operators;
+- registrable-domain cases for `example.com`, a multi-label suffix such as `example.co.uk`, an exact rule, wildcard rule, exception rule, PRIVATE-section suffix, Unicode and equivalent punycode input, one optional terminal dot, a host equal to a public suffix, IP-literal rejection, and two subdomains sharing one registrable domain;
+- byte-for-byte pinned suffix-data verification and deterministic registrable-domain behavior across restarts;
 - provider-set count, provider/domain/declared-operator separation, HTTPS-only URLs, strict statuses, redirect rejection, and bounded optional-body validation;
 - HTTPS endpoint outcomes for 204, 200 status-only, wrong status, redirect, TLS failure, timeout, cancellation, oversized body, body not retained, partial provider failure, all-provider failure, and two-provider independence;
-- DNS-blocked HTTPS aggregation and DNS independence;
+- DNS snapshot correlation for DNS completion before HTTPS start, DNS completion after HTTPS start, concurrent completions in opposite task orders producing the same HTTPS result, the exact 60-second freshness boundary, stale snapshot, no snapshot, fresh success, fresh counted failure, fresh non-counting result, DNS disabled, and timestamp reversal;
+- DNS-blocked HTTPS aggregation, `dns_correlation_unavailable`, DNS independence, and absence of snapshot fields from logs and evidence;
 - gateway route changes, missing route, missing gateway, ICMP success/timeout/unreachable/unavailable;
 - evidence-code allowlisting and redaction.
 
@@ -890,7 +1180,7 @@ Verify:
 
 - URI user information, credentials, credential-assignment syntax, query strings, fragments, and customer/device identifiers are rejected;
 - HTTPS redirects and invalid TLS are rejected without fallback or weakened validation;
-- endpoint URLs/hosts, DNS queries/answers, target IDs/labels/hosts/ports, response bodies, headers, interface/route data, exception text, machine paths, and other customer-controlled values do not appear in production logs or evidence;
+- endpoint URLs/hosts, DNS queries/answers, DNS-correlation snapshot fields, target IDs/labels/hosts/ports, response bodies, headers, interface/route data, exception text, machine paths, and other customer-controlled values do not appear in production logs or evidence;
 - response-body readers stop at the 256-byte bound plus one overflow-detection byte and retain no bytes;
 - no production inbound listener, firewall mutation, packet capture, subnet/range expansion, broad port scan, or arbitrary gateway TCP probe exists;
 - no probe journal/outbox call, schema artifact, identity fabrication, or raw LAN inventory is introduced.
@@ -899,6 +1189,8 @@ Verify:
 
 Native acceptance must verify:
 
+- the host matches `r0-005-windows11-x64/v1`, records every required bounded profile field, and passes the 60-second idle/resource preflight;
+- the host is physical or a dedicated VM rather than a shared or CPU-quota-limited runner, with virtualization recorded;
 - active default-route/interface discovery on Windows;
 - bounded route evidence without interface/address disclosure;
 - ICMP success when permitted and `icmp_unavailable` behavior when it is not;
@@ -917,10 +1209,16 @@ Deterministic automated tests must cover:
 - every CPU, growth, disk, network, rate-demand, and unit-conversion formula at values below, exactly at, and above each pass boundary;
 - fixed-rate five-second scheduling, no catch-up burst, the ten-second collection deadline, and fewer than 11 valid samples in a complete minute;
 - initialization/steady-state phase boundaries, all 30 complete minute assignments, and first/final five-minute median windows including the even-count median rule;
+- admission before start with transport start after `steady_state_start`, admission before end with transport start exactly at `steady_state_end`, and transport start one monotonic tick before `steady_state_end`;
+- start-drain success and timeout, end-drain success and timeout, exact half-open interval behavior, and deterministic `measurement_boundary_timeout` and `measurement_boundary_violation` codes;
+- no byte splitting, full bytes from a steady-state attempt that completes during end drain, startup attempts excluded from top-level attempts, and queued pre-start/end work excluded from transport-attempt arrays;
+- process CPU, disk, and network attribution through end drain, with growth windows excluding drain samples;
 - PID change, process exit, restart, negative/zero/reset/unavailable/overflowed counters, disappearing runtime files, unknown methods, and missing started-attempt accounting;
 - decimal-byte, decimal-MB/day, bytes/minute, millisecond, percentage, and logical-processor normalization;
 - every stable resource violation code and ordinal violation ordering;
-- exact `r0-005-resource-report/v1` property names/order, invariant numeric and UTC serialization, no NaN/infinity, and identical calculations in the JSON and human report;
+- every static host-profile boundary, OS build below minimum, x86 or ARM process rejection, insufficient processors or physical memory, battery/power-scheme failure, debugger/profiler rejection, the idle CPU boundary, and the available-memory boundary;
+- physical, virtual, and unknown virtualization values;
+- exact `r0-005-resource-report/v1` top-level, `host_profile`, `timing`, `startup`, and remaining nested property names/order, invariant numeric and UTC serialization, no NaN/infinity, and identical values/calculations in the JSON and human report;
 - exact `by_probe_kind` vocabulary and exact `dns`, `gateway_icmp`, `https`, `tcp`, `unknown` order;
 - exact `by_outcome` vocabulary and exact `canceled`, `failed`, `incomplete`, `succeeded`, `timed_out` order;
 - exact `{code,count}` property order, mandatory zero-count entries, and the normative zero-attempt representation;
@@ -938,7 +1236,8 @@ Deterministic automated tests must cover:
 - both `attempt_accounting_incomplete` and `unknown_probe_method` appearing exactly once and in ordinal order when both apply;
 - byte-for-byte stable JSON for identical report models;
 - identical attempt counts in the human and JSON reports;
-- rejection/redaction of machine names, usernames, absolute paths, endpoints, targets, interfaces, addresses, DNS answers, payloads, headers, bodies, exception text, credentials, and customer identifiers;
+- privacy exclusion of machine names, usernames, domain membership, serials, device UUIDs, product keys, MAC/IP addresses, disk serials, cloud instance IDs, arbitrary environment variables, absolute paths, endpoints, targets, interfaces, DNS answers, DNS-correlation snapshot fields, payloads, headers, bodies, exception text, credentials, and customer identifiers;
+- deterministic `host_profile` property order and rejection of missing or additional host-profile fields;
 - synthetic-listener and acceptance cleanup success/failure.
 
 ### 9.6 Standard repository validation
