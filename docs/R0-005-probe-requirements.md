@@ -233,7 +233,7 @@ An endpoint succeeds only when:
 
 Aggregation is deterministic:
 
-1. If cancellation, the deadline, or capacity prevents even one configured endpoint from starting, or prevents an admitted endpoint from producing a classified transport result, the round is `incomplete`; counters and state do not change. A started attempt that returns a classified timeout is a completed failure, not an incomplete attempt.
+1. If cancellation, the deadline, or capacity prevents even one configured endpoint from starting, or prevents an admitted endpoint from producing a classified transport result, the logical round is `incomplete`; operational state-machine counters and state do not change. An endpoint invocation that never starts does not enter attempt accounting. An invocation that starts is still accounted separately at attempt level: a classified timeout is `timed_out`, while an invocation with no terminal outcome when accounting closes is attempt-level `incomplete` and fails acceptance under section 8.7.
 2. If every endpoint completes and at least one succeeds, the aggregate round succeeds.
 3. If every endpoint completes, at least one succeeds, and at least one fails, emit `partial_endpoint_failure`; reset the aggregate failure counter and apply a success transition. Do not create an incident or change the user-facing state because of the failed provider.
 4. If every endpoint completes and all fail exclusively during DNS resolution while the independent DNS probe is failing, emit `blocked_by_dns`; the HTTPS aggregate round is incomplete, not failed, and its counter/state do not change.
@@ -293,7 +293,7 @@ Jitter comes from an injected deterministic source in tests. Scheduling uses fix
 | Each HTTPS endpoint | 5 seconds |
 | Any logical round, including capacity/rate waiting | 10 seconds |
 
-There is no retry within a round. A timed-out transport that was actually started is a counted failure. A round that expires before all required attempts can start/complete is incomplete and does not change counters or state.
+There is no retry within a round. A timed-out transport that was actually started is a counted failure. A logical round that expires before all required attempts can start or complete is a scheduler-level incomplete outcome and does not change operational state-machine counters or state. A required transport that never starts does not enter attempt accounting; any transport invocation that did start remains subject to the attempt-level closure rules in section 8.7.
 
 ### 4.4 Capacity, configured budgets, and token consumption
 
@@ -394,7 +394,7 @@ Every enabled logical target starts `unknown`, moves to `baselining` when the re
 
 Every success resets the relevant consecutive-failure counter. Reaching a threshold means `>=` the method-specific threshold.
 
-Canceled, rate-limited, superseded, configuration-invalid, deadline-incomplete, capacity-incomplete, and method-unavailable results are not transport failures. They do not advance failure or recovery counters. The gateway confidence-only `healthy` to `suspect` transition above is the sole non-counting state change.
+Canceled, rate-limited, superseded, configuration-invalid, deadline-incomplete, capacity-incomplete, and method-unavailable scheduler/state-machine results are not transport failures. Ordinary scheduler-level incomplete rounds, including rounds that become incomplete before any transport begins, do not advance failure or recovery counters. This operational rule does not excuse a started transport invocation from attempt-level outcome accounting. The gateway confidence-only `healthy` to `suspect` transition above is the sole non-counting state change.
 
 State is observational, not causal. `offline` means repeated technical failure; it does not prove disconnection, sabotage, intrusion, or intent.
 
@@ -637,7 +637,13 @@ Both `attempts.by_probe_kind` and `attempts.by_outcome` use a common entry shape
 | `succeeded` | A started transport invocation reached its method-specific success classification. |
 | `timed_out` | A started invocation reached its defined transport timeout. |
 
-These categories are mutually exclusive, and every started invocation is assigned to exactly one outcome entry. Scheduler-level logical rounds that become incomplete before a transport starts do not increment transport-attempt counts; they remain scheduler outcomes, not `attempts.by_outcome` entries.
+These categories are mutually exclusive, and every started invocation is assigned to exactly one outcome entry.
+
+Scheduler-level and attempt-level incompleteness are distinct:
+
+- A logical scheduler round may become incomplete before any transport invocation begins. That round does not increment `attempts.started`, any `attempts.by_probe_kind` entry, or any `attempts.by_outcome` entry. It remains only a scheduler/state-machine outcome and, under the existing operational rule, does not advance failure or recovery counters.
+- Attempt-level `incomplete` applies only when a transport invocation actually started and attempt accounting closes before that invocation receives exactly one of `succeeded`, `failed`, `timed_out`, or `canceled`.
+- Attempt-level `incomplete` is always an acceptance failure and adds violation `attempt_accounting_incomplete`.
 
 The scalar attempt properties have these exact definitions:
 
@@ -674,6 +680,36 @@ started =
   completed + incomplete
 ```
 
+The following object fragment is the normative zero-attempt representation:
+
+```json
+"attempts": {
+  "by_probe_kind": [
+    { "code": "dns", "count": 0 },
+    { "code": "gateway_icmp", "count": 0 },
+    { "code": "https", "count": 0 },
+    { "code": "tcp", "count": 0 },
+    { "code": "unknown", "count": 0 }
+  ],
+  "by_outcome": [
+    { "code": "canceled", "count": 0 },
+    { "code": "failed", "count": 0 },
+    { "code": "incomplete", "count": 0 },
+    { "code": "succeeded", "count": 0 },
+    { "code": "timed_out", "count": 0 }
+  ],
+  "started": 0,
+  "completed": 0,
+  "succeeded": 0,
+  "failed": 0,
+  "timed_out": 0,
+  "canceled": 0,
+  "incomplete": 0
+}
+```
+
+This example is normative for property names, property order, array order, closed vocabularies, mandatory zero entries, integer count encoding, and scalar representation. It is an object fragment from the complete `r0-005-resource-report/v1` report, not a standalone full report.
+
 `violations` is an ordinal-sorted array containing only these stable bounded codes when applicable:
 
 - `acceptance_cleanup_failed`
@@ -699,6 +735,29 @@ started =
 - `working_set_cap_exceeded`
 - `working_set_growth_exceeded`
 
+Violation `attempt_accounting_incomplete` is mandatory when any of the following occurs:
+
+- any required probe-kind code is missing;
+- any required outcome code is missing;
+- any code appears more than once;
+- an unknown or extension code is emitted;
+- a count is negative;
+- a count is nonintegral;
+- an entry contains additional properties;
+- required property order differs;
+- required array order differs;
+- a mandatory zero-count entry is omitted;
+- any scalar/array identity fails;
+- one invocation is assigned to more than one probe kind;
+- one invocation is assigned to more than one outcome;
+- a started invocation has no outcome;
+- an outcome exists without a corresponding started invocation;
+- `incomplete` is greater than zero.
+
+Violation `unknown_probe_method` is mandatory whenever `attempts.by_probe_kind["unknown"] > 0`. Both `attempt_accounting_incomplete` and `unknown_probe_method` appear when both conditions apply. Every applicable violation appears exactly once, and the `violations` array remains in ordinal code order.
+
+Schema, property-order, array-order, and type defects also make the report `result` equal `fail` and cause a nonzero sampler exit. This is required even when the report can still serialize a bounded violation list; every other independently applicable violation code also appears exactly once.
+
 The report contains no machine name, username, absolute path, endpoint, target, interface, address, DNS answer, payload, header, body, exception text, credential, or customer identifier. The human report must not apply different calculations or privacy rules.
 
 ### 8.8 Failure rules
@@ -714,9 +773,9 @@ The sampler exits nonzero when:
 - disk reaches or exceeds 100 decimal MB/day;
 - network reaches or exceeds 100,000 bytes/minute;
 - any growth rule fails;
-- attempt accounting is incomplete;
+- attempt accounting is incomplete under any mandatory `attempt_accounting_incomplete` condition in section 8.7;
 - an unknown probe method is encountered;
-- report serialization violates schema, ordering, numeric, or privacy requirements;
+- report serialization violates schema, property or array ordering, type, numeric, or privacy requirements;
 - synthetic-listener or acceptance cleanup fails.
 
 ## 9. Required verification for implementation
@@ -727,7 +786,7 @@ Use fake transports, an injected clock, and deterministic jitter to cover:
 
 - every state transition and each method threshold;
 - success counter reset and two-success recovery;
-- incomplete/canceled/rate-limited/method-unavailable outcomes not counting as failures;
+- ordinary scheduler-level incomplete/canceled/rate-limited/method-unavailable outcomes not advancing operational state counters, including pre-start incomplete rounds remaining absent from attempt arrays;
 - no overlap, fixed-delay scheduling, jitter bounds, no catch-up, timeouts, deadline, global concurrency, per-target concurrency, and token-bucket burst/refill;
 - worst-case attempt-demand and charged-network formulas, provider-count effects, and double-precision boundaries immediately below, exactly at, and immediately above 60 attempts/minute and 100,000 charged bytes/minute as applicable;
 - rejection of 25 targets at 15 seconds, acceptance of a 25-target configuration with sufficiently long intervals, and the valid two-default-provider 25-target/60-second example;
@@ -794,6 +853,23 @@ Deterministic automated tests must cover:
 - decimal-byte, decimal-MB/day, bytes/minute, millisecond, percentage, and logical-processor normalization;
 - every stable resource violation code and ordinal violation ordering;
 - exact `r0-005-resource-report/v1` property names/order, invariant numeric and UTC serialization, no NaN/infinity, and identical calculations in the JSON and human report;
+- exact `by_probe_kind` vocabulary and exact `dns`, `gateway_icmp`, `https`, `tcp`, `unknown` order;
+- exact `by_outcome` vocabulary and exact `canceled`, `failed`, `incomplete`, `succeeded`, `timed_out` order;
+- exact `{code,count}` property order, mandatory zero-count entries, and the normative zero-attempt representation;
+- rejection of an omitted zero entry, duplicate code, unknown or extension code, additional entry property, negative count, and nonintegral count;
+- equality between each outcome scalar and its corresponding array entry, plus every started/completed/outcome accounting identity;
+- mutually exclusive probe-kind assignment and mutually exclusive outcome assignment for every invocation;
+- every started invocation receiving exactly one outcome and rejection of an outcome without a corresponding started invocation;
+- separate accounting for every HTTPS provider request;
+- route/interface discovery remaining outside transport-invocation counts;
+- cancellation before transport invocation not counting as started and cancellation after start counting only as `canceled`;
+- timeout counting only as `timed_out` and ordinary failure counting only as `failed`;
+- attempt-level incomplete adding `attempt_accounting_incomplete` and failing acceptance;
+- scheduler-level pre-start incomplete remaining absent from both attempt arrays and not incrementing `attempts.started`;
+- an unknown method counting under `unknown` and adding `unknown_probe_method`;
+- both `attempt_accounting_incomplete` and `unknown_probe_method` appearing exactly once and in ordinal order when both apply;
+- byte-for-byte stable JSON for identical report models;
+- identical attempt counts in the human and JSON reports;
 - rejection/redaction of machine names, usernames, absolute paths, endpoints, targets, interfaces, addresses, DNS answers, payloads, headers, bodies, exception text, credentials, and customer identifiers;
 - synthetic-listener and acceptance cleanup success/failure.
 
