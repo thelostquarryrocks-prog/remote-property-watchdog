@@ -89,9 +89,11 @@ R0-005 configuration uses the normal .NET configuration providers already availa
 - environment variables;
 - command-line configuration.
 
-Configuration is bound and validated exactly once during service startup. A restart is required to apply changes. R0-005 provides no CRUD API, LAN or cloud management endpoint, UI, hot reload, SQLite configuration, or “last known good” fallback.
+Configuration is bound and validated exactly once during service startup. The atomically accepted configuration is immutable for the process lifetime; a restart is required to apply changes. R0-005 provides no CRUD API, LAN or cloud management endpoint, UI, hot reload, SQLite configuration, or “last known good” fallback.
 
 Validation is atomic. If any enabled probe or provider entry is invalid, the probe subsystem schedules no work. It exposes bounded validation codes without echoing customer-controlled values. It must not partly activate a valid subset.
+
+At the same atomic acceptance boundary and before acceptance workload measurement or probe scheduling begins, the implementation freezes the acceptance workload manifest defined in section 8.1. The manifest and the accepted configuration cannot be replaced, reordered, or mutated during the run. Any detected configuration or manifest mutation is an acceptance failure rather than a hot-reload operation.
 
 #### TCP target definition
 
@@ -475,7 +477,7 @@ After a transport attempt becomes eligible through the fair-dispatch rules, it m
 
 ### 4.5 Deterministic fair dispatch
 
-The dispatcher uses a deterministic rotating fair queue over due logical targets. Gateway, DNS, HTTPS aggregate, and every enabled TCP target are logical targets. Each has one stable scheduler key that determines a stable order and is never logged or exposed.
+The dispatcher uses a deterministic rotating fair queue over due logical targets. Gateway, DNS, HTTPS aggregate, and every enabled TCP target are logical targets. Each logical target and each configured HTTPS provider child has one stable internal scheduler/member identity. The logical-target identities determine stable queue order; the provider-member identities determine stable child attribution. These are the same immutable identities used to route work and reconcile the acceptance workload manifest in section 8.1. They are never logged, reported, derived from display names, mutable array positions, endpoint strings, or log text, or exposed through health, support, or metrics output.
 
 - The dispatcher maintains a rotating cursor over stable key order.
 - Gateway, DNS, and each due TCP logical target contribute at most one attempt per pass.
@@ -638,7 +640,39 @@ pwsh ./scripts/r0-005-resource-sampling.ps1 `
   -DurationMinutes 30
 ```
 
-The run uses 25 synthetic TCP targets and fake or loopback endpoints, never real customer or network data. It exercises the gateway, DNS, HTTPS aggregate, and TCP scheduling abstractions.
+The run uses 25 distinct enabled synthetic TCP targets, enabled DNS, the accepted two-provider HTTPS configuration, and fake or loopback endpoints, never real customer or network data. It exercises the Gateway, DNS, every HTTPS provider child, and every TCP scheduling member. The command's `-TargetCount` must equal 25, the atomically accepted configuration must contain exactly 25 distinct enabled TCP members, and the report's `configuration.target_count` must equal that manifest count.
+
+The implementation freezes one immutable **acceptance workload manifest** from the atomically accepted startup configuration before acceptance workload measurement begins. It contains exactly one stable, internal, non-observable workload-member identity for each required member:
+
+- one Gateway member;
+- one DNS member when DNS is enabled and no DNS member when DNS is disabled;
+- one member for every configured HTTPS provider; and
+- one member for every enabled TCP target.
+
+The manifest uses the same stable internal scheduler/member identities that route work under section 4.5. It is not reconstructed from display names, array positions that can change, endpoint strings, log text, the reported target count, or aggregate probe-kind counts. Identities must be unique and remain bound to the same accepted members for the complete run. Configuration changes, manifest replacement or mutation, duplicate manifest identities, or an attempt attributed to an unknown, missing, duplicated, or no-longer-configured member fail acceptance.
+
+A required member is `exercised` only by attributable work during the half-open steady-state interval whose transport or required logical-round operation starts and reaches one terminal, completely accounted result under the attempt-closure rules. A member counts once as distinctly exercised regardless of later attempts. Terminal failure, timeout, or cancellation after transport start can exercise the member; endpoint success is not required. Work canceled before transport start, startup-only work, and a started attempt that never reaches terminal accounting do not exercise a member.
+
+Method-specific coverage is binding:
+
+- **Gateway:** at least one steady-state Gateway logical round must complete and the required acceptance configuration must produce at least one terminal `gateway_icmp` transport attempt attributed to the manifest Gateway member. A missing or unusable acceptance-host default route cannot satisfy coverage.
+- **DNS:** when enabled, at least one terminal steady-state DNS attempt must be attributed to the manifest DNS member. When disabled, DNS is absent from the manifest and both report flags are `false`.
+- **HTTPS:** every configured provider member must independently receive at least one terminal steady-state child attempt. Attempts from one provider cannot substitute for another.
+- **TCP:** every distinct enabled TCP member, including all 25 required synthetic targets, must independently receive at least one terminal steady-state attempt. Repeated work against one target cannot substitute for a missing target.
+
+The internal reconciliation deduplicates exact member identity and must prove:
+
+```text
+distinct_exercised_required_members =
+  distinct_required_manifest_members
+
+gateway_exercised_count = gateway_required_count
+dns_exercised_count = dns_required_count
+https_providers_exercised = https_providers_configured
+tcp_targets_exercised = tcp_targets_configured
+```
+
+Gateway and DNS internal counts are each zero or one and produce the report booleans in section 8.8. Duplicate accounting for one member never increases a distinct exercised count.
 
 `-DurationMinutes 30` means 30 complete steady-state minutes after the service first reaches monitoring-ready and the steady-state baseline bundle below is committed. Initialization and the complete start barrier are additional and do not reduce that window.
 
@@ -659,7 +693,7 @@ After monitoring-ready, the acceptance coordinator establishes a clean steady-st
 5. Capture the process-CPU baseline immediately before the monotonic bundle-commit timestamp. Commit the bundle atomically; `steady_state_start` is exactly that successful commit timestamp. There is no wait for a later pre-existing sampling-grid boundary.
 6. Resume admissions only after the baseline bundle and `steady_state_start` exist. Begin the requested 30 complete steady-state minutes at that exact timestamp.
 
-The complete start-barrier operation, from the admission pause through successful baseline-bundle commit, has one ten-monotonic-second deadline. Exceeding it adds `measurement_boundary_timeout` and fails the run; drain completion does not start a new allowance. The runtime-file component must be a stable complete snapshot. If the monitored tree changes during capture and consistency cannot be proven, the sampler may retry only within the same bounded barrier. If no stable complete snapshot can be committed before the deadline, the sampler fails with `runtime_file_snapshot_incomplete` and `measurement_boundary_timeout` as independently applicable rather than accepting an ambiguous baseline.
+The complete start-barrier operation, from the admission pause through successful baseline-bundle commit, has one ten-monotonic-second deadline. Exceeding it adds `measurement_boundary_timeout` and fails the run; drain completion does not start a new allowance. The runtime-file component uses the shared consecutive-map stable-snapshot protocol in section 8.6. If the monitored tree changes during a pair, the sampler may retry only within the same bounded barrier. If no stable complete snapshot can be committed before the deadline, the sampler fails with `runtime_file_snapshot_incomplete` and `measurement_boundary_timeout` as independently applicable rather than accepting an ambiguous baseline.
 
 The acceptance pause does not initialize, reset, discard, or refund scheduler token-bucket credit. While admissions are paused, exact elapsed monotonic duration may lazily refill the active bucket only up to eight token-seconds under section 4.4. The next eligible starts after resume use that existing bucket and anchor. Only scheduler activation, readiness degradation, restart, or shutdown has the token-bucket lifecycle effects defined in sections 4.1 and 4.6.
 
@@ -679,10 +713,15 @@ At exact `steady_state_end`, the acceptance coordinator establishes the end barr
 2. Cancel attempts admitted but not started before the endpoint as scheduler-level non-counting work. They consume no token and do not enter steady-state attempt accounting.
 3. Allow attempts started before the endpoint to drain to one terminal result. They remain steady-state attempts and contribute their complete sent, received, and charged bytes plus exactly one complete outcome even when completion occurs during the drain.
 4. Fail the run if the end drain exceeds 10 monotonic seconds. A started invocation without a terminal result at that deadline becomes attempt-level `incomplete`, adds `attempt_accounting_incomplete`, and fails the run.
+5. Keep admissions paused after the drain and immediately begin one separate final-runtime-snapshot stabilization window.
+6. Commit the final snapshot through the shared consecutive-map stable-snapshot protocol in section 8.6 within exactly 10 monotonic seconds from end-drain completion.
+7. Resume no work after `steady_state_end`; the final-snapshot protocol must not start a transport, restart acceptance accounting, or reset or reactivate the token bucket.
 
-No invocation may start at or after `steady_state_end`. Such a start adds `measurement_boundary_violation` and fails the run. `steady_state_end_drain_elapsed_ms` measures from exact `steady_state_end` until every started steady-state attempt has a terminal accounting outcome or the drain deadline expires.
+No invocation may start at or after `steady_state_end`. Such a start adds `measurement_boundary_violation` and fails the run. `steady_state_end_drain_elapsed_ms` measures from exact `steady_state_end` until every started steady-state attempt has a terminal accounting outcome or the drain deadline expires. The final-snapshot window begins only when that drain completes; its ten-second deadline neither resets nor extends the preceding ten-second drain deadline.
 
-The top-level `attempts` object represents steady-state attempts only. Steady-state network attribution includes the full bytes of every steady-state attempt, including an attempt that completes during the end drain. After the end drain, the sampler captures the complete recursive final runtime-file snapshot. Startup disk attribution compares the process-start snapshot with the runtime-file snapshot committed in the steady-state baseline bundle; steady-state disk attribution compares that same committed snapshot with the final snapshot. Startup CPU ends at the bundle's committed CPU baseline; the steady-state CPU numerator begins at that identical baseline and includes process CPU through end-drain completion, while its denominator remains the exact requested 30 steady-state minutes. Working-set absolute-cap enforcement continues through end drain. Growth medians use only steady-state minutes 1–5 and 26–30 and never include drain samples.
+The exact service PID must remain alive and unchanged through final-snapshot commit. Exit, restart, or PID replacement during stabilization fails under the existing process/PID violations. If no stable final snapshot commits before the final-snapshot deadline, the sampler adds `runtime_file_snapshot_incomplete` and `measurement_boundary_timeout`, fails acceptance, and does not calculate or report a passing disk result from either ambiguous map.
+
+The top-level `attempts` object represents steady-state attempts only. Attempt membership and steady-state network attribution end at exact `steady_state_end`, with the full bytes of every attempt started before that boundary included even when it completes during the end drain. Startup disk attribution compares the process-start snapshot with the runtime-file snapshot committed in the steady-state baseline bundle; steady-state disk attribution compares that same committed snapshot with the stable final snapshot. Startup CPU ends at the bundle's committed CPU baseline; the steady-state CPU numerator begins at that identical baseline and includes process CPU through stable final-snapshot commit, while its denominator remains the exact requested 30 steady-state minutes. Working-set absolute-cap enforcement and process identity enforcement continue through stable final-snapshot commit. Growth medians use only steady-state minutes 1–5 and 26–30 and never include drain or final-snapshot samples.
 
 The 30-minute run is an R0-005 merge gate. A seven-day soak with zero false Critical alerts and no unplanned termination remains a later R0 release-exit/controlled-acceptance gate because R0-005 creates no alerts.
 
@@ -715,7 +754,7 @@ The 30-minute result is evidence for the exact executable on the recorded profil
 
 Elapsed time and sampling deadlines use a monotonic clock. Pre-steady-state initialization/barrier sampling may use a separately reported fixed-rate grid anchored at initialization start, immediately before process launch; those samples remain subject to the absolute working-set cap but do not define the steady-state boundary, CPU baseline, disk baseline, complete-minute windows, or acceptance accounting reset. `steady_state_start` is the baseline-bundle commit itself. The steady-state fixed-rate grid is re-anchored there: the first steady-state sample boundary is exactly `steady_state_start + 5 seconds`, and every later boundary is an exact five-second multiple from `steady_state_start`. `steady_state_end` is exactly `steady_state_start + requested_steady_state_duration`. UTC wall-clock timestamps may be recorded for correlation, but no calculation uses wall-clock elapsed time.
 
-The sampler uses fixed-rate monotonic schedules with one sample every five seconds and no catch-up burst, continuing through end-drain completion. `valid_sample_count` and `missing_sample_count` cover every required process sample after process creation through that completion, across the separately anchored pre-steady-state and steady-state schedules without duplicating a sample. A sample is missing when no valid sample is collected within ten seconds of its scheduled deadline or when any complete steady-state minute contains fewer than 11 valid samples. Any missing sample fails the run. Only samples at steady-state boundaries derived from `steady_state_start` and within the 30-minute half-open steady-state interval participate in complete-minute growth windows.
+The sampler uses fixed-rate monotonic schedules with one sample every five seconds and no catch-up burst, continuing through stable final-snapshot commit or the failing final-snapshot deadline. `valid_sample_count` and `missing_sample_count` cover every required process sample after process creation through that endpoint, across the separately anchored pre-steady-state and steady-state schedules without duplicating a sample. A sample is missing when no valid sample is collected within ten seconds of its scheduled deadline or when any complete steady-state minute contains fewer than 11 valid samples. Any missing sample fails the run. Only samples at steady-state boundaries derived from `steady_state_start` and within the 30-minute half-open steady-state interval participate in complete-minute growth windows; end-drain and final-snapshot samples enforce absolute caps and process identity but do not enter those medians.
 
 At each valid sample, the sampler refreshes the exact service process and records:
 
@@ -738,11 +777,11 @@ normalized_cpu_percent =
 
 Negative processor-time deltas, zero or negative wall-time deltas, PID changes, and counter resets fail the run. Only after raw inputs have been validated may a reported sampled percentage be bounded to 0–100.
 
-The baseline bundle captures one process-CPU value immediately before its monotonic commit. Startup CPU attribution ends at that value, and steady-state average CPU uses the process-CPU delta from that identical committed baseline through end-drain completion with the same logical-processor normalization. No CPU interval between drain completion and `steady_state_start` exists outside those phases because the commit is the boundary. The denominator remains the exact requested 30 steady-state minutes; drain duration does not extend it. The pass condition is `steady_state_average_cpu_percent < 2.0`. Startup observation duration, startup total CPU time, and startup maximum sampled normalized CPU are reported separately; a startup peak neither replaces nor relaxes the steady-state rule.
+The baseline bundle captures one process-CPU value immediately before its monotonic commit. Startup CPU attribution ends at that value, and steady-state average CPU uses the process-CPU delta from that identical committed baseline through stable final-snapshot commit, or through the failing final-snapshot deadline when no commit occurs, with the same logical-processor normalization. No CPU interval between drain completion and `steady_state_start` exists outside those phases because the commit is the boundary. The denominator remains the exact requested 30 steady-state minutes; neither drain nor final-snapshot duration extends it. The pass condition is `steady_state_average_cpu_percent < 2.0`. Startup observation duration, startup total CPU time, and startup maximum sampled normalized CPU are reported separately; a startup peak neither replaces nor relaxes the steady-state rule.
 
 ### 8.5 Memory, handles, threads, and growth
 
-Every valid working-set sample after process creation must be less than 150,000,000 bytes. Reaching or exceeding that decimal-byte cap fails independently of growth calculations.
+Every valid working-set sample after process creation through stable final-snapshot commit or its failing deadline must be less than 150,000,000 bytes. Reaching or exceeding that decimal-byte cap fails independently of growth calculations.
 
 Growth calculations use complete steady-state per-minute medians anchored to `steady_state_start`. Each steady-state sample is assigned to exactly one complete half-open minute window derived from that boundary. For each minute, values are sorted without rounding; an odd count uses the middle value and an even count uses the arithmetic mean of the two middle values. The first-window value is the median of the five per-minute medians for steady-state minutes 1–5. The final-window value is the median of the five per-minute medians for minutes 26–30.
 
@@ -770,9 +809,20 @@ Disk evidence measures attributable positive file-size growth beneath the dedica
 
 Network or device I/O therefore cannot change either disk value.
 
-Published binaries, immutable input configuration, and sampler-owned evidence/report files must remain outside the monitored runtime directory. The process-start snapshot, the snapshot committed in the steady-state baseline bundle, and the final snapshot recursively enumerate every file beneath that directory. A snapshot keys each file only by its normalized bounded relative path and records a nonnegative integer length. No absolute path enters a report. Enumeration or normalization must not skip or filter a runtime file; a path that escapes the monitored directory, including through traversal or a reparse target, fails rather than being followed or omitted.
+Published binaries, immutable input configuration, and sampler-owned evidence/report files must remain outside the monitored runtime directory. The process-start snapshot, the snapshot committed in the steady-state baseline bundle, and the final snapshot recursively enumerate every file beneath that directory. A canonical snapshot map contains only a normalized bounded relative path and a nonnegative integer file length for every runtime file, with entries ordinal-sorted by normalized relative path. No absolute path enters a report. Enumeration or normalization must not skip or filter a runtime file; a path that escapes the monitored directory, including through traversal or a reparse target, fails rather than being followed or omitted.
 
-The steady-state-start snapshot is committed atomically with the CPU baseline, accounting reset, and monotonic `steady_state_start`. It must be complete and consistent: monitored-tree changes during capture require a bounded retry under section 8.1, and failure to prove a stable snapshot within that barrier fails rather than creating an ambiguous baseline. The same calculation applies to the process-start/steady-state-start pair for `startup.attributed_disk_bytes` and the steady-state-start/final pair for `steady_state.attributed_disk_bytes`:
+The steady-state-start baseline and final post-drain snapshot use one shared **stable runtime-file snapshot protocol**. One bounded stability attempt:
+
+1. captures one complete recursive canonical map `A`;
+2. immediately captures a second complete recursive canonical map `B`;
+3. normalizes and ordinal-sorts both complete maps using the same bounded relative-path rules;
+4. requires identical complete path sets and an identical recorded file length for every path;
+5. commits `B` as the stable snapshot when the maps are identical; and
+6. otherwise discards both maps and retries only within the applicable bounded snapshot window.
+
+The protocol uses the same enumeration, canonicalization, equality, error, and privacy rules at both boundaries. An unreadable file, incomplete enumeration, invalid or negative length, arithmetic overflow, disappearing file during a required comparison, traversal/reparse escape, or absolute-path exposure cannot produce a committed map and retains the bounded failure handling below. No retry may exceed the applicable deadline, and no unbounded retry or sleep is permitted. Same-size rewrites need not be detected because this evidence intentionally measures persistent file-size growth rather than content mutation. Wall-clock timestamps, file-content hashing, ETW, Process Monitor, filesystem drivers, administrator-only monitoring, and new dependencies are prohibited.
+
+The steady-state-start snapshot is committed atomically with the CPU baseline, accounting reset, and monotonic `steady_state_start`. Its stable protocol retries only within the existing single ten-second start barrier. The final protocol begins immediately after end-drain completion, keeps admissions paused, and retries only within its separate ten-second window. Failure to prove either stable snapshot within its applicable window fails rather than creating an ambiguous baseline. The same calculation applies to the process-start/steady-state-start pair for `startup.attributed_disk_bytes` and the steady-state-start/stable-final pair for `steady_state.attributed_disk_bytes`:
 
 ```text
 positive_runtime_file_growth_bytes(baseline, ending) =
@@ -798,7 +848,7 @@ disk_mb_per_day =
 
 For every snapshot pair, a new ending file has baseline size zero; an existing file contributes only `max(0, ending_size - baseline_size)`; and an unchanged, same-size rewritten, or reduced file contributes zero. A baseline file that is missing from the corresponding ending snapshot fails the run instead of contributing a negative value. An unreadable file, invalid or negative length, arithmetic overflow, directory escape, or incomplete recursive snapshot also fails deterministically.
 
-The bounded violations are `runtime_file_disappeared` for a missing baseline file, `runtime_file_scope_violation` for directory escape, `runtime_file_snapshot_incomplete` for unreadable or incompletely enumerated snapshot data, and `runtime_file_snapshot_invalid` for an invalid length or arithmetic overflow. The generic counter-reset, counter-unavailable, counter-negative, and counter-overflow rules remain applicable to independently specified process CPU, sampling, and network-accounting inputs, but they are not disk-attribution rules.
+The bounded violations are `runtime_file_disappeared` for a missing baseline file, `runtime_file_scope_violation` for directory escape, `runtime_file_snapshot_incomplete` for unreadable, incompletely enumerated, or unstable snapshot data, and `runtime_file_snapshot_invalid` for an invalid length or arithmetic overflow. Exhausting either stable-snapshot window also adds `measurement_boundary_timeout`. The generic counter-reset, counter-unavailable, counter-negative, and counter-overflow rules remain applicable to independently specified process CPU, sampling, and network-accounting inputs, but they are not disk-attribution rules.
 
 For the required run, `steady_state_minutes = 30`. The pass condition is `disk_mb_per_day < 100`, using decimal MB/day.
 
@@ -808,9 +858,9 @@ R0-005 intentionally persists no probe evidence. Any unexpected runtime artifact
 
 System-wide adapter counters, packet capture, payload capture, addresses, interface values, and endpoint values are prohibited. The implementation exposes acceptance-only aggregate accounting through its injected probe transport boundaries.
 
-For every started attempt, accounting records only probe kind, measured application bytes sent, measured application bytes received, and `charged_method_bytes` derived exclusively from the closed exact table in section 4.4. No payload or endpoint value is retained. Measured application bytes are exact byte counts crossing the injected transport boundary where available. For a recognized method, the charged value is exactly 128 for Gateway ICMP, 1,024 for DNS, 1,024 for TCP connect, or 8,192 for an HTTPS provider request. It is never supplied or overridden by a transport adapter, configuration, measurement, or platform-specific uplift.
+For every started attempt, accounting records the probe kind, the stable internal workload-member identity required for manifest reconciliation, measured application bytes sent, measured application bytes received, and `charged_method_bytes` derived exclusively from the closed exact table in section 4.4. The member identity is used only for deterministic internal routing, attempt closure, and distinct coverage; it never enters either report. No payload or endpoint value is retained. Measured application bytes are exact byte counts crossing the injected transport boundary where available. For a recognized method, the charged value is exactly 128 for Gateway ICMP, 1,024 for DNS, 1,024 for TCP connect, or 8,192 for an HTTPS provider request. It is never supplied or overridden by a transport adapter, configuration, measurement, or platform-specific uplift.
 
-Concurrent HTTPS provider children are never coalesced. Each provider invocation has its own internal round/provider identity, token consumption, transport-start timestamp, sent/received/charged byte values, outcome, and phase membership. The reports aggregate those records without exposing provider IDs or endpoint values; concurrency changes neither the per-attempt formula nor completeness requirements.
+Concurrent HTTPS provider children are never coalesced. Each provider invocation has its own internal round/provider member identity, token consumption, transport-start timestamp, sent/received/charged byte values, outcome, phase membership, and coverage attribution. The reports aggregate those records without exposing provider IDs or endpoint values; concurrency changes neither the per-attempt formula, per-provider coverage proof, nor completeness requirements.
 
 ```text
 attributed_attempt_network_bytes =
@@ -844,9 +894,10 @@ The JSON has these exact top-level properties in this order:
 7. `steady_state`
 8. `growth`
 9. `attempts`
-10. `caps`
-11. `violations`
-12. `result`
+10. `workload_coverage`
+11. `caps`
+12. `violations`
+13. `result`
 
 `schema_version` is exactly `r0-005-resource-report/v1`. Required nested properties are:
 
@@ -855,15 +906,16 @@ The JSON has these exact top-level properties in this order:
 | `source` | `commit_sha`, `configuration_name`, `executable_sha256` |
 | `configuration` | `target_count`, `https_provider_count`, `logical_processor_count`, `sampling_interval_seconds`, `requested_steady_state_minutes` |
 | `host_profile` | `profile_id`, `os_product`, `os_version`, `os_build`, `os_revision`, `os_architecture`, `process_architecture`, `framework_description`, `runtime_version`, `runtime_identifier`, `gc_mode`, `logical_processor_count`, `total_physical_memory_bytes`, `processor_vendor`, `processor_family`, `processor_model`, `processor_stepping`, `virtualization`, `power_source`, `power_scheme_guid`, `battery_saver_enabled`, `process_priority`, `debugger_attached`, `profiler_attached`, `idle_preflight_average_cpu_percent`, `idle_preflight_available_memory_bytes` |
-| `timing` | `process_start_utc`, `readiness_utc`, `startup_elapsed_ms`, `steady_state_start_barrier_elapsed_ms`, `steady_state_start_utc`, `steady_state_end_utc`, `steady_state_end_drain_elapsed_ms`, `valid_sample_count`, `missing_sample_count` |
+| `timing` | `process_start_utc`, `readiness_utc`, `startup_elapsed_ms`, `steady_state_start_barrier_elapsed_ms`, `steady_state_start_utc`, `steady_state_end_utc`, `steady_state_end_drain_elapsed_ms`, `final_runtime_snapshot_elapsed_ms`, `valid_sample_count`, `missing_sample_count` |
 | `startup` | `cpu_observation_duration_ms`, `total_cpu_ms`, `maximum_normalized_cpu_percent`, `maximum_working_set_bytes`, `attributed_disk_bytes`, `attributed_network_bytes`, `attempts_started`, `attempts_completed`, `attempts_succeeded`, `attempts_failed`, `attempts_timed_out`, `attempts_canceled`, `attempts_incomplete` |
 | `steady_state` | `average_normalized_cpu_percent`, `maximum_working_set_bytes`, `maximum_private_bytes`, `maximum_handle_count`, `maximum_thread_count`, `attributed_disk_bytes`, `disk_mb_per_day`, `attributed_network_bytes`, `network_bytes_per_minute` |
 | `growth` | `working_set`, `private_bytes`, `handles`, `threads` |
 | `attempts` | `by_probe_kind`, `by_outcome`, `started`, `completed`, `succeeded`, `failed`, `timed_out`, `canceled`, `incomplete` |
+| `workload_coverage` | `gateway_required`, `gateway_exercised`, `dns_required`, `dns_exercised`, `https_providers_configured`, `https_providers_exercised`, `tcp_targets_configured`, `tcp_targets_exercised`, `all_required_exercised` |
 | `caps` | `readiness_ms`, `working_set_bytes`, `average_cpu_percent`, `disk_mb_per_day`, `network_bytes_per_minute`, `growth_percent`, `working_set_growth_noise_bytes`, `private_bytes_growth_noise_bytes`, `handle_growth_noise_count`, `thread_growth_noise_count` |
 | `result` | the string `pass` or `fail` |
 
-The table is normative for nested property presence and property order. `configuration.logical_processor_count` must exactly equal `host_profile.logical_processor_count`. The two barrier timing durations are nonnegative JSON integers in milliseconds. `timing.steady_state_start_utc` represents the UTC correlation value captured for the exact monotonic baseline-bundle commit; `steady_state_end_utc` correlates to exactly the requested duration after that commit. `startup.total_cpu_ms`, `steady_state.average_normalized_cpu_percent`, `startup.attributed_disk_bytes`, and `steady_state.attributed_disk_bytes` all use the one committed boundary model in sections 8.1, 8.4, and 8.6. The disk integers are the results of the process-start/steady-state-start and steady-state-start/final snapshot pairs; `steady_state.disk_mb_per_day` is calculated only from the latter. `startup.attempts_*` values are nonnegative JSON integers for startup transport invocations and satisfy the same started/completed/outcome identities as the top-level steady-state attempt scalars. Queued work canceled before transport start appears in neither set of transport-attempt counts. The human report uses the identical baseline-bundle timestamp, CPU baseline, snapshot pairs, phase membership, exact method-charge derivation, and totals.
+The table is normative for nested property presence and property order. `configuration.logical_processor_count` must exactly equal `host_profile.logical_processor_count`; `configuration.target_count` must equal the manifest's distinct TCP-member count; and `configuration.https_provider_count` must equal its distinct HTTPS-provider count. The three boundary timing durations are nonnegative JSON integers in milliseconds. `timing.steady_state_start_utc` represents the UTC correlation value captured for the exact monotonic baseline-bundle commit; `steady_state_end_utc` correlates to exactly the requested duration after that commit. `steady_state_end_drain_elapsed_ms` ends at terminal attempt closure or its deadline. `final_runtime_snapshot_elapsed_ms` is required in every success or failure report, starts at end-drain completion or its failing deadline, and ends at stable final-snapshot commit; it is zero only when the complete two-map protocol commits at the same observable monotonic instant, and on final-snapshot failure records elapsed time through the failing deadline. `startup.total_cpu_ms`, `steady_state.average_normalized_cpu_percent`, `startup.attributed_disk_bytes`, and `steady_state.attributed_disk_bytes` all use the boundary model in sections 8.1, 8.4, and 8.6. The disk integers are the results of the process-start/steady-state-start and steady-state-start/stable-final snapshot pairs; `steady_state.disk_mb_per_day` is calculated only from the latter. `startup.attempts_*` values are nonnegative JSON integers for startup transport invocations and satisfy the same started/completed/outcome identities as the top-level steady-state attempt scalars. Queued work canceled before transport start appears in neither set of transport-attempt counts. The human report uses the identical baseline-bundle timestamp, CPU baseline, stable snapshot pairs, phase membership, exact method-charge derivation, coverage reconciliation, timing values, and totals.
 
 ```text
 startup.attempts_completed =
@@ -951,6 +1003,7 @@ The following synthetic fragment is normative for the adjacency and property ord
   "steady_state_start_utc": "2026-01-01T00:00:10.0000000Z",
   "steady_state_end_utc": "2026-01-01T00:30:10.0000000Z",
   "steady_state_end_drain_elapsed_ms": 0,
+  "final_runtime_snapshot_elapsed_ms": 0,
   "valid_sample_count": 362,
   "missing_sample_count": 0
 },
@@ -1064,7 +1117,27 @@ started =
   completed + incomplete
 ```
 
-The following object fragment is the normative zero-attempt representation:
+`workload_coverage` is derived from the frozen manifest and terminal steady-state attempt records, never independently assigned. Gateway and DNS use JSON Booleans; the provider and target values are nonnegative JSON integers. Its properties appear exactly in the table order above. `gateway_required` is always `true`; `dns_required` reflects whether DNS was enabled in the accepted configuration. The corresponding exercised Boolean is `true` only when that required member meets section 8.1, while disabled DNS requires both DNS flags to be `false`. Configured counts equal the manifest's distinct category counts and exercised counts deduplicate exact internal member identity. `all_required_exercised` is `true` if and only if every equality in section 8.1 holds, the Gateway logical-round/ICMP rule holds, no manifest identity or configuration defect exists, and every required member is distinctly exercised.
+
+The required passing two-provider, DNS-enabled, 25-TCP-target run has this ordered object shape:
+
+```json
+"workload_coverage": {
+  "gateway_required": true,
+  "gateway_exercised": true,
+  "dns_required": true,
+  "dns_exercised": true,
+  "https_providers_configured": 2,
+  "https_providers_exercised": 2,
+  "tcp_targets_configured": 25,
+  "tcp_targets_exercised": 25,
+  "all_required_exercised": true
+}
+```
+
+The complete report fails deterministic serialization when `workload_coverage` is missing, reordered, malformed, contains an additional property, uses a non-Boolean flag or noninteger/negative count, conflicts with `configuration` or the internal manifest reconciliation, or disagrees with the identical human-report calculation. No endpoint, provider ID, target ID, host, port, operator ID, scheduler key, internal member identity, or private path enters either report.
+
+The following object fragment is the normative zero-attempt representation for the required two-provider, DNS-enabled, 25-TCP-target run:
 
 ```json
 "attempts": {
@@ -1089,14 +1162,26 @@ The following object fragment is the normative zero-attempt representation:
   "timed_out": 0,
   "canceled": 0,
   "incomplete": 0
+},
+"workload_coverage": {
+  "gateway_required": true,
+  "gateway_exercised": false,
+  "dns_required": true,
+  "dns_exercised": false,
+  "https_providers_configured": 2,
+  "https_providers_exercised": 0,
+  "tcp_targets_configured": 25,
+  "tcp_targets_exercised": 0,
+  "all_required_exercised": false
 }
 ```
 
-This example is normative for property names, property order, array order, closed vocabularies, mandatory zero entries, integer count encoding, and scalar representation. It is an object fragment from the complete `r0-005-resource-report/v1` report, not a standalone full report.
+This example is normative for property names, property order, array order, closed vocabularies, mandatory zero entries, integer count encoding, Boolean encoding, and scalar representation. It is an object fragment from the complete `r0-005-resource-report/v1` report, not a standalone full report. Counts in other valid configurations reflect their accepted manifest. The zero-attempt representation remains a valid deterministic diagnostic, but it cannot pass when the manifest is nonempty: the exercised values remain false or zero, `all_required_exercised` is `false`, and `acceptance_workload_incomplete` is mandatory.
 
 `violations` is an ordinal-sorted array containing only these stable bounded codes when applicable:
 
 - `acceptance_cleanup_failed`
+- `acceptance_workload_incomplete`
 - `attempt_accounting_incomplete`
 - `counter_negative`
 - `counter_overflow`
@@ -1148,11 +1233,15 @@ Violation `attempt_accounting_incomplete` is mandatory when any of the following
 - the configured-budget and acceptance-accounting charge tables differ;
 - `incomplete` is greater than zero.
 
+Violation `acceptance_workload_incomplete` is mandatory when any required workload member is not exercised or workload identity cannot be reconciled. This includes zero steady-state attempts; missing Gateway coverage; missing enabled-DNS coverage; any unexercised configured HTTPS provider or enabled TCP target; a `configuration.target_count`/manifest mismatch; any configured/exercised count mismatch; duplicate identities masking a missing member; unknown, missing, duplicated, or unmanifested member attribution; accepted-configuration or manifest mutation; startup-only purported coverage; a coverage-calculation, derived-flag, or human/JSON identity failure; or malformed/missing/reordered `workload_coverage`. A started attempt without terminal accounting triggers the existing `attempt_accounting_incomplete` violation and cannot exercise a member, so both violations appear when both conditions apply. A run containing `acceptance_workload_incomplete` can never pass regardless of resource values.
+
+Coverage proves execution, not endpoint health. A completely accounted failed, timed-out, or post-start canceled attempt can exercise its exact member. No exact cadence-derived attempt count per member is required; the scheduler, cadence, rate, resource, and at-least-one-exercise rules remain independently binding.
+
 Violation `unknown_probe_method` is mandatory whenever `attempts.by_probe_kind["unknown"] > 0`. Both `attempt_accounting_incomplete` and `unknown_probe_method` appear when both conditions apply. Every applicable violation appears exactly once, and the `violations` array remains in ordinal code order.
 
 Schema, property-order, array-order, and type defects also make the report `result` equal `fail` and cause a nonzero sampler exit. This is required even when the report can still serialize a bounded violation list; every other independently applicable violation code also appears exactly once.
 
-The report contains no machine name, username, domain membership, serial number, BIOS serial, device UUID, Windows product key, MAC address, IP address, disk serial, cloud instance ID, arbitrary environment variable, absolute path, endpoint, target, interface, DNS answer, payload, header, body, exception text, credential, customer identifier, or DNS-correlation snapshot field. The human report must contain the same required host-profile, timing, startup-attempt, steady-state-attempt, cap, and violation values and must not apply different calculations, phase membership, property meaning, or privacy rules.
+The report contains no machine name, username, domain membership, serial number, BIOS serial, device UUID, Windows product key, MAC address, IP address, disk serial, cloud instance ID, arbitrary environment variable, absolute path, endpoint, target, provider/member identity, scheduler key, interface, DNS answer, payload, header, body, exception text, credential, customer identifier, or DNS-correlation snapshot field. The human report must contain the same required host-profile, timing, startup-attempt, steady-state-attempt, workload-coverage, cap, and violation values and must not apply different calculations, phase membership, property meaning, or privacy rules.
 
 ### 8.9 Failure rules
 
@@ -1161,17 +1250,18 @@ The sampler exits nonzero when:
 - readiness exceeds 60 seconds;
 - any static acceptance-host requirement is unsupported, required host metadata is missing, or a prohibited shared/CPU-quota-limited host is used;
 - the 60-second host preflight is missing a required sample, has average non-agent system CPU greater than or equal to 10.0%, or ends with less than 2,000,000,000 bytes available physical memory;
-- the process exits, the PID changes, or a replacement/restart occurs;
-- the complete start barrier from admission pause through baseline-bundle commit, or the end drain, exceeds 10 seconds;
+- the process exits, the PID changes, or a replacement/restart occurs at any point through stable final-snapshot commit;
+- the complete start barrier from admission pause through baseline-bundle commit, the end drain, or the separate final-snapshot stabilization window exceeds its 10-second deadline;
 - an invocation starts at or after `steady_state_end`;
 - a sample is missing;
 - a required non-disk counter or network-accounting value is unavailable, negative, reset, or overflows;
-- a recursive runtime-file snapshot is incomplete, unstable within the bounded start barrier, unreadable, contains an invalid length, overflows during subtraction or summation, escapes the monitored directory, or loses a baseline file;
+- a required recursive runtime-file snapshot is incomplete, unstable within its bounded start or final window, unreadable, contains an invalid length, overflows during subtraction or summation, escapes the monitored directory, or loses a baseline file;
 - working set reaches or exceeds 150,000,000 bytes;
 - steady-state average CPU reaches or exceeds 2.0%;
 - disk reaches or exceeds 100 decimal MB/day;
 - network reaches or exceeds 100,000 bytes/minute;
 - any growth rule fails;
+- any required workload member is not distinctly exercised or manifest/configuration/member reconciliation fails under mandatory `acceptance_workload_incomplete` conditions in section 8.8;
 - attempt accounting, exact recognized-method charge derivation, or configured-budget/acceptance table consistency is incomplete under any mandatory `attempt_accounting_incomplete` condition in section 8.8;
 - an unknown probe method is encountered;
 - report serialization violates schema, property or array ordering, type, numeric, or privacy requirements;
@@ -1215,6 +1305,8 @@ Use fake transports, an injected clock, and deterministic jitter to cover:
 - unknown methods always failing with the deterministic zero-sentinel/measured-byte representation, and missing, malformed, negative, nonintegral, supplied, overridden, or conflicting recognized-method charges failing deterministically;
 - exact budget boundaries with DNS enabled and disabled, including a configuration that is valid only when DNS is disabled;
 - rejection of 25 targets at 15 seconds, acceptance of a 25-target configuration with sufficiently long intervals, and the valid two-default-provider 25-target/60-second example;
+- atomic acceptance-manifest capture from the accepted startup configuration before acceptance measurement, with exactly one Gateway member, conditional DNS membership, one member per configured HTTPS provider, and one member per enabled TCP target;
+- immutable manifest/configuration and stable scheduler/member identity across the run, with duplicate, unknown, missing, mutated, or no-longer-configured identities rejected without using display names, positions, endpoints, logs, or aggregate counts;
 - all provider children in valid two-, three-, and four-provider HTTPS rounds starting without serial five-second waits when the required slots and tokens are available;
 - three- and four-provider rounds in which every child times out at five seconds completing as one counted aggregate failure within the ten-second round deadline, and two consecutive such rounds advancing HTTPS state under the existing threshold;
 - partial HTTPS success remaining aggregate success with `partial_endpoint_failure` when one provider succeeds and the other provider children fail;
@@ -1258,6 +1350,7 @@ Verify:
 - URI user information, credentials, credential-assignment syntax, query strings, fragments, and customer/device identifiers are rejected;
 - HTTPS redirects and invalid TLS are rejected without fallback or weakened validation;
 - endpoint URLs/hosts, DNS queries/answers, DNS-correlation snapshot fields, target IDs/labels/hosts/ports, response bodies, headers, interface/route data, exception text, machine paths, and other customer-controlled values do not appear in production logs or evidence;
+- workload manifests, scheduler keys, internal member identities, per-provider identities, and per-target identities do not appear in JSON or human acceptance reports, logs, health, support output, or metrics;
 - response-body readers stop at the 256-byte bound plus one overflow-detection byte and retain no bytes;
 - no production inbound listener, firewall mutation, packet capture, subnet/range expansion, broad port scan, or arbitrary gateway TCP probe exists;
 - no probe journal/outbox call, schema artifact, identity fabrication, or raw LAN inventory is introduced.
@@ -1272,9 +1365,11 @@ Native acceptance must verify:
 - bounded route evidence without interface/address disclosure;
 - ICMP success when permitted and `icmp_unavailable` behavior when it is not;
 - cancellation and service stop complete within five seconds;
-- the 25-target resource sampler passes;
+- the 25-target resource sampler passes only after the Gateway, enabled DNS, both HTTPS providers, and all 25 distinct synthetic TCP members receive terminal steady-state exercise;
 - the start barrier commits one stable steady-state baseline bundle while admissions remain paused, with `steady_state_start` equal to that commit and no later pre-existing sampling-grid wait;
+- the start and final snapshots use the same consecutive-map stable-snapshot protocol, the final snapshot commits within its separate ten-second post-drain window, and admissions remain paused with no transport start after `steady_state_end`;
 - steady-state sampling is anchored at exact `steady_state_start + 5n seconds`, and startup/steady-state CPU and disk attribution share the committed boundary without an omitted or double-counted interval;
+- the exact PID remains alive and unchanged and CPU, disk, and working-set enforcement continue through stable final-snapshot commit while attempt and network membership stop at exact `steady_state_end`;
 - monitoring-ready is achieved within 60 seconds after network availability;
 - no inbound listener or firewall rule is added;
 - every synthetic listener and service acceptance artifact is cleaned up.
@@ -1292,12 +1387,17 @@ Deterministic automated tests must cover:
 - a drain ending between pre-existing five-second grid points producing no baseline gap, complete start-barrier success/timeout including bounded stable-snapshot retry, end-drain success/timeout, exact half-open interval behavior, and deterministic `measurement_boundary_timeout` and `measurement_boundary_violation` codes;
 - start/end admission pauses consuming no pre-start token, issuing no refund, preserving the active bucket/anchor, and allowing elapsed barrier time to refill lazily only to the eight-token cap before post-resume dispatch;
 - no byte splitting, full bytes from a steady-state attempt that completes during end drain, startup attempts excluded from top-level attempts, and queued pre-start/end work excluded from transport-attempt arrays;
-- process CPU and network attribution through end drain, disk attribution through the process-start/committed-steady-state-start/final recursive snapshots, and growth windows excluding drain samples;
+- full network-byte/outcome closure for steady-state attempts through end drain, disk attribution through the process-start/committed-stable-start/stable-final recursive snapshots, and growth windows excluding drain and final-snapshot samples;
+- process CPU and working-set enforcement through stable final-snapshot commit, disk growth through that commit, and attempt/network membership ending at exact `steady_state_end` without a final-snapshot transport or token-bucket restart;
 - CPU consumed before baseline-bundle commit counted startup-only, CPU consumed after commit counted steady-state-only, file growth before the committed snapshot counted startup-only, file growth after it counted steady-state-only, and no CPU or file-growth interval omitted, duplicated, or assigned to both phases;
 - 80,000 process/network write bytes per minute with zero runtime-file growth producing zero `attributed_disk_bytes` and zero `disk_mb_per_day`, proving that aggregate process I/O counters are not disk inputs;
 - new-file and existing-file growth summing correctly, unchanged and same-size rewritten files contributing zero, file shrinkage contributing zero, and a disappearing baseline file failing;
 - startup and steady-state disk attribution using their separate pairs around the one committed snapshot, with timing, CPU, disk, attempts, network, and phase-boundary values/calculations identical in JSON and human reports;
-- an unstable/incomplete steady-state-start snapshot, unreadable or incomplete snapshots, invalid lengths, arithmetic overflow, directory escape/reparse escape, bounded retry/deadline exhaustion, and each corresponding bounded runtime-file violation;
+- identical consecutive canonical maps committing the second map deterministically; differing path sets or file lengths discarding both maps and retrying; and one unstable pair followed by a stable pair committing only the stable second map;
+- continuous mutation through either bounded window, unreadable or incomplete final enumeration, invalid lengths, arithmetic overflow, disappearing files, directory escape/reparse escape, and bounded retry/deadline exhaustion producing each applicable runtime-file and boundary violation without a passing disk result;
+- one shared start/final canonicalization and equality implementation, same-size rewrites requiring no content detection, no wall-clock/hash/ETW/Process Monitor/driver dependency, and exact separate ten-second end-drain and final-snapshot deadlines;
+- process exit, restart, or PID change during final stabilization failing; no transport start at or after `steady_state_end`; CPU and disk including use/growth through final commit while attempts and network remain bounded by the half-open interval;
+- exact deterministic placement and nonnegative integer encoding of `final_runtime_snapshot_elapsed_ms`, including zero-at-the-same-observable-instant semantics, failure elapsed through the deadline, and identical human/JSON values;
 - PID change, process exit, restart, negative/zero/reset/unavailable/overflowed non-disk counters, unknown methods, and missing started-attempt accounting;
 - decimal-byte, decimal-MB/day, bytes/minute, millisecond, percentage, and logical-processor normalization;
 - every stable resource violation code and ordinal violation ordering;
@@ -1312,6 +1412,12 @@ Deterministic automated tests must cover:
 - mutually exclusive probe-kind assignment and mutually exclusive outcome assignment for every invocation;
 - every started invocation receiving exactly one outcome and rejection of an outcome without a corresponding started invocation;
 - separate accounting for every HTTPS provider request;
+- complete required workload passing only after the Gateway logical-round/terminal-ICMP rule, enabled DNS, every configured HTTPS provider, and all 25 TCP members are distinctly exercised during steady state, with terminal failed/timed-out attempts eligible and no exact cadence-derived count required;
+- a zero-attempt run, one missing TCP target, 24 distinct TCP targets plus duplicate work on another, one missing HTTPS provider, aggregate HTTPS counts masking an unexercised provider, missing Gateway coverage, and enabled-but-unexercised DNS each adding `acceptance_workload_incomplete` and failing;
+- disabled DNS producing no required member and both DNS flags false; startup-only work and pre-start cancellation not satisfying coverage; and a started nonterminal attempt satisfying neither coverage nor existing attempt closure while adding both applicable violations;
+- unknown, missing, duplicate, unmanifested, mutated, or no-longer-configured internal identities; `configuration.target_count`/manifest mismatch; configured/exercised mismatch; and configuration or manifest mutation all failing deterministic reconciliation;
+- exact `workload_coverage` top-level placement and property order, JSON Boolean and nonnegative-integer encodings, derived `all_required_exercised`, agreement between human and JSON calculations, and rejection of missing, reordered, malformed, additional, or inconsistent fields;
+- privacy exclusion of target/provider identities, endpoints, hosts, ports, operator IDs, scheduler keys, internal member identities, and private paths from workload coverage, with the deterministic zero-attempt fragment remaining valid diagnostic output but never a passing nonempty-manifest run;
 - exact fixed charge derivation for every supported method, adapter charge input/override rejection, measured-below-table and measured-above-table attribution, and one shared configured-budget/acceptance table without drift;
 - byte-identical totals and reports from different adapters with identical measured bytes, one exact 8,192-byte charge per concurrent HTTPS provider, and deterministic network totals immediately below, exactly at, and above the 100,000-byte/minute boundary;
 - route/interface discovery remaining outside transport-invocation counts;
