@@ -38,7 +38,7 @@ These are deliberate R0-005 decisions affecting detection latency and false-posi
 The binding rationales are:
 
 - The 30-second Gateway, DNS, and HTTPS cadence preserves capacity for 25 configured targets under the global attempt and charged-network budgets and reduces always-on background traffic.
-- A successfully stabilized route snapshot with no eligible default-route candidate is higher-confidence local evidence than an ICMP timeout or unreachable response. That `missing_route` evidence therefore uses threshold 2, while ICMP retains threshold 3. Failed or unstable route selection is non-counting `route_selection_unavailable`, not missing-route evidence.
+- A successfully stabilized route snapshot with no eligible default-route candidate, including after mandatory `DisableDefaultRoutes == false` policy filtering, is higher-confidence local evidence than an ICMP timeout or unreachable response. That `missing_route` evidence therefore uses threshold 2, while ICMP retains threshold 3. Failed or unstable route selection is non-counting `route_selection_unavailable`, not missing-route evidence.
 - DNS uses threshold 2 because it remains an independently exposed local state and cannot alone declare the HTTPS aggregate offline.
 - HTTPS uses threshold 2 because a counted aggregate failure requires every configured provider attempt to start and complete with no success. Partial provider success, `blocked_by_dns`, correlation-unavailable rounds, cancellation, and capacity/deadline incompleteness do not count toward that threshold.
 - TCP uses threshold 2 because every target is one explicitly configured host/port service and R0-005 creates no user incident or alert. Later notification policy may add user-facing debounce without changing the local technical evidence.
@@ -50,6 +50,8 @@ The remaining deliberate reconciliations are:
 - Technical Feasibility supplies the approved resource caps, 25-target boundary, three-check “protected” concept, and later seven-day soak. Its disk cap is explicitly a persistent “Disk growth” target tested by “Database size trend”; R0-005 therefore measures attributable runtime-file-size growth rather than aggregate process I/O. R0-005 adopts the caps and target count but keeps “protected,” alert truth, and the long soak outside its local operational-state merge gate.
 - Data Model/API supplies the broader persisted state vocabulary. R0-005 maps to it without changing contracts and defers durability until authenticated identity exists.
 - MVP Backlog assigns target management to the later local-configuration task. R0-005 pulls forward only the narrow execution/evidence primitives listed in section 2.5.
+
+For Windows route-policy field semantics, the official Microsoft IP Helper documentation is the source of truth. [`MIB_IPINTERFACE_ROW.DisableDefaultRoutes`](https://learn.microsoft.com/en-us/windows/win32/api/netioapi/ns-netioapi-mib_ipinterface_row) is a Boolean on the family-specific IP-interface row: `true` means use of the default route on that interface is disabled. Microsoft documents this as a security control VPN clients can use to restrict split tunneling and documents that [`GetIpInterfaceEntry`](https://learn.microsoft.com/en-us/windows/win32/api/netioapi/nf-netioapi-getipinterfaceentry) obtains its current value. R0-005 therefore treats `DisableDefaultRoutes == false` as a mandatory operating-system route-policy constraint, not an optional heuristic, metric penalty, preference, or fallback rule.
 
 ## 2. Resolved planning blockers
 
@@ -263,6 +265,8 @@ The Windows adapter uses these official Microsoft IP Helper contracts:
 - [`GetIpInterfaceEntry`](https://learn.microsoft.com/en-us/windows/win32/api/netioapi/nf-netioapi-getipinterfaceentry) and [`MIB_IPINTERFACE_ROW`](https://learn.microsoft.com/en-us/windows/win32/api/netioapi/ns-netioapi-mib_ipinterface_row) for the associated family-specific IP-interface row; and
 - [`GetIfEntry2`](https://learn.microsoft.com/en-us/windows/win32/api/netioapi/nf-netioapi-getifentry2) and [`MIB_IF_ROW2`](https://learn.microsoft.com/en-us/windows/win32/api/netioapi/ns-netioapi-mib_if_row2) for the associated interface row.
 
+For each route and address family, `GetIpInterfaceEntry` supplies one family-matching `MIB_IPINTERFACE_ROW` whose `Connected`, `Metric`, and `DisableDefaultRoutes` values are consumed together. `DisableDefaultRoutes == true` prohibits that interface's default route from entering the eligible candidate set. The adapter must not penalize the route's metric, place it after enabled routes, select it as a fallback, or reinterpret the policy as `icmp_unavailable`.
+
 A default route has an all-zero `DestinationPrefix.Prefix` for its address family and `DestinationPrefix.PrefixLength` exactly zero. Multiple default-route rows may coexist. For each row, the effective metric is the checked sum documented by Microsoft:
 
 ```text
@@ -272,13 +276,15 @@ effective_metric = route_metric + family_specific_interface_metric
 At the beginning of every Gateway logical round, before route reduction, the adapter performs this stable-snapshot protocol within the existing ten-second logical-round deadline:
 
 1. Enumerate current-compartment IPv4 and IPv6 route rows.
-2. For every possible default-route candidate, resolve its associated `MIB_IPINTERFACE_ROW` for the same address family and its `MIB_IF_ROW2`.
+2. For every possible default-route candidate, resolve its associated `MIB_IPINTERFACE_ROW` for the same address family and its `MIB_IF_ROW2`. The family-specific row used for `Connected`, `Metric`, and `DisableDefaultRoutes` must come from this same complete snapshot pass; the adapter must not combine route data from one state with an IP-interface policy field from another.
 3. Filter and canonicalize the complete eligible candidate set as set A.
 4. Immediately repeat the complete enumeration, resolution, filtering, and canonicalization as set B.
 5. Normalize and ordinal-sort both sets using the exact tuple below.
 6. Commit B only when the complete canonical sets are identical. Otherwise discard both and retry only within the same logical-round deadline.
 
-Failure of a required route/interface API, invalid or contradictory row data, invalid metric, checked metric overflow, or inability to obtain identical sets before the deadline reduces the round as non-counting `route_selection_unavailable`. An unstable or failed enumeration must never be reported as a missing route. Once B commits, later route changes cannot alter the active round; they are visible only to the next Gateway round. Route discovery consumes no token and no network-attempt slot.
+Candidate membership incorporates `DisableDefaultRoutes`. When the value is `false` in both A and B, an otherwise conforming route may remain eligible. When it is `true` in both passes, the route is absent from both eligible sets. A change from `false` to `true` or from `true` to `false` changes candidate membership, makes A and B unequal, and discards the pair. Retry remains bounded by the existing Gateway logical-round deadline. Continuous policy-flag instability through that deadline reduces as non-counting `route_selection_unavailable`; no mixed-state snapshot may commit.
+
+Failure of a required route/interface API, incomplete associated-row resolution, invalid or contradictory row data, invalid metric, checked metric overflow, or inability to obtain identical sets before the deadline reduces the round as non-counting `route_selection_unavailable`. An unstable, incomplete, or failed enumeration must never be reported as a missing route. Once B commits, later route changes cannot alter the active round; they are visible only to the next Gateway round. Route discovery consumes no token and no network-attempt slot.
 
 A row is an eligible default-route candidate only when all of these conditions hold:
 
@@ -286,13 +292,13 @@ A row is an eligible default-route candidate only when all of these conditions h
 - address family is IPv4 or IPv6;
 - route `Loopback` is false;
 - route valid lifetime is nonzero or infinite;
-- the family-matching IP-interface row exists and `Connected` is true;
+- the family-matching IP-interface row exists, `Connected` is true, and `DisableDefaultRoutes` is false;
 - the interface row exists, `AdminStatus` is up, `OperStatus` is `IfOperStatusUp`, and `MediaConnectState` is connected;
 - the interface is not software loopback, endpoint-only, or a filter interface;
 - `NotAuthenticated`, `NotMediaConnected`, `Paused`, and `LowPower` are all false; and
 - route and interface metrics are valid nonnegative values whose checked sum does not overflow.
 
-An absent associated row makes that route ineligible. An API error while resolving a required row makes the snapshot unavailable. Ethernet, Wi-Fi, PPP, tunnel, and VPN interfaces remain eligible when they satisfy the same conditions; physical, wireless, virtual, or tunnel form alone neither prefers nor excludes a candidate.
+An associated row that is conclusively absent in an otherwise complete successful pass makes that route ineligible; inability to complete associated-row resolution or any required lookup failure makes the snapshot unavailable. Ethernet, Wi-Fi, PPP, VPN, tunnel, and virtual interfaces use exactly the same `Connected == true`, `DisableDefaultRoutes == false`, metric, status, and flag conditions. Interface type alone neither prefers nor excludes a candidate, and no interface type may bypass the default-route policy field.
 
 Each internal canonical candidate contains only:
 
@@ -324,7 +330,7 @@ Canonical next-hop bytes are the fixed-length address bytes in network order for
 
 Address-family rank is the explicit R0-005 tie-break policy: IPv4 is `0` and IPv6 is `1`. Lower effective metric therefore wins across both families; IPv4 wins only when effective metrics tie; the remaining fields deterministically resolve multi-adapter and duplicate-metric cases. The selected route is exactly the first candidate after sorting.
 
-A successfully stabilized set with zero eligible candidates reduces as counted `missing_route`. Route selection and ICMP usability are separate. After selecting a route:
+A successfully stabilized set with zero eligible candidates reduces as counted `missing_route`, including when every potential default route is excluded because its family-matching IP-interface row has `DisableDefaultRoutes == true`. No new public result code is added for this policy exclusion. Route selection and ICMP usability are separate. After selecting a route:
 
 - a usable IPv4 next hop is unicast, nonzero, non-loopback, non-multicast, and non-broadcast;
 - a usable IPv6 next hop is unicast, non-unspecified, non-loopback, and non-multicast; and
@@ -334,7 +340,7 @@ An unusable, unspecified, or on-link next hop does not turn the selected route i
 
 `icmp_unavailable` retains route evidence and cannot by itself move a target to `offline`. When `icmp_unavailable` occurs before any successful method result while the target is `baselining`, the state remains `baselining` (`Unknown` projection). From `healthy`, it lowers confidence to `suspect` (`Degraded` projection) without incrementing either gateway failure streak. From `baselining`, `suspect`, `recovering`, or `offline`, state and counters remain unchanged. An already `offline` state remains offline until an actual success begins recovery. `route_selection_unavailable` is also non-counting and leaves state and counters unchanged.
 
-The round records only bounded method evidence for whether a stable route selection exists, whether a usable ICMP next hop exists, whether ICMP was attempted, and the bounded result. Candidate fields, gateway or interface addresses, LUIDs, indices, names, descriptions, metrics, protocols, origins, raw API values, and operating-system exception text never enter reports, logs, health, support output, persistence, or metrics.
+The round records only bounded method evidence for whether a stable route selection exists, whether a usable ICMP next hop exists, whether ICMP was attempted, and the bounded result. Honoring `DisableDefaultRoutes` preserves Windows interface route policy and avoids bypassing VPN split-tunneling controls. The policy value, interface identity or type, VPN status, gateway or interface IP address, next hop, LUID, interface index, names, descriptions, metrics, protocols, origins, other candidate fields, raw API values, and operating-system exception text never enter JSON reports, human reports, logs, health output, support evidence, persistence, or metrics. Evidence must not reveal whether any VPN or other interface had the flag set.
 
 The stable zero-eligible-candidate `missing_route` threshold is two consecutive rounds. The ICMP timeout/unreachable threshold is three consecutive counted failures. A successful Gateway round resets both Gateway failure streaks. A `missing_route` failure resets the ICMP streak before incrementing the missing-route streak, and an ICMP timeout/unreachable resets the missing-route streak before incrementing the ICMP streak. The two classifications therefore form separate consecutive streaks and never combine toward either threshold.
 
@@ -607,7 +613,7 @@ The R0-005 offline thresholds remain:
 
 | Logical target and failure classification | Threshold |
 | --- | ---: |
-| Gateway stable snapshot with zero eligible default-route candidates (`missing_route`) | 2 |
+| Gateway stable snapshot with zero eligible default-route candidates after `DisableDefaultRoutes == false` and every other binding filter (`missing_route`) | 2 |
 | Gateway ICMP timeout/unreachable | 3 |
 | DNS | 2 |
 | HTTPS aggregate | 2 |
@@ -683,7 +689,7 @@ Allowed evidence codes:
 Codes are not user-facing causal claims. Production logs and metrics may include the probe kind, code, aggregate counts, state names, and bounded duration. They must not contain:
 
 - exception text, stack traces from expected transport failures, or operating-system error strings;
-- IDs, labels, hostnames, IP addresses, ports, URLs, query names, DNS answers, headers, bodies, interface descriptions, route/interface candidate fields, metrics, indices, LUIDs, protocols, origins, or machine paths;
+- IDs, labels, hostnames, IP addresses, ports, URLs, query names, DNS answers, headers, bodies, interface identities or types, VPN status, `DisableDefaultRoutes` values, interface descriptions, route/interface candidate fields, next hops, metrics, indices, LUIDs, protocols, origins, or machine paths;
 - payloads, credentials, authorization, user information, cookies, customer identifiers, or provider trace metadata;
 - DNS-correlation sequence, completion timestamp, round classification, or captured resulting state;
 - raw configuration or entire serialized outcomes.
@@ -720,7 +726,7 @@ A required member is `exercised` only by attributable work during the half-open 
 
 Method-specific coverage is binding:
 
-- **Gateway:** at least one steady-state Gateway logical round must complete and the required acceptance configuration must produce at least one terminal `gateway_icmp` transport attempt attributed to the manifest Gateway member. A missing or unusable acceptance-host default route cannot satisfy coverage.
+- **Gateway:** at least one steady-state Gateway logical round must complete and the required acceptance configuration must produce at least one terminal `gateway_icmp` transport attempt attributed to the manifest Gateway member. A missing, policy-disabled, or unusable acceptance-host default route cannot satisfy coverage; in particular, a route whose family-matching IP-interface row has `DisableDefaultRoutes == true` cannot satisfy Gateway workload coverage.
 - **DNS:** when enabled, at least one terminal steady-state DNS attempt must be attributed to the manifest DNS member. When disabled, DNS is absent from the manifest and both report flags are `false`.
 - **HTTPS:** every configured provider member must independently receive at least one terminal steady-state child attempt. Attempts from one provider cannot substitute for another.
 - **TCP:** every distinct enabled TCP member, including all 25 required synthetic targets, must independently receive at least one terminal steady-state attempt. Repeated work against one target cannot substitute for a missing target.
@@ -1359,7 +1365,7 @@ Violation `unknown_probe_method` is mandatory whenever `attempts.by_probe_kind["
 
 Schema, property-order, array-order, and type defects also make the report `result` equal `fail` and cause a nonzero sampler exit. This is required even when the report can still serialize a bounded violation list; every other independently applicable violation code also appears exactly once.
 
-The report contains no machine name, username, domain membership, serial number, BIOS serial, device UUID, Windows product key, MAC address, IP address, disk serial, cloud instance ID, arbitrary environment variable, absolute path, endpoint, target, provider/member identity, scheduler key or epoch, route/interface candidate value, readiness-transition timestamp detail, interface, DNS answer, payload, header, body, exception text, credential, customer identifier, or DNS-correlation snapshot field. The human report must contain the same required host-profile, timing, startup-attempt, steady-state-attempt, workload-coverage, runtime-continuity, cap, and violation values and must not apply different calculations, phase membership, property meaning, or privacy rules.
+The report contains no machine name, username, domain membership, serial number, BIOS serial, device UUID, Windows product key, MAC address, IP address, disk serial, cloud instance ID, arbitrary environment variable, absolute path, endpoint, target, provider/member identity, scheduler key or epoch, route/interface candidate value, `DisableDefaultRoutes` value, interface identity or type, VPN status, next hop, readiness-transition timestamp detail, DNS answer, payload, header, body, exception text, credential, customer identifier, or DNS-correlation snapshot field. The human report must contain the same required host-profile, timing, startup-attempt, steady-state-attempt, workload-coverage, runtime-continuity, cap, and violation values and must not apply different calculations, phase membership, property meaning, or privacy rules.
 
 ### 8.9 Failure rules
 
@@ -1392,7 +1398,7 @@ The sampler exits nonzero when:
 
 ### 9.1 Unit tests
 
-Use fake transports, an injected clock, and deterministic jitter to cover:
+Use fake transports, an injected clock, deterministic jitter, and synthetic route/interface rows only to cover:
 
 - table-driven activation from `unknown` to `baselining`;
 - no round dispatch or reduction in `unknown`, with an observed result treated as an invariant failure;
@@ -1452,11 +1458,16 @@ Use fake transports, an injected clock, and deterministic jitter to cover:
 - HTTPS endpoint outcomes for 204, 200 status-only, wrong status, redirect, TLS failure, timeout, cancellation, oversized body, body not retained, partial provider failure, all-provider failure, and two-provider independence;
 - DNS snapshot correlation for DNS completion before HTTPS start, DNS completion after HTTPS start, concurrent completions in opposite task orders producing the same HTTPS result, the exact 60-second freshness boundary, stale snapshot, no snapshot, fresh success, fresh counted failure, fresh non-counting result, DNS disabled, and timestamp reversal;
 - DNS-blocked HTTPS aggregation, `dns_correlation_unavailable`, DNS independence, and absence of snapshot fields from logs and evidence;
-- one IPv4 default route, one IPv6 default route, simultaneous-family routes, lower effective metric winning across families, IPv4 winning only an exact effective-metric tie, and route/interface metric composition using checked addition;
-- Ethernet/Wi-Fi and physical/VPN metric competition, PPP and tunnel eligibility, exact remaining tuple tie-breaks, identical-row deduplication, injected/configuration-order independence, and a post-commit route change affecting only the next Gateway round;
-- filtering of interface down/disconnected/unauthenticated/paused/low-power states and exclusion of software-loopback, endpoint, and filter interfaces;
-- stable zero-candidate `missing_route`, route/interface API failure, unstable A/B sets, invalid/contradictory metric data, checked overflow, unusable IPv4 or on-link next hop, and IPv6 link-local next hop with selected-interface scope, preserving the exact `missing_route`/`icmp_unavailable`/`route_selection_unavailable` distinctions;
-- no route/interface candidate field, address, metric, LUID, index, protocol, origin, or scheduler/endpoint identity entering evidence;
+- one IPv4 default route, one IPv6 default route, simultaneous-family routes, lower effective metric winning across families, IPv4 winning only an exact effective-metric tie, and route/interface metric composition using checked addition from the same family-matching IP-interface row that supplies `Connected` and `DisableDefaultRoutes`;
+- `DisableDefaultRoutes == false` allowing an otherwise eligible route and `true` excluding it before sorting, including a disabled lower-metric route losing to an enabled higher-metric route and every potential route disabled producing counted `missing_route`;
+- `false` in A and `true` in B, plus `true` in A and `false` in B, making the pair unstable and retrying; one unstable pair followed by a stable pair committing only the stable result; and continuous toggling through the deadline producing non-counting `route_selection_unavailable`;
+- IPv4 and IPv6 using their own family-matching IP-interface rows, API failure while obtaining a required row producing `route_selection_unavailable`, and candidate input order not altering the result;
+- Ethernet, Wi-Fi, PPP, VPN, tunnel, and virtual interfaces all applying `DisableDefaultRoutes == false` with no interface-type preference, exact remaining tuple tie-breaks, identical-row deduplication, and a post-commit route or policy change affecting only the next Gateway round;
+- filtering of `DisableDefaultRoutes == true`, interface down/disconnected/unauthenticated/paused/low-power states, and software-loopback, endpoint, and filter interfaces before sorting;
+- stable zero-candidate `missing_route`, including every potential default route policy-disabled; route/interface API failure or incomplete row resolution; unstable A/B sets; invalid/contradictory metric data; checked overflow; unusable IPv4 or on-link next hop; and IPv6 link-local next hop with selected-interface scope, preserving the exact `missing_route`/`icmp_unavailable`/`route_selection_unavailable` distinctions;
+- a policy-disabled route never satisfying Gateway workload coverage;
+- no `DisableDefaultRoutes` value, VPN/interface identity or type, route/interface candidate field, address, next hop, metric, LUID, index, protocol, origin, or scheduler/endpoint identity entering evidence; and
+- a document-drift test failing if any default-route eligibility list or summary omits the mandatory `DisableDefaultRoutes == false` requirement;
 - evidence-code allowlisting and redaction.
 
 ### 9.2 Integration tests
@@ -1472,7 +1483,7 @@ Use disposable local endpoints or fakes only. Cover:
 - restart rebinds static configuration, reconstructs enabled probes as `unknown`, moves them to `baselining` only through scheduler activation after readiness, and creates a new full bucket/anchor without prior credit;
 - an acceptance coordinator subscribed before readiness, continuous event/sample reconciliation, permanent failure after transient readiness loss, same-epoch ownership through both barriers/final stabilization, and no same-run scheduler restart after continuity failure;
 - deterministic due-round reconciliation through success, failure, timeout, cancellation, rate/capacity incomplete, admission pauses, and injected silent-round loss, with token-bucket continuity across acceptance barriers;
-- an injected Windows route adapter exercising stable A/B current-compartment snapshots, family-specific interface metric lookup, exact candidate filtering/order/deduplication, failure distinctions, and no route/interface value leakage;
+- an injected Windows route adapter exercising stable A/B current-compartment snapshots; same-pass, family-specific `Connected`/`Metric`/`DisableDefaultRoutes` lookup; false/true policy filtering and both toggle directions; exact candidate ordering/deduplication; enabled-higher-metric selection over a disabled lower-metric route; stable-all-disabled `missing_route`; API/incomplete-row `route_selection_unavailable`; workload exclusion; and no route/interface or VPN-policy value leakage;
 - no probe journal/outbox calls and no database/schema artifacts;
 - no response body, DNS answer, endpoint, target, interface, or exception leakage.
 
@@ -1484,7 +1495,7 @@ Verify:
 
 - URI user information, credentials, credential-assignment syntax, query strings, fragments, and customer/device identifiers are rejected;
 - HTTPS redirects and invalid TLS are rejected without fallback or weakened validation;
-- endpoint URLs/hosts, DNS queries/answers, DNS-correlation snapshot fields, target IDs/labels/hosts/ports, response bodies, headers, interface/route candidate data, metrics, LUIDs, indices, protocols/origins, exception text, machine paths, and other customer-controlled values do not appear in production logs or evidence;
+- endpoint URLs/hosts, DNS queries/answers, DNS-correlation snapshot fields, target IDs/labels/hosts/ports, response bodies, headers, `DisableDefaultRoutes` values, VPN status, interface identities/types, interface/route candidate data, IP addresses, next hops, metrics, LUIDs, indices, protocols/origins, exception text, machine paths, and other customer-controlled values do not appear in JSON or human reports, production logs, health output, support evidence, metrics, or other evidence;
 - workload manifests, scheduler keys or epochs, readiness-transition timestamp details, internal member identities, per-provider identities, and per-target identities do not appear in JSON or human acceptance reports, logs, health, support output, or metrics;
 - response-body readers stop at the 256-byte bound plus one overflow-detection byte and retain no bytes;
 - no production inbound listener, firewall mutation, packet capture, subnet/range expansion, broad port scan, or arbitrary gateway TCP probe exists;
@@ -1496,8 +1507,8 @@ Native acceptance must verify:
 
 - the host matches `r0-005-windows11-x64/v1`, records every required bounded profile field, and passes the 60-second idle/resource preflight;
 - the host is physical or a dedicated VM rather than a shared or CPU-quota-limited runner, with virtualization recorded;
-- current-compartment IPv4/IPv6 default-route discovery through the required IP Helper rows, stable A/B candidate-set commit, family-specific effective-metric composition, exact tuple selection, and bounded `missing_route`/`icmp_unavailable`/`route_selection_unavailable` distinctions;
-- Ethernet/Wi-Fi/VPN competition resolved by the binding metric/tuple policy without interface, address, metric, LUID, index, protocol, or origin disclosure;
+- current-compartment IPv4/IPv6 default-route discovery through the required IP Helper rows; same-pass, family-specific `Connected`/`Metric`/`DisableDefaultRoutes` resolution; stable A/B candidate-set commit; exclusion before sorting when the policy value is true; both flag-toggle directions causing retry; family-specific effective-metric composition; exact tuple selection; and bounded `missing_route`/`icmp_unavailable`/`route_selection_unavailable` distinctions;
+- Ethernet, Wi-Fi, PPP, VPN, tunnel, and virtual competition resolved uniformly by mandatory `DisableDefaultRoutes == false` plus the binding metric/tuple policy, with an enabled higher-metric route selected over a disabled lower-metric route and without policy value, VPN status, interface identity/type, address, next hop, metric, LUID, index, protocol, or origin disclosure;
 - ICMP success when permitted and `icmp_unavailable` behavior when it is not;
 - cancellation and service stop complete within five seconds;
 - the 25-target resource sampler passes only after the Gateway, enabled DNS, both HTTPS providers, and all 25 distinct synthetic TCP members receive terminal steady-state exercise;
@@ -1561,7 +1572,7 @@ Deterministic automated tests must cover:
 - privacy exclusion of target/provider identities, endpoints, hosts, ports, operator IDs, scheduler keys/epochs, readiness-transition timestamp details, route/interface values, internal member identities, and private paths from workload/continuity evidence, with the deterministic zero-attempt fragment remaining valid diagnostic output but never a passing nonempty-manifest run;
 - exact fixed charge derivation for every supported method, adapter charge input/override rejection, measured-below-table and measured-above-table attribution, and one shared configured-budget/acceptance table without drift;
 - byte-identical totals and reports from different adapters with identical measured bytes, one exact 8,192-byte charge per concurrent HTTPS provider, and deterministic network totals immediately below, exactly at, and above the 100,000-byte/minute boundary;
-- route/interface discovery remaining outside token and transport-invocation counts, with stable A/B snapshots, exact tuple selection, route changes after commit deferred to the next round, and no route/interface identity or candidate field in either report;
+- route/interface discovery remaining outside token and transport-invocation counts, with same-pass family-specific `Connected`/`Metric`/`DisableDefaultRoutes` resolution, stable A/B membership changes for both flag-toggle directions, exact false-only eligibility and tuple selection, all-disabled `missing_route`, API/incomplete-row and persistent-instability `route_selection_unavailable`, disabled-route workload exclusion, route or policy changes after commit deferred to the next round, a drift check for the false requirement in every eligibility summary, and no policy value, VPN/interface identity or type, or other route/interface candidate field in either report;
 - cancellation before transport invocation not counting as started and cancellation after start counting only as `canceled`;
 - timeout counting only as `timed_out` and ordinary failure counting only as `failed`;
 - attempt-level incomplete adding `attempt_accounting_incomplete` and failing acceptance;
@@ -1571,7 +1582,7 @@ Deterministic automated tests must cover:
 - both `attempt_accounting_incomplete` and `unknown_probe_method` appearing exactly once and in ordinal order when both apply;
 - byte-for-byte stable JSON for identical report models;
 - identical attempt counts, exact method-charge-derived network totals, timing boundaries, startup values, steady-state values, and disk values in the human and JSON reports;
-- privacy exclusion of machine names, usernames, domain membership, serials, device UUIDs, product keys, MAC/IP addresses, disk serials, cloud instance IDs, arbitrary environment variables, absolute paths, endpoints, targets, interfaces, DNS answers, DNS-correlation snapshot fields, payloads, headers, bodies, exception text, credentials, and customer identifiers, including identical exclusions in JSON and human disk evidence;
+- privacy exclusion of machine names, usernames, domain membership, serials, device UUIDs, product keys, MAC/IP addresses, disk serials, cloud instance IDs, arbitrary environment variables, absolute paths, endpoints, targets, `DisableDefaultRoutes` values, VPN status, interface identities/types, next hops, other route/interface fields, DNS answers, DNS-correlation snapshot fields, payloads, headers, bodies, exception text, credentials, and customer identifiers, including identical exclusions in JSON and human evidence;
 - deterministic `host_profile` property order and rejection of missing or additional host-profile fields;
 - synthetic-listener and acceptance cleanup success/failure.
 
