@@ -38,7 +38,7 @@ These are deliberate R0-005 decisions affecting detection latency and false-posi
 The binding rationales are:
 
 - The 30-second Gateway, DNS, and HTTPS cadence preserves capacity for 25 configured targets under the global attempt and charged-network budgets and reduces always-on background traffic.
-- A missing active interface or default route is higher-confidence local evidence than an ICMP timeout or unreachable response. Missing-route evidence therefore uses threshold 2, while ICMP retains threshold 3.
+- A successfully stabilized route snapshot with no eligible default-route candidate is higher-confidence local evidence than an ICMP timeout or unreachable response. That `missing_route` evidence therefore uses threshold 2, while ICMP retains threshold 3. Failed or unstable route selection is non-counting `route_selection_unavailable`, not missing-route evidence.
 - DNS uses threshold 2 because it remains an independently exposed local state and cannot alone declare the HTTPS aggregate offline.
 - HTTPS uses threshold 2 because a counted aggregate failure requires every configured provider attempt to start and complete with no success. Partial provider success, `blocked_by_dns`, correlation-unavailable rounds, cancellation, and capacity/deadline incompleteness do not count toward that threshold.
 - TCP uses threshold 2 because every target is one explicitly configured host/port service and R0-005 creates no user incident or alert. Later notification policy may add user-facing debounce without changing the local technical evidence.
@@ -160,8 +160,8 @@ An operator may override the full HTTPS provider set at startup, subject to all 
 - `operator_id` is required for every entry, trimmed, 1–64 ASCII characters, and unique ignoring case across the configured provider set;
 - `operator_id` contains only lowercase ASCII letters, digits, and hyphens and begins and ends with an ASCII letter or digit;
 - every URL is absolute HTTPS with an explicit host and no user information, credentials, query, or fragment;
-- endpoint hosts are unique ignoring case;
-- providers use at least two distinct registrable domains and at least two distinct declared `operator_id` values;
+- normalized endpoint hosts are pairwise distinct under ordinal case-insensitive comparison after the normalization below;
+- across the complete configured set, every provider ID, declared `operator_id`, normalized endpoint host, and normalized registrable domain is pairwise distinct;
 - redirects are disabled and rejected;
 - cookies, authentication, uploads, custom authorization, and customer identifiers are forbidden;
 - each entry contains an exact integer expected status from 100 through 599;
@@ -202,15 +202,21 @@ Public-suffix matching must implement the official Public Suffix List algorithm:
 - include both the ICANN and PRIVATE sections;
 - apply the implicit `*` rule only as defined by that algorithm.
 
-The registrable domain is the label immediately preceding the prevailing public suffix plus that suffix. A host that is itself a public suffix, or that has no registrable label, is invalid. All configured provider hosts must produce distinct normalized registrable domains under ordinal case-insensitive comparison.
+The registrable domain is the label immediately preceding the prevailing public suffix plus that suffix. A host that is itself a public suffix, or that has no registrable label, is invalid. For a configured provider count `N` from 2 through 4, all configured provider hosts must produce pairwise-distinct normalized registrable domains under ordinal case-insensitive comparison:
+
+```text
+distinct_registrable_domain_count = N
+```
+
+Subdomains of one registrable domain never count as independent providers. For example, the three-provider set `a.example.com`, `b.example.com`, and `c.example.net` is invalid because the first two normalized hosts share registrable domain `example.com`. The pairwise rule applies to the complete configured set and is independent of configuration order.
 
 This pinned snapshot remains binding for R0-005. Any suffix-data update requires a reviewed requirements change, a new full upstream commit SHA, a new file SHA-256, license review, security review, and full configuration-boundary regression tests. Existing deployed configuration must not be silently reinterpreted by a live list update.
 
 This documentation correction authorizes no new production package. If implementation requires a parser dependency instead of a repository-owned parser, stop for explicit package, license, security, and vulnerability approval. No dependency may fetch suffix data at runtime.
 
-Runtime validation deterministically enforces unique provider IDs, unique endpoint hosts, at least two registrable domains, and at least two distinct declared operators. Configuration errors remain bounded and must not echo an operator identifier, endpoint, host, URL, or other customer-controlled value.
+Runtime validation deterministically enforces pairwise-distinct provider IDs, declared `operator_id` values, normalized endpoint hosts, and normalized registrable domains across the complete configured set. Any duplicate or cardinality mismatch rejects the entire provider configuration before scheduler activation with bounded `configuration_invalid`; no valid subset may activate. Configuration errors remain bounded and must not echo an operator identifier, endpoint, host, URL, registrable domain, or other customer-controlled value.
 
-This validation is intentionally structural. Runtime can enforce declared-operator and registrable-domain diversity, but registrable-domain separation alone does not prove provider independence and network probing cannot prove real-world corporate ownership. The configuration author is responsible for declaring `operator_id` accurately. The built-in Google and Cloudflare declarations are reviewed defaults; a custom override that falsely declares ownership is configuration-author error that the agent cannot discover through probing. Separately operated providers remain an architectural and operator responsibility.
+This validation is intentionally structural. Pairwise-distinct registrable domains combined with truthful pairwise-distinct operator declarations are required, but neither property proves real-world corporate independence and network probing cannot prove ownership. The configuration author is responsible for declaring `operator_id` accurately. The built-in Google and Cloudflare declarations satisfy the pairwise rule and remain reviewed defaults; a custom override that falsely declares ownership is configuration-author error that the agent cannot discover through probing. Separately operated providers remain an architectural and operator responsibility.
 
 ### 2.4 External endpoint verification record
 
@@ -249,29 +255,88 @@ R0-005 must not leave placeholder endpoints or tables that pre-implement R0-013.
 
 ### 3.1 Gateway
 
-Each gateway round discovers the active default route and interface from current operating-system state. It must not pin the result from startup.
+Each Gateway logical round discovers and commits one deterministic default-route selection from current operating-system state. It never pins a route from startup. The following selection algorithm is binding R0-005 policy; its IPv4-before-IPv6 tie-break is not presented as a universal Windows routing rule.
 
-The round records only bounded method evidence for:
+The Windows adapter uses these official Microsoft IP Helper contracts:
 
-- whether an active interface exists;
-- whether a usable default route exists;
-- whether a gateway address exists;
-- whether ICMP was attempted;
-- the bounded ICMP outcome.
+- [`GetIpForwardTable2`](https://learn.microsoft.com/en-us/windows/win32/api/netioapi/nf-netioapi-getipforwardtable2) and [`MIB_IPFORWARD_ROW2`](https://learn.microsoft.com/en-us/windows/win32/api/netioapi/ns-netioapi-mib_ipforward_row2) for current-compartment IPv4 and IPv6 route rows;
+- [`GetIpInterfaceEntry`](https://learn.microsoft.com/en-us/windows/win32/api/netioapi/nf-netioapi-getipinterfaceentry) and [`MIB_IPINTERFACE_ROW`](https://learn.microsoft.com/en-us/windows/win32/api/netioapi/ns-netioapi-mib_ipinterface_row) for the associated family-specific IP-interface row; and
+- [`GetIfEntry2`](https://learn.microsoft.com/en-us/windows/win32/api/netioapi/nf-netioapi-getifentry2) and [`MIB_IF_ROW2`](https://learn.microsoft.com/en-us/windows/win32/api/netioapi/ns-netioapi-mib_if_row2) for the associated interface row.
 
-The gateway address, interface name, interface description, route details, and operating-system exception text are never logged or surfaced as evidence.
+A default route has an all-zero `DestinationPrefix.Prefix` for its address family and `DestinationPrefix.PrefixLength` exactly zero. Multiple default-route rows may coexist. For each row, the effective metric is the checked sum documented by Microsoft:
 
-ICMP is the only network reachability method in R0-005. The implementation must not try arbitrary ports, scan the gateway, or use a generic TCP fallback. Outcomes are classified as follows:
+```text
+effective_metric = route_metric + family_specific_interface_metric
+```
 
-- no active interface or no usable default route: counted missing-route gateway failure;
-- route exists but has no usable gateway address: incomplete method evidence, not a counted reachability failure;
-- ICMP success: success;
-- ICMP timeout or unreachable: counted failure;
-- ICMP unavailable because the platform, API, or permissions do not permit it: `icmp_unavailable`, not a failure.
+At the beginning of every Gateway logical round, before route reduction, the adapter performs this stable-snapshot protocol within the existing ten-second logical-round deadline:
 
-`icmp_unavailable` retains route evidence and cannot by itself move a target to `offline`. When `icmp_unavailable` occurs before any successful method result while the target is `baselining`, the state remains `baselining` (`Unknown` projection). From `healthy`, it lowers confidence to `suspect` (`Degraded` projection) without incrementing either gateway failure streak. From `baselining`, `suspect`, `recovering`, or `offline`, state and counters remain unchanged. An already `offline` state remains offline until an actual success begins recovery.
+1. Enumerate current-compartment IPv4 and IPv6 route rows.
+2. For every possible default-route candidate, resolve its associated `MIB_IPINTERFACE_ROW` for the same address family and its `MIB_IF_ROW2`.
+3. Filter and canonicalize the complete eligible candidate set as set A.
+4. Immediately repeat the complete enumeration, resolution, filtering, and canonicalization as set B.
+5. Normalize and ordinal-sort both sets using the exact tuple below.
+6. Commit B only when the complete canonical sets are identical. Otherwise discard both and retry only within the same logical-round deadline.
 
-The missing-active-interface/default-route threshold is two consecutive rounds. The ICMP timeout/unreachable threshold is three consecutive counted failures. A successful gateway round resets both gateway failure streaks. A missing-route failure resets the ICMP streak before incrementing the missing-route streak, and an ICMP timeout/unreachable resets the missing-route streak before incrementing the ICMP streak. The two classifications therefore form separate consecutive streaks and never combine toward either threshold.
+Failure of a required route/interface API, invalid or contradictory row data, invalid metric, checked metric overflow, or inability to obtain identical sets before the deadline reduces the round as non-counting `route_selection_unavailable`. An unstable or failed enumeration must never be reported as a missing route. Once B commits, later route changes cannot alter the active round; they are visible only to the next Gateway round. Route discovery consumes no token and no network-attempt slot.
+
+A row is an eligible default-route candidate only when all of these conditions hold:
+
+- destination prefix is all zero and prefix length is exactly zero;
+- address family is IPv4 or IPv6;
+- route `Loopback` is false;
+- route valid lifetime is nonzero or infinite;
+- the family-matching IP-interface row exists and `Connected` is true;
+- the interface row exists, `AdminStatus` is up, `OperStatus` is `IfOperStatusUp`, and `MediaConnectState` is connected;
+- the interface is not software loopback, endpoint-only, or a filter interface;
+- `NotAuthenticated`, `NotMediaConnected`, `Paused`, and `LowPower` are all false; and
+- route and interface metrics are valid nonnegative values whose checked sum does not overflow.
+
+An absent associated row makes that route ineligible. An API error while resolving a required row makes the snapshot unavailable. Ethernet, Wi-Fi, PPP, tunnel, and VPN interfaces remain eligible when they satisfy the same conditions; physical, wireless, virtual, or tunnel form alone neither prefers nor excludes a candidate.
+
+Each internal canonical candidate contains only:
+
+- address-family rank;
+- effective metric;
+- route metric;
+- interface metric;
+- interface LUID numeric value;
+- interface index;
+- canonical next-hop bytes;
+- route protocol numeric value; and
+- route origin numeric value.
+
+Canonical next-hop bytes are the fixed-length address bytes in network order for the candidate family. Candidates identical across the complete canonical field set are deduplicated; any difference in a canonical field remains a separate candidate. Eligible candidates are sorted ascending by exactly this complete tuple:
+
+```text
+(
+  effective_metric,
+  address_family_rank,
+  route_metric,
+  interface_metric,
+  interface_luid,
+  interface_index,
+  canonical_next_hop_bytes,
+  route_protocol,
+  route_origin
+)
+```
+
+Address-family rank is the explicit R0-005 tie-break policy: IPv4 is `0` and IPv6 is `1`. Lower effective metric therefore wins across both families; IPv4 wins only when effective metrics tie; the remaining fields deterministically resolve multi-adapter and duplicate-metric cases. The selected route is exactly the first candidate after sorting.
+
+A successfully stabilized set with zero eligible candidates reduces as counted `missing_route`. Route selection and ICMP usability are separate. After selecting a route:
+
+- a usable IPv4 next hop is unicast, nonzero, non-loopback, non-multicast, and non-broadcast;
+- a usable IPv6 next hop is unicast, non-unspecified, non-loopback, and non-multicast; and
+- an IPv6 link-local next hop uses the selected interface scope.
+
+An unusable, unspecified, or on-link next hop does not turn the selected route into `missing_route`; it reduces through existing non-counting `icmp_unavailable` behavior and may use bounded `gateway_address_missing` evidence. ICMP is the only network reachability method in R0-005. The implementation must not try arbitrary ports, scan the gateway, or use a generic TCP fallback. A usable selected next hop produces ICMP success, counted ICMP timeout/unreachable, or non-counting `icmp_unavailable` when the platform, ICMP API, or permissions do not permit the method.
+
+`icmp_unavailable` retains route evidence and cannot by itself move a target to `offline`. When `icmp_unavailable` occurs before any successful method result while the target is `baselining`, the state remains `baselining` (`Unknown` projection). From `healthy`, it lowers confidence to `suspect` (`Degraded` projection) without incrementing either gateway failure streak. From `baselining`, `suspect`, `recovering`, or `offline`, state and counters remain unchanged. An already `offline` state remains offline until an actual success begins recovery. `route_selection_unavailable` is also non-counting and leaves state and counters unchanged.
+
+The round records only bounded method evidence for whether a stable route selection exists, whether a usable ICMP next hop exists, whether ICMP was attempted, and the bounded result. Candidate fields, gateway or interface addresses, LUIDs, indices, names, descriptions, metrics, protocols, origins, raw API values, and operating-system exception text never enter reports, logs, health, support output, persistence, or metrics.
+
+The stable zero-eligible-candidate `missing_route` threshold is two consecutive rounds. The ICMP timeout/unreachable threshold is three consecutive counted failures. A successful Gateway round resets both Gateway failure streaks. A `missing_route` failure resets the ICMP streak before incrementing the missing-route streak, and an ICMP timeout/unreachable resets the missing-route streak before incrementing the ICMP streak. The two classifications therefore form separate consecutive streaks and never combine toward either threshold.
 
 ### 3.2 DNS
 
@@ -292,7 +357,7 @@ These fields are internal coordination data. They must not enter logs, health ou
 
 ### 3.3 HTTPS aggregate
 
-One logical HTTPS round attempts every configured provider, subject to global limits and the logical-round deadline. The HTTPS aggregate is one logical target and has at most one active logical round. Each configured provider invocation is a child transport attempt within that round, not another logical target. Within the one active round, at most one attempt per configured provider may be active, provider attempts may overlap, and no provider may be attempted more than once. A second HTTPS aggregate round cannot be admitted or started until the first round has reduced to one terminal aggregate result.
+One logical HTTPS round attempts every provider in the atomically accepted pairwise-distinct set, subject to global limits and the logical-round deadline. Provider count `N` is therefore also the distinct provider-ID, operator-ID, normalized-host, and normalized-registrable-domain count; aggregation never collapses or substitutes providers by shared domain, host, operator, or ID. The HTTPS aggregate is one logical target and has at most one active logical round. Each configured provider invocation is a child transport attempt within that round, not another logical target. Within the one active round, at most one attempt per configured provider may be active, provider attempts may overlap, and no provider may be attempted more than once. A second HTTPS aggregate round cannot be admitted or started until the first round has reduced to one terminal aggregate result.
 
 At the HTTPS logical-round start timestamp, the reducer captures exactly one immutable copy of the most recent published DNS snapshot whose completion timestamp is less than or equal to the HTTPS round start. A DNS round that completes after the HTTPS round starts can never alter that HTTPS round. Snapshot age uses only the injected monotonic clock:
 
@@ -339,18 +404,18 @@ The TCP offline threshold is two consecutive counted failures.
 
 ### 4.1 Activation and degradation
 
-The scheduler may activate only after R0-004 reports both journal readiness and formal service readiness. A configured logical target is constructed as `unknown`. At the exact injected-monotonic timestamp of successful scheduler activation, activation moves every enabled target from `unknown` to `baselining`, clears every failure streak, recovery progress, and flapping history, makes every first round due immediately through the same global controls as later work, and creates the scheduler's one process-local token bucket with exactly eight token-seconds of credit and that activation timestamp as its refill anchor. No transport round may be dispatched or reduced while a target remains `unknown`; a round result observed for an `unknown` target is an implementation invariant failure, not an operational transition.
+The scheduler may activate only after R0-004 reports both journal readiness and formal service readiness. A configured logical target is constructed as `unknown`. At the exact injected-monotonic timestamp of successful scheduler activation, activation creates one stable process-local scheduler epoch, marks it active and enabled, moves every enabled target from `unknown` to `baselining`, clears every failure streak, recovery progress, and flapping history, makes every first round due immediately through the same global controls as later work, and creates the epoch's one process-local token bucket with exactly eight token-seconds of credit and that activation timestamp as its refill anchor. No transport round may be dispatched or reduced while a target remains `unknown`; a round result observed for an `unknown` target is an implementation invariant failure, not an operational transition.
 
 If journal health or formal service readiness becomes false:
 
 - stop admitting new rounds;
 - cancel queued and active attempts promptly;
-- clear schedules, discard the complete token-bucket credit and refill anchor, and clear counters, recovery progress, and flapping history;
+- mark the scheduler epoch inactive and disabled, clear schedules, discard the complete token-bucket credit and refill anchor, dispose scheduler resources, and clear counters, recovery progress, and flapping history;
 - keep the process alive under R0-004's existing degraded-service behavior;
 - do not collect, log, buffer, persist, or emit observations while degraded;
 - do not recreate the journal, restore readiness, or invent writes from R0-005.
 
-Recovery of probe execution requires a healthy process restart. No token credit or anchor survives degradation or restart. On restart, all enabled targets are reconstructed as `unknown` and enter `baselining` only through scheduler activation after readiness; that later valid activation creates a new full eight-token bucket and a new injected-monotonic activation anchor.
+Recovery of probe execution requires a healthy process restart. No scheduler epoch, token credit, or anchor survives degradation or restart. On restart, all enabled targets are reconstructed as `unknown` and enter `baselining` only through scheduler activation after readiness; that later valid activation creates a new epoch, full eight-token bucket, and injected-monotonic activation anchor. The acceptance-run restriction in section 8.1 independently forbids using such a restart or later epoch to recover a failed run.
 
 Known R0-004 limitation: a simultaneous journal failure and lifecycle-marker write failure can leave the durable readiness marker stale until restart, although in-process readiness is false. R0-005 must trust the in-process false state and stop.
 
@@ -477,7 +542,7 @@ After a transport attempt becomes eligible through the fair-dispatch rules, it m
 
 ### 4.5 Deterministic fair dispatch
 
-The dispatcher uses a deterministic rotating fair queue over due logical targets. Gateway, DNS, HTTPS aggregate, and every enabled TCP target are logical targets. Each logical target and each configured HTTPS provider child has one stable internal scheduler/member identity. The logical-target identities determine stable queue order; the provider-member identities determine stable child attribution. These are the same immutable identities used to route work and reconcile the acceptance workload manifest in section 8.1. They are never logged, reported, derived from display names, mutable array positions, endpoint strings, or log text, or exposed through health, support, or metrics output.
+The dispatcher uses a deterministic rotating fair queue over due logical targets. Gateway, DNS, HTTPS aggregate, and every enabled TCP target are logical targets. Within one scheduler epoch, each logical target and each configured HTTPS provider child has one stable internal scheduler/member identity. The logical-target identities determine stable queue order and due-round ledger attribution; the provider-member identities determine stable child attribution. These are the same immutable identities used to route work and reconcile the acceptance workload manifest and runtime continuity in section 8.1. They are never logged, reported, derived from display names, mutable array positions, endpoint strings, or log text, or exposed through health, support, or metrics output.
 
 - The dispatcher maintains a rotating cursor over stable key order.
 - Gateway, DNS, and each due TCP logical target contribute at most one attempt per pass.
@@ -542,7 +607,7 @@ The R0-005 offline thresholds remain:
 
 | Logical target and failure classification | Threshold |
 | --- | ---: |
-| Gateway missing active interface/default route | 2 |
+| Gateway stable snapshot with zero eligible default-route candidates (`missing_route`) | 2 |
 | Gateway ICMP timeout/unreachable | 3 |
 | DNS | 2 |
 | HTTPS aggregate | 2 |
@@ -610,7 +675,7 @@ Allowed evidence codes:
 | Scope | Codes |
 | --- | --- |
 | Common | `round_succeeded`, `round_incomplete`, `cancelled`, `rate_limited`, `capacity_unavailable`, `deadline_exceeded`, `superseded`, `configuration_invalid` |
-| Gateway | `active_interface_missing`, `default_route_missing`, `gateway_address_missing`, `icmp_succeeded`, `icmp_timeout`, `icmp_unreachable`, `icmp_unavailable` |
+| Gateway | `active_interface_missing`, `default_route_missing`, `gateway_address_missing`, `icmp_succeeded`, `icmp_timeout`, `icmp_unreachable`, `icmp_unavailable`, `route_selection_unavailable` |
 | DNS | `dns_succeeded`, `dns_timeout`, `dns_no_address`, `dns_resolution_failed` |
 | HTTPS | `https_succeeded`, `https_dns_failed`, `https_connect_failed`, `https_tls_failed`, `https_timeout`, `https_redirect_rejected`, `https_unexpected_status`, `https_body_mismatch`, `https_body_too_large`, `endpoint_not_started`, `partial_endpoint_failure`, `blocked_by_dns`, `dns_correlation_unavailable` |
 | TCP | `tcp_connect_succeeded`, `tcp_connect_refused`, `tcp_connect_timeout`, `tcp_connect_failed` |
@@ -618,7 +683,7 @@ Allowed evidence codes:
 Codes are not user-facing causal claims. Production logs and metrics may include the probe kind, code, aggregate counts, state names, and bounded duration. They must not contain:
 
 - exception text, stack traces from expected transport failures, or operating-system error strings;
-- IDs, labels, hostnames, IP addresses, ports, URLs, query names, DNS answers, headers, bodies, interface descriptions, route details, or machine paths;
+- IDs, labels, hostnames, IP addresses, ports, URLs, query names, DNS answers, headers, bodies, interface descriptions, route/interface candidate fields, metrics, indices, LUIDs, protocols, origins, or machine paths;
 - payloads, credentials, authorization, user information, cookies, customer identifiers, or provider trace metadata;
 - DNS-correlation sequence, completion timestamp, round classification, or captured resulting state;
 - raw configuration or entire serialized outcomes.
@@ -640,13 +705,13 @@ pwsh ./scripts/r0-005-resource-sampling.ps1 `
   -DurationMinutes 30
 ```
 
-The run uses 25 distinct enabled synthetic TCP targets, enabled DNS, the accepted two-provider HTTPS configuration, and fake or loopback endpoints, never real customer or network data. It exercises the Gateway, DNS, every HTTPS provider child, and every TCP scheduling member. The command's `-TargetCount` must equal 25, the atomically accepted configuration must contain exactly 25 distinct enabled TCP members, and the report's `configuration.target_count` must equal that manifest count.
+The run uses 25 distinct enabled synthetic TCP targets, enabled DNS, the accepted two-provider HTTPS configuration, and fake or loopback endpoints, never real customer or network data. The two accepted providers satisfy the same pairwise provider-ID, operator-ID, normalized-host, and normalized-registrable-domain rule as every 2–4-provider configuration. It exercises the Gateway, DNS, every HTTPS provider child, and every TCP scheduling member. The command's `-TargetCount` must equal 25, the atomically accepted configuration must contain exactly 25 distinct enabled TCP members, and the report's `configuration.target_count` must equal that manifest count.
 
 The implementation freezes one immutable **acceptance workload manifest** from the atomically accepted startup configuration before acceptance workload measurement begins. It contains exactly one stable, internal, non-observable workload-member identity for each required member:
 
 - one Gateway member;
 - one DNS member when DNS is enabled and no DNS member when DNS is disabled;
-- one member for every configured HTTPS provider; and
+- one member for every configured HTTPS provider, with manifest HTTPS count equal to the pairwise-distinct accepted provider/domain/operator/host count; and
 - one member for every enabled TCP target.
 
 The manifest uses the same stable internal scheduler/member identities that route work under section 4.5. It is not reconstructed from display names, array positions that can change, endpoint strings, log text, the reported target count, or aggregate probe-kind counts. Identities must be unique and remain bound to the same accepted members for the complete run. Configuration changes, manifest replacement or mutation, duplicate manifest identities, or an attempt attributed to an unknown, missing, duplicated, or no-longer-configured member fail acceptance.
@@ -682,12 +747,41 @@ Gateway and DNS internal counts are each zero or one and produce the report bool
 - Startup CPU is reported separately and is excluded from the approved steady-state average CPU calculation.
 - Every successfully collected working-set sample after process creation, including initialization, barrier, steady-state, and drain samples, remains subject to the absolute working-set cap.
 
+Before accepting the first monitoring-ready observation, the acceptance coordinator subscribes to the exact R0-004 monitoring-readiness state-transition source. Every transition is recorded against the injected monotonic clock. The first successful ready observation begins one **runtime continuity interval** that ends only at stable final-runtime-snapshot commit on success or at the final bounded failure-evidence/cleanup endpoint on failure. Throughout that interval:
+
+1. the existing monitoring-ready level remains continuously `true`;
+2. the probe scheduler remains active, enabled, undisposed, and owned by the same scheduler epoch;
+3. that epoch continues to own the atomically accepted configuration and immutable acceptance workload manifest;
+4. the accepted configuration and manifest remain unchanged; and
+5. the captured service PID remains unchanged.
+
+The scheduler epoch is a stable process-local internal identity created by the successful activation that produced the accepted scheduler. It is used only to prove continuity and is never placed in reports, logs, health, support output, persistence, or metrics. The coordinator checks the readiness level, scheduler active/enabled/disposed state, scheduler epoch, configuration/manifest ownership, and PID at every required process sample in addition to consuming the event-driven readiness transitions. Transition events detect short losses; sampled levels provide deterministic reconciliation. A missing transition, unavailable level, sampled/event contradiction, false level, scheduler disposal, disablement, replacement, epoch change, ownership loss, configuration mutation, or manifest mutation is permanent evidence of failure; later recovery cannot erase it.
+
+Readiness loss before steady-state entry fails the start barrier. Readiness loss during steady state, end drain, or final-snapshot stabilization also fails the run. A false-to-true transition is not forgiven. `monitoring_readiness_lost` is mandatory when readiness becomes false, unavailable, or internally contradictory after the first ready observation and before the continuity endpoint. `acceptance_scheduler_inactive` is mandatory when the scheduler stops, is disabled or disposed, is replaced, changes or loses its epoch, ceases to own the accepted workload, or otherwise fails the scheduler continuity checks even if readiness incorrectly remains true.
+
+After either continuity failure, the coordinator permanently stops new admissions, performs only bounded closure of already-started attempts, final bounded evidence capture, and cleanup, and never restarts or reactivates a scheduler in the same acceptance run. It does not reset, replace, or refill the token bucket to hide the interruption. Independently applicable PID, workload, attempt, boundary, report, and cleanup violations remain required.
+
+Continuous readiness and epoch ownership are combined with deterministic due-work reconciliation. The scheduler maintains an internal due-round ledger under the existing fixed-delay, jitter, admission, and ten-second deadline rules. For every Gateway, enabled DNS, HTTPS aggregate, and enabled TCP logical round whose calculated due timestamp occurs before `steady_state_end`, the stable logical-target identity must receive exactly one of these reductions before its round deadline:
+
+- one terminal logical-round reduction, including a valid success, counted failure, or existing non-counting terminal result; or
+- one explicit scheduler-level incomplete reduction when admission or completion cannot occur under the existing scheduler rules.
+
+A due round may not silently disappear during a barrier, capacity/token contention, degradation, cancellation, or any other scheduler path. For each required logical target, the ledger proves:
+
+```text
+due_rounds =
+  terminal_rounds
+  + explicit_scheduler_incomplete_rounds
+```
+
+The ledger uses the same stable internal scheduler/member identity as dispatch and manifest reconciliation. A due round with neither reduction, duplicate reduction, wrong-member reduction, or reduction after its deadline makes due-work reconciliation false and adds `acceptance_scheduler_inactive`. The counts and identities remain internal and are not exposed per target or provider. This rule requires deterministic round closure, not endpoint success or an exact success count; valid timeout, failure, post-start cancellation, and scheduler-level incomplete semantics remain unchanged.
+
 The transport-start instant is the monotonic timestamp captured at the same point the token is consumed, immediately before invoking the transport. Admission time, queue time, slot-wait time, and token-wait time do not determine resource-phase membership.
 
 After monitoring-ready, the acceptance coordinator establishes a clean steady-state start barrier:
 
 1. Pause all new network-attempt admissions.
-2. Cancel queued attempts that have not started as scheduler-level non-counting/incomplete work. They consume no token and do not enter a transport-attempt array.
+2. Cancel queued attempts that have not started and reduce every due-but-not-started logical round, including due work not yet admitted, as explicit scheduler-level non-counting/incomplete work. Reconcile each affected due round in the internal ledger before its deadline. Such work consumes no token and does not enter a transport-attempt array.
 3. Allow every started attempt to reach one terminal attempt outcome.
 4. After no started attempt remains and while admissions remain paused, establish one steady-state baseline bundle containing the complete consistent recursive runtime-file snapshot, the exact process-CPU baseline, the acceptance-only attempt/network-accounting reset, and one injected-monotonic boundary timestamp. The reset seals the separately reported startup attempt/network totals and initializes the steady-state attempt/network accumulators to zero; it does not erase startup evidence.
 5. Capture the process-CPU baseline immediately before the monotonic bundle-commit timestamp. Commit the bundle atomically; `steady_state_start` is exactly that successful commit timestamp. There is no wait for a later pre-existing sampling-grid boundary.
@@ -710,7 +804,7 @@ An invocation started before `steady_state_start` is startup work. An invocation
 At exact `steady_state_end`, the acceptance coordinator establishes the end barrier:
 
 1. Pause new network-attempt admissions before another token can be consumed.
-2. Cancel attempts admitted but not started before the endpoint as scheduler-level non-counting work. They consume no token and do not enter steady-state attempt accounting.
+2. Cancel attempts admitted but not started before the endpoint and reduce every due-but-not-started logical round, including due work not yet admitted, as explicit scheduler-level non-counting work. Reconcile each affected due round in the internal ledger before its deadline. Such work consumes no token and does not enter steady-state attempt accounting.
 3. Allow attempts started before the endpoint to drain to one terminal result. They remain steady-state attempts and contribute their complete sent, received, and charged bytes plus exactly one complete outcome even when completion occurs during the drain.
 4. Fail the run if the end drain exceeds 10 monotonic seconds. A started invocation without a terminal result at that deadline becomes attempt-level `incomplete`, adds `attempt_accounting_incomplete`, and fails the run.
 5. Keep admissions paused after the drain and immediately begin one separate final-runtime-snapshot stabilization window.
@@ -764,6 +858,8 @@ At each valid sample, the sampler refreshes the exact service process and record
 - handle count;
 - thread count;
 - monotonic sample time and bounded UTC correlation time.
+
+At that same sample boundary, the coordinator also reconciles the current monitoring-ready level, scheduler active/enabled/disposed state, scheduler epoch continuity, accepted configuration/manifest ownership, and due-round ledger through the sample time. These checks feed only the four derived `runtime_continuity` Booleans and bounded violations; no transition timestamp, scheduler identity, route/interface value, target/provider identity, or private configuration value is added to the report.
 
 ### 8.4 CPU
 
@@ -895,9 +991,10 @@ The JSON has these exact top-level properties in this order:
 8. `growth`
 9. `attempts`
 10. `workload_coverage`
-11. `caps`
-12. `violations`
-13. `result`
+11. `runtime_continuity`
+12. `caps`
+13. `violations`
+14. `result`
 
 `schema_version` is exactly `r0-005-resource-report/v1`. Required nested properties are:
 
@@ -912,10 +1009,11 @@ The JSON has these exact top-level properties in this order:
 | `growth` | `working_set`, `private_bytes`, `handles`, `threads` |
 | `attempts` | `by_probe_kind`, `by_outcome`, `started`, `completed`, `succeeded`, `failed`, `timed_out`, `canceled`, `incomplete` |
 | `workload_coverage` | `gateway_required`, `gateway_exercised`, `dns_required`, `dns_exercised`, `https_providers_configured`, `https_providers_exercised`, `tcp_targets_configured`, `tcp_targets_exercised`, `all_required_exercised` |
+| `runtime_continuity` | `monitoring_ready_continuous`, `scheduler_active_continuous`, `scheduler_epoch_unchanged`, `all_due_rounds_reconciled` |
 | `caps` | `readiness_ms`, `working_set_bytes`, `average_cpu_percent`, `disk_mb_per_day`, `network_bytes_per_minute`, `growth_percent`, `working_set_growth_noise_bytes`, `private_bytes_growth_noise_bytes`, `handle_growth_noise_count`, `thread_growth_noise_count` |
 | `result` | the string `pass` or `fail` |
 
-The table is normative for nested property presence and property order. `configuration.logical_processor_count` must exactly equal `host_profile.logical_processor_count`; `configuration.target_count` must equal the manifest's distinct TCP-member count; and `configuration.https_provider_count` must equal its distinct HTTPS-provider count. The three boundary timing durations are nonnegative JSON integers in milliseconds. `timing.steady_state_start_utc` represents the UTC correlation value captured for the exact monotonic baseline-bundle commit; `steady_state_end_utc` correlates to exactly the requested duration after that commit. `steady_state_end_drain_elapsed_ms` ends at terminal attempt closure or its deadline. `final_runtime_snapshot_elapsed_ms` is required in every success or failure report, starts at end-drain completion or its failing deadline, and ends at stable final-snapshot commit; it is zero only when the complete two-map protocol commits at the same observable monotonic instant, and on final-snapshot failure records elapsed time through the failing deadline. `startup.total_cpu_ms`, `steady_state.average_normalized_cpu_percent`, `startup.attributed_disk_bytes`, and `steady_state.attributed_disk_bytes` all use the boundary model in sections 8.1, 8.4, and 8.6. The disk integers are the results of the process-start/steady-state-start and steady-state-start/stable-final snapshot pairs; `steady_state.disk_mb_per_day` is calculated only from the latter. `startup.attempts_*` values are nonnegative JSON integers for startup transport invocations and satisfy the same started/completed/outcome identities as the top-level steady-state attempt scalars. Queued work canceled before transport start appears in neither set of transport-attempt counts. The human report uses the identical baseline-bundle timestamp, CPU baseline, stable snapshot pairs, phase membership, exact method-charge derivation, coverage reconciliation, timing values, and totals.
+The table is normative for nested property presence and property order. `configuration.logical_processor_count` must exactly equal `host_profile.logical_processor_count`; `configuration.target_count` must equal the manifest's distinct TCP-member count; and `configuration.https_provider_count` must equal its distinct HTTPS-provider count. The three boundary timing durations are nonnegative JSON integers in milliseconds. `timing.steady_state_start_utc` represents the UTC correlation value captured for the exact monotonic baseline-bundle commit; `steady_state_end_utc` correlates to exactly the requested duration after that commit. `steady_state_end_drain_elapsed_ms` ends at terminal attempt closure or its deadline. `final_runtime_snapshot_elapsed_ms` is required in every success or failure report, starts at end-drain completion or its failing deadline, and ends at stable final-snapshot commit; it is zero only when the complete two-map protocol commits at the same observable monotonic instant, and on final-snapshot failure records elapsed time through the failing deadline. `startup.total_cpu_ms`, `steady_state.average_normalized_cpu_percent`, `startup.attributed_disk_bytes`, and `steady_state.attributed_disk_bytes` all use the boundary model in sections 8.1, 8.4, and 8.6. The disk integers are the results of the process-start/steady-state-start and steady-state-start/stable-final snapshot pairs; `steady_state.disk_mb_per_day` is calculated only from the latter. `startup.attempts_*` values are nonnegative JSON integers for startup transport invocations and satisfy the same started/completed/outcome identities as the top-level steady-state attempt scalars. Queued work canceled before transport start appears in neither set of transport-attempt counts. The human report uses the identical baseline-bundle timestamp, CPU baseline, stable snapshot pairs, phase membership, exact method-charge derivation, coverage reconciliation, runtime-continuity derivation, timing values, and totals.
 
 ```text
 startup.attempts_completed =
@@ -1132,10 +1230,18 @@ The required passing two-provider, DNS-enabled, 25-TCP-target run has this order
   "tcp_targets_configured": 25,
   "tcp_targets_exercised": 25,
   "all_required_exercised": true
+},
+"runtime_continuity": {
+  "monitoring_ready_continuous": true,
+  "scheduler_active_continuous": true,
+  "scheduler_epoch_unchanged": true,
+  "all_due_rounds_reconciled": true
 }
 ```
 
-The complete report fails deterministic serialization when `workload_coverage` is missing, reordered, malformed, contains an additional property, uses a non-Boolean flag or noninteger/negative count, conflicts with `configuration` or the internal manifest reconciliation, or disagrees with the identical human-report calculation. No endpoint, provider ID, target ID, host, port, operator ID, scheduler key, internal member identity, or private path enters either report.
+`runtime_continuity` is derived from the subscribed readiness-transition history, sampled readiness/scheduler/PID levels, scheduler-epoch and workload-ownership checks, immutable configuration/manifest checks, and the internal due-round ledger. Its four values are JSON Booleans and appear exactly in the table order above. A required run can pass only when all four are `true`. A later recovery cannot change a derived `false` back to `true`. If first readiness is never observed, all four values are `false`, `readiness_timeout` remains mandatory, and `monitoring_readiness_lost` does not replace that pre-continuity failure. Scheduler epoch, target/member/provider identity, endpoint, route/interface value, transition timestamp detail, and private host value never enter this object or the human report.
+
+The complete report fails deterministic serialization when `workload_coverage` or `runtime_continuity` is missing, reordered, malformed, contains an additional property, uses an invalid type, conflicts with configuration, internal manifest, readiness, scheduler, PID, epoch, or due-ledger reconciliation, or disagrees with the identical human-report calculation. No endpoint, provider ID, target ID, host, port, operator ID, scheduler key, scheduler epoch, internal member identity, transition timestamp detail, or private path enters either report.
 
 The following object fragment is the normative zero-attempt representation for the required two-provider, DNS-enabled, 25-TCP-target run:
 
@@ -1173,14 +1279,21 @@ The following object fragment is the normative zero-attempt representation for t
   "tcp_targets_configured": 25,
   "tcp_targets_exercised": 0,
   "all_required_exercised": false
+},
+"runtime_continuity": {
+  "monitoring_ready_continuous": true,
+  "scheduler_active_continuous": false,
+  "scheduler_epoch_unchanged": true,
+  "all_due_rounds_reconciled": false
 }
 ```
 
-This example is normative for property names, property order, array order, closed vocabularies, mandatory zero entries, integer count encoding, Boolean encoding, and scalar representation. It is an object fragment from the complete `r0-005-resource-report/v1` report, not a standalone full report. Counts in other valid configurations reflect their accepted manifest. The zero-attempt representation remains a valid deterministic diagnostic, but it cannot pass when the manifest is nonempty: the exercised values remain false or zero, `all_required_exercised` is `false`, and `acceptance_workload_incomplete` is mandatory.
+This example is normative for property names, property order, array order, closed vocabularies, mandatory zero entries, integer count encoding, Boolean encoding, scalar representation, and the adjacency of workload and continuity evidence. It is an object fragment from the complete `r0-005-resource-report/v1` report, not a standalone full report. Counts in other valid configurations reflect their accepted manifest. The zero-attempt representation remains a valid deterministic diagnostic, but it cannot pass when the manifest is nonempty: the exercised values remain false or zero, `all_required_exercised` is `false`, and `acceptance_workload_incomplete` is mandatory. This representative idle-scheduler fragment also derives false scheduler and due-round continuity; another failing zero-attempt diagnostic must serialize the four Booleans from its actual bounded evidence rather than copy these illustrative values.
 
 `violations` is an ordinal-sorted array containing only these stable bounded codes when applicable:
 
 - `acceptance_cleanup_failed`
+- `acceptance_scheduler_inactive`
 - `acceptance_workload_incomplete`
 - `attempt_accounting_incomplete`
 - `counter_negative`
@@ -1193,6 +1306,7 @@ This example is normative for property names, property order, array order, close
 - `host_profile_unsupported`
 - `measurement_boundary_timeout`
 - `measurement_boundary_violation`
+- `monitoring_readiness_lost`
 - `network_cap_exceeded`
 - `pid_changed`
 - `private_bytes_growth_exceeded`
@@ -1235,19 +1349,25 @@ Violation `attempt_accounting_incomplete` is mandatory when any of the following
 
 Violation `acceptance_workload_incomplete` is mandatory when any required workload member is not exercised or workload identity cannot be reconciled. This includes zero steady-state attempts; missing Gateway coverage; missing enabled-DNS coverage; any unexercised configured HTTPS provider or enabled TCP target; a `configuration.target_count`/manifest mismatch; any configured/exercised count mismatch; duplicate identities masking a missing member; unknown, missing, duplicated, or unmanifested member attribution; accepted-configuration or manifest mutation; startup-only purported coverage; a coverage-calculation, derived-flag, or human/JSON identity failure; or malformed/missing/reordered `workload_coverage`. A started attempt without terminal accounting triggers the existing `attempt_accounting_incomplete` violation and cannot exercise a member, so both violations appear when both conditions apply. A run containing `acceptance_workload_incomplete` can never pass regardless of resource values.
 
-Coverage proves execution, not endpoint health. A completely accounted failed, timed-out, or post-start canceled attempt can exercise its exact member. No exact cadence-derived attempt count per member is required; the scheduler, cadence, rate, resource, and at-least-one-exercise rules remain independently binding.
+Violation `monitoring_readiness_lost` is mandatory for any false, unavailable, missing, or internally contradictory readiness level or transition after the first successful ready observation and before the continuity endpoint. It remains mandatory after a later true observation.
+
+Violation `acceptance_scheduler_inactive` is mandatory when the accepted scheduler is stopped, disabled, disposed, replaced, changes or loses epoch, loses accepted-workload ownership, silently loses any due round, emits a duplicate/wrong-member/late due-round reduction, or otherwise makes any of `scheduler_active_continuous`, `scheduler_epoch_unchanged`, or `all_due_rounds_reconciled` false. Accepted-configuration or manifest mutation independently adds `acceptance_workload_incomplete` as applicable. A run containing either continuity violation can never pass.
+
+Coverage proves execution, not endpoint health. A completely accounted failed, timed-out, or post-start canceled attempt can exercise its exact member. No exact success count is required; the dynamically derived due-round count and its terminal-or-explicit-incomplete identity remain exact, while scheduler, cadence, rate, resource, and at-least-one-exercise rules remain independently binding.
 
 Violation `unknown_probe_method` is mandatory whenever `attempts.by_probe_kind["unknown"] > 0`. Both `attempt_accounting_incomplete` and `unknown_probe_method` appear when both conditions apply. Every applicable violation appears exactly once, and the `violations` array remains in ordinal code order.
 
 Schema, property-order, array-order, and type defects also make the report `result` equal `fail` and cause a nonzero sampler exit. This is required even when the report can still serialize a bounded violation list; every other independently applicable violation code also appears exactly once.
 
-The report contains no machine name, username, domain membership, serial number, BIOS serial, device UUID, Windows product key, MAC address, IP address, disk serial, cloud instance ID, arbitrary environment variable, absolute path, endpoint, target, provider/member identity, scheduler key, interface, DNS answer, payload, header, body, exception text, credential, customer identifier, or DNS-correlation snapshot field. The human report must contain the same required host-profile, timing, startup-attempt, steady-state-attempt, workload-coverage, cap, and violation values and must not apply different calculations, phase membership, property meaning, or privacy rules.
+The report contains no machine name, username, domain membership, serial number, BIOS serial, device UUID, Windows product key, MAC address, IP address, disk serial, cloud instance ID, arbitrary environment variable, absolute path, endpoint, target, provider/member identity, scheduler key or epoch, route/interface candidate value, readiness-transition timestamp detail, interface, DNS answer, payload, header, body, exception text, credential, customer identifier, or DNS-correlation snapshot field. The human report must contain the same required host-profile, timing, startup-attempt, steady-state-attempt, workload-coverage, runtime-continuity, cap, and violation values and must not apply different calculations, phase membership, property meaning, or privacy rules.
 
 ### 8.9 Failure rules
 
 The sampler exits nonzero when:
 
 - readiness exceeds 60 seconds;
+- readiness is lost, unavailable, or contradictory after first readiness and before the continuity endpoint;
+- the accepted scheduler is inactive, disabled, disposed, replaced, changes/loses epoch or workload ownership, or fails exact due-round reconciliation at any point in the continuity interval;
 - any static acceptance-host requirement is unsupported, required host metadata is missing, or a prohibited shared/CPU-quota-limited host is used;
 - the 60-second host preflight is missing a required sample, has average non-agent system CPU greater than or equal to 10.0%, or ends with less than 2,000,000,000 bytes available physical memory;
 - the process exits, the PID changes, or a replacement/restart occurs at any point through stable final-snapshot commit;
@@ -1262,6 +1382,7 @@ The sampler exits nonzero when:
 - network reaches or exceeds 100,000 bytes/minute;
 - any growth rule fails;
 - any required workload member is not distinctly exercised or manifest/configuration/member reconciliation fails under mandatory `acceptance_workload_incomplete` conditions in section 8.8;
+- any required `runtime_continuity` value is false or its event/sample/epoch/due-ledger derivation fails;
 - attempt accounting, exact recognized-method charge derivation, or configured-budget/acceptance table consistency is incomplete under any mandatory `attempt_accounting_incomplete` condition in section 8.8;
 - an unknown probe method is encountered;
 - report serialization violates schema, property or array ordering, type, numeric, or privacy requirements;
@@ -1307,6 +1428,11 @@ Use fake transports, an injected clock, and deterministic jitter to cover:
 - rejection of 25 targets at 15 seconds, acceptance of a 25-target configuration with sufficiently long intervals, and the valid two-default-provider 25-target/60-second example;
 - atomic acceptance-manifest capture from the accepted startup configuration before acceptance measurement, with exactly one Gateway member, conditional DNS membership, one member per configured HTTPS provider, and one member per enabled TCP target;
 - immutable manifest/configuration and stable scheduler/member identity across the run, with duplicate, unknown, missing, mutated, or no-longer-configured identities rejected without using display names, positions, endpoints, logs, or aggregate counts;
+- readiness-transition subscription preceding the first accepted ready observation, continuous true readiness through the final snapshot, and event-driven transitions reconciled with sampled readiness levels under the injected monotonic clock;
+- readiness loss during the start barrier, after every workload member was initially exercised, during end drain, and during final-snapshot stabilization, with a transient false-to-true transition remaining a permanent `monitoring_readiness_lost` failure;
+- scheduler stop, disablement, disposal, replacement, epoch change/loss, or accepted-workload ownership loss producing `acceptance_scheduler_inactive` even when readiness remains true;
+- due-round ledger equality for Gateway, enabled DNS, HTTPS aggregate, and every enabled TCP member, with each due round receiving one terminal or explicit scheduler-level incomplete reduction before its deadline and silent, duplicate, wrong-member, or late reduction failing;
+- acceptance barriers preserving the original epoch and token bucket, and continuity failure causing no same-run scheduler restart/reactivation or token-bucket reset;
 - all provider children in valid two-, three-, and four-provider HTTPS rounds starting without serial five-second waits when the required slots and tokens are available;
 - three- and four-provider rounds in which every child times out at five seconds completing as one counted aggregate failure within the ten-second round deadline, and two consecutive such rounds advancing HTTPS state under the existing threshold;
 - partial HTTPS success remaining aggregate success with `partial_endpoint_failure` when one provider succeeds and the other provider children fail;
@@ -1317,15 +1443,20 @@ Use fake transports, an injected clock, and deterministic jitter to cover:
 - shutdown and degradation cancellation;
 - flapping detection, rolling-window eviction, clearing, restart reset, and degradation reset;
 - configuration bounds, atomic rejection, duplicate IDs, 0/25/26 targets, interval/port limits, credential-like values, and URI/range rejection;
-- missing or invalid `operator_id`, duplicate operator IDs, two domains with the same declared operator, and two declared operators on the same host/domain;
-- valid built-in Google/Cloudflare declarations and valid custom providers with distinct IDs, hosts, registrable domains, and declared operators;
-- registrable-domain cases for `example.com`, a multi-label suffix such as `example.co.uk`, an exact rule, wildcard rule, exception rule, PRIVATE-section suffix, Unicode and equivalent punycode input, one optional terminal dot, a host equal to a public suffix, IP-literal rejection, and two subdomains sharing one registrable domain;
+- missing or invalid `operator_id` and rejection when any provider pair shares a provider ID, declared operator, normalized endpoint host, or normalized registrable domain;
+- valid two-, three-, and four-provider configurations whose provider IDs, declared operators, normalized hosts, and normalized registrable domains are all pairwise distinct, including the built-in Google/Cloudflare declarations;
+- registrable-domain cases for `example.com`, a multi-label suffix such as `example.co.uk`, exact, wildcard, exception, and PRIVATE-section rules, one optional terminal dot, a host equal to a public suffix, IP-literal rejection, two subdomains sharing one registrable domain, and Unicode/IDNA-equivalent hosts normalizing to the same domain;
 - byte-for-byte pinned suffix-data verification and deterministic registrable-domain behavior across restarts;
-- provider-set count, provider/domain/declared-operator separation, HTTPS-only URLs, strict statuses, redirect rejection, and bounded optional-body validation;
+- provider-set count, pairwise provider/domain/host/declared-operator separation, configuration-order independence, atomic rejection with no partial scheduler activation, and a drift test proving every requirements statement uses `distinct_registrable_domain_count = N` for all 2–4 providers;
+- HTTPS-only URLs, strict statuses, redirect rejection, and bounded optional-body validation;
 - HTTPS endpoint outcomes for 204, 200 status-only, wrong status, redirect, TLS failure, timeout, cancellation, oversized body, body not retained, partial provider failure, all-provider failure, and two-provider independence;
 - DNS snapshot correlation for DNS completion before HTTPS start, DNS completion after HTTPS start, concurrent completions in opposite task orders producing the same HTTPS result, the exact 60-second freshness boundary, stale snapshot, no snapshot, fresh success, fresh counted failure, fresh non-counting result, DNS disabled, and timestamp reversal;
 - DNS-blocked HTTPS aggregation, `dns_correlation_unavailable`, DNS independence, and absence of snapshot fields from logs and evidence;
-- gateway route changes, missing route, missing gateway, ICMP success/timeout/unreachable/unavailable;
+- one IPv4 default route, one IPv6 default route, simultaneous-family routes, lower effective metric winning across families, IPv4 winning only an exact effective-metric tie, and route/interface metric composition using checked addition;
+- Ethernet/Wi-Fi and physical/VPN metric competition, PPP and tunnel eligibility, exact remaining tuple tie-breaks, identical-row deduplication, injected/configuration-order independence, and a post-commit route change affecting only the next Gateway round;
+- filtering of interface down/disconnected/unauthenticated/paused/low-power states and exclusion of software-loopback, endpoint, and filter interfaces;
+- stable zero-candidate `missing_route`, route/interface API failure, unstable A/B sets, invalid/contradictory metric data, checked overflow, unusable IPv4 or on-link next hop, and IPv6 link-local next hop with selected-interface scope, preserving the exact `missing_route`/`icmp_unavailable`/`route_selection_unavailable` distinctions;
+- no route/interface candidate field, address, metric, LUID, index, protocol, origin, or scheduler/endpoint identity entering evidence;
 - evidence-code allowlisting and redaction.
 
 ### 9.2 Integration tests
@@ -1335,9 +1466,13 @@ Use disposable local endpoints or fakes only. Cover:
 - local TCP accept, refuse, timeout, cancellation, and socket disposal;
 - local HTTPS status/body/redirect/streaming behavior with test certificates as appropriate;
 - two-, three-, and four-provider local HTTPS fan-out with concurrent all-timeout completion, partial success, global/per-provider limits, non-overlapping aggregate rounds, contention incompleteness, and sustained mixed-work fairness;
+- two-, three-, and four-provider startup acceptance with pairwise-distinct IDs/operators/hosts/domains, plus atomic no-scheduler rejection for every pairwise duplicate and for IDNA-equivalent or configuration-order-permuted duplicates;
 - system-resolver adapter success/failure through a controlled abstraction;
 - scheduler activation after readiness creating one full process-local bucket, exact monotonic lazy refill during local fake/endpoint work, and prompt stop plus bucket discard on readiness degradation;
 - restart rebinds static configuration, reconstructs enabled probes as `unknown`, moves them to `baselining` only through scheduler activation after readiness, and creates a new full bucket/anchor without prior credit;
+- an acceptance coordinator subscribed before readiness, continuous event/sample reconciliation, permanent failure after transient readiness loss, same-epoch ownership through both barriers/final stabilization, and no same-run scheduler restart after continuity failure;
+- deterministic due-round reconciliation through success, failure, timeout, cancellation, rate/capacity incomplete, admission pauses, and injected silent-round loss, with token-bucket continuity across acceptance barriers;
+- an injected Windows route adapter exercising stable A/B current-compartment snapshots, family-specific interface metric lookup, exact candidate filtering/order/deduplication, failure distinctions, and no route/interface value leakage;
 - no probe journal/outbox calls and no database/schema artifacts;
 - no response body, DNS answer, endpoint, target, interface, or exception leakage.
 
@@ -1349,8 +1484,8 @@ Verify:
 
 - URI user information, credentials, credential-assignment syntax, query strings, fragments, and customer/device identifiers are rejected;
 - HTTPS redirects and invalid TLS are rejected without fallback or weakened validation;
-- endpoint URLs/hosts, DNS queries/answers, DNS-correlation snapshot fields, target IDs/labels/hosts/ports, response bodies, headers, interface/route data, exception text, machine paths, and other customer-controlled values do not appear in production logs or evidence;
-- workload manifests, scheduler keys, internal member identities, per-provider identities, and per-target identities do not appear in JSON or human acceptance reports, logs, health, support output, or metrics;
+- endpoint URLs/hosts, DNS queries/answers, DNS-correlation snapshot fields, target IDs/labels/hosts/ports, response bodies, headers, interface/route candidate data, metrics, LUIDs, indices, protocols/origins, exception text, machine paths, and other customer-controlled values do not appear in production logs or evidence;
+- workload manifests, scheduler keys or epochs, readiness-transition timestamp details, internal member identities, per-provider identities, and per-target identities do not appear in JSON or human acceptance reports, logs, health, support output, or metrics;
 - response-body readers stop at the 256-byte bound plus one overflow-detection byte and retain no bytes;
 - no production inbound listener, firewall mutation, packet capture, subnet/range expansion, broad port scan, or arbitrary gateway TCP probe exists;
 - no probe journal/outbox call, schema artifact, identity fabrication, or raw LAN inventory is introduced.
@@ -1361,8 +1496,8 @@ Native acceptance must verify:
 
 - the host matches `r0-005-windows11-x64/v1`, records every required bounded profile field, and passes the 60-second idle/resource preflight;
 - the host is physical or a dedicated VM rather than a shared or CPU-quota-limited runner, with virtualization recorded;
-- active default-route/interface discovery on Windows;
-- bounded route evidence without interface/address disclosure;
+- current-compartment IPv4/IPv6 default-route discovery through the required IP Helper rows, stable A/B candidate-set commit, family-specific effective-metric composition, exact tuple selection, and bounded `missing_route`/`icmp_unavailable`/`route_selection_unavailable` distinctions;
+- Ethernet/Wi-Fi/VPN competition resolved by the binding metric/tuple policy without interface, address, metric, LUID, index, protocol, or origin disclosure;
 - ICMP success when permitted and `icmp_unavailable` behavior when it is not;
 - cancellation and service stop complete within five seconds;
 - the 25-target resource sampler passes only after the Gateway, enabled DNS, both HTTPS providers, and all 25 distinct synthetic TCP members receive terminal steady-state exercise;
@@ -1371,6 +1506,8 @@ Native acceptance must verify:
 - steady-state sampling is anchored at exact `steady_state_start + 5n seconds`, and startup/steady-state CPU and disk attribution share the committed boundary without an omitted or double-counted interval;
 - the exact PID remains alive and unchanged and CPU, disk, and working-set enforcement continue through stable final-snapshot commit while attempt and network membership stop at exact `steady_state_end`;
 - monitoring-ready is achieved within 60 seconds after network availability;
+- monitoring-ready remains continuously true from its first accepted observation through stable final-snapshot commit, the same active/enabled/undisposed scheduler epoch owns the unchanged accepted workload, and every due round before `steady_state_end` is terminally or explicitly incompletely reconciled;
+- injected native acceptance failure proves readiness loss, scheduler/epoch loss, or silent due-round loss cannot be forgiven by recovery or a same-run scheduler restart;
 - no inbound listener or firewall rule is added;
 - every synthetic listener and service acceptance artifact is cleaned up.
 
@@ -1403,7 +1540,7 @@ Deterministic automated tests must cover:
 - every stable resource violation code and ordinal violation ordering;
 - every static host-profile boundary, OS build below minimum, x86 or ARM process rejection, insufficient processors or physical memory, battery/power-scheme failure, debugger/profiler rejection, the idle CPU boundary, and the available-memory boundary;
 - physical, virtual, and unknown virtualization values;
-- exact `r0-005-resource-report/v1` top-level, `host_profile`, `timing`, `startup`, and remaining nested property names/order, invariant numeric and UTC serialization, no NaN/infinity, and identical values/calculations in the JSON and human report;
+- exact `r0-005-resource-report/v1` top-level, `host_profile`, `timing`, `startup`, `runtime_continuity`, and remaining nested property names/order, invariant numeric and UTC serialization, no NaN/infinity, and identical values/calculations in the JSON and human report;
 - exact `by_probe_kind` vocabulary and exact `dns`, `gateway_icmp`, `https`, `tcp`, `unknown` order;
 - exact `by_outcome` vocabulary and exact `canceled`, `failed`, `incomplete`, `succeeded`, `timed_out` order;
 - exact `{code,count}` property order, mandatory zero-count entries, and the normative zero-attempt representation;
@@ -1412,15 +1549,19 @@ Deterministic automated tests must cover:
 - mutually exclusive probe-kind assignment and mutually exclusive outcome assignment for every invocation;
 - every started invocation receiving exactly one outcome and rejection of an outcome without a corresponding started invocation;
 - separate accounting for every HTTPS provider request;
-- complete required workload passing only after the Gateway logical-round/terminal-ICMP rule, enabled DNS, every configured HTTPS provider, and all 25 TCP members are distinctly exercised during steady state, with terminal failed/timed-out attempts eligible and no exact cadence-derived count required;
+- complete required workload passing only after the Gateway logical-round/terminal-ICMP rule, enabled DNS, every configured HTTPS provider, and all 25 TCP members are distinctly exercised during steady state, with terminal failed/timed-out attempts eligible and no exact success count required;
 - a zero-attempt run, one missing TCP target, 24 distinct TCP targets plus duplicate work on another, one missing HTTPS provider, aggregate HTTPS counts masking an unexercised provider, missing Gateway coverage, and enabled-but-unexercised DNS each adding `acceptance_workload_incomplete` and failing;
 - disabled DNS producing no required member and both DNS flags false; startup-only work and pre-start cancellation not satisfying coverage; and a started nonterminal attempt satisfying neither coverage nor existing attempt closure while adding both applicable violations;
 - unknown, missing, duplicate, unmanifested, mutated, or no-longer-configured internal identities; `configuration.target_count`/manifest mismatch; configured/exercised mismatch; and configuration or manifest mutation all failing deterministic reconciliation;
 - exact `workload_coverage` top-level placement and property order, JSON Boolean and nonnegative-integer encodings, derived `all_required_exercised`, agreement between human and JSON calculations, and rejection of missing, reordered, malformed, additional, or inconsistent fields;
-- privacy exclusion of target/provider identities, endpoints, hosts, ports, operator IDs, scheduler keys, internal member identities, and private paths from workload coverage, with the deterministic zero-attempt fragment remaining valid diagnostic output but never a passing nonempty-manifest run;
+- readiness remaining true from first observation through final snapshot; loss during the start barrier, after initial member coverage, during end drain, or during final stabilization; transient false-to-true loss not forgiven; and exact readiness-event/sampled-level reconciliation;
+- scheduler disposal, disablement, replacement, epoch change/loss, or workload-ownership loss failing even when readiness remains true, with token-bucket continuity across barriers and no same-run restart/reactivation after continuity failure;
+- every due Gateway, enabled-DNS, HTTPS-aggregate, and enabled-TCP round receiving exactly one terminal or explicit scheduler-level incomplete reduction before its deadline, with silent disappearance, duplicate/wrong-member/late reduction, and ledger-identity failure producing `acceptance_scheduler_inactive`;
+- exact `runtime_continuity` placement and `monitoring_ready_continuous`, `scheduler_active_continuous`, `scheduler_epoch_unchanged`, `all_due_rounds_reconciled` property order, derived JSON Booleans, all-four-true pass requirement, and identical human-report values;
+- privacy exclusion of target/provider identities, endpoints, hosts, ports, operator IDs, scheduler keys/epochs, readiness-transition timestamp details, route/interface values, internal member identities, and private paths from workload/continuity evidence, with the deterministic zero-attempt fragment remaining valid diagnostic output but never a passing nonempty-manifest run;
 - exact fixed charge derivation for every supported method, adapter charge input/override rejection, measured-below-table and measured-above-table attribution, and one shared configured-budget/acceptance table without drift;
 - byte-identical totals and reports from different adapters with identical measured bytes, one exact 8,192-byte charge per concurrent HTTPS provider, and deterministic network totals immediately below, exactly at, and above the 100,000-byte/minute boundary;
-- route/interface discovery remaining outside transport-invocation counts;
+- route/interface discovery remaining outside token and transport-invocation counts, with stable A/B snapshots, exact tuple selection, route changes after commit deferred to the next round, and no route/interface identity or candidate field in either report;
 - cancellation before transport invocation not counting as started and cancellation after start counting only as `canceled`;
 - timeout counting only as `timed_out` and ordinary failure counting only as `failed`;
 - attempt-level incomplete adding `attempt_accounting_incomplete` and failing acceptance;
