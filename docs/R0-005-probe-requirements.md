@@ -48,8 +48,10 @@ Nominal base-interval multiples are not detection-time service-level agreements.
 The remaining deliberate reconciliations are:
 
 - Technical Feasibility supplies the approved resource caps, 25-target boundary, three-check “protected” concept, and later seven-day soak. Its disk cap is explicitly a persistent “Disk growth” target tested by “Database size trend”; R0-005 therefore measures attributable runtime-file-size growth rather than aggregate process I/O. R0-005 adopts the caps and target count but keeps “protected,” alert truth, and the long soak outside its local operational-state merge gate.
+- Technical Feasibility section 7.2 proposes two stable DNS names to reduce authoritative-domain-specific false negatives. R0-005 explicitly supersedes that prototype heuristic for R0-005 only and defines one independently scheduled resolver-path probe with one query name, one transport attempt, and one unambiguous reducer result per logical round. Pairwise-distinct multi-provider HTTPS supplies separate internet-path diversity, and the existing correlation rules prohibit one DNS signal from being presented as a broad property outage. A two-name DNS design would require reviewed aggregation, per-child token/charge, concurrency/fairness, coverage-identity, snapshot-publication, and budget semantics that this task does not silently invent. The accepted tradeoff is that failure of the configured authoritative domain can move only the DNS probe through its own `suspect` or `offline` state. Any future multi-name design requires a separately reviewed requirements change.
 - Data Model/API supplies the broader persisted state vocabulary. R0-005 maps to it without changing contracts and defers durability until authenticated identity exists.
 - MVP Backlog assigns target management to the later local-configuration task. R0-005 pulls forward only the narrow execution/evidence primitives listed in section 2.5.
+- [Security and Privacy Guardrails](security-guardrails.md) generally require malformed durable or updateable configuration to preserve a safely stored accepted last-known-good value. R0-005 has no authenticated or durable configuration owner and no stored last-known-good probe configuration, so it uses the guardrail's documented, narrow pre-registration exception: atomic, visible fail-closed startup rejection with no scheduler and no stale substitution. This is an R0-005-only source reconciliation, not general product policy.
 
 For Windows route-policy field semantics, the official Microsoft IP Helper documentation is the source of truth. [`MIB_IPINTERFACE_ROW.DisableDefaultRoutes`](https://learn.microsoft.com/en-us/windows/win32/api/netioapi/ns-netioapi-mib_ipinterface_row) is a Boolean on the family-specific IP-interface row: `true` means use of the default route on that interface is disabled. Microsoft documents this as a security control VPN clients can use to restrict split tunneling and documents that [`GetIpInterfaceEntry`](https://learn.microsoft.com/en-us/windows/win32/api/netioapi/nf-netioapi-getipinterfaceentry) obtains its current value. R0-005 therefore treats `DisableDefaultRoutes == false` as a mandatory operating-system route-policy constraint, not an optional heuristic, metric penalty, preference, or fallback rule.
 
@@ -91,9 +93,11 @@ R0-005 configuration uses the normal .NET configuration providers already availa
 - environment variables;
 - command-line configuration.
 
-Configuration is bound and validated exactly once during service startup. The atomically accepted configuration is immutable for the process lifetime; a restart is required to apply changes. R0-005 provides no CRUD API, LAN or cloud management endpoint, UI, hot reload, SQLite configuration, or “last known good” fallback.
+Configuration is bound and validated exactly once during service startup. The atomically accepted configuration is immutable for the process lifetime; a restart is required to apply changes. R0-005 provides no CRUD API, LAN or cloud management endpoint, UI, hot reload, SQLite configuration, authenticated or durable configuration owner, or stored last-known-good fallback. Process memory is not a last-known-good store and is never reused across restart.
 
-Validation is atomic. If any enabled probe or provider entry is invalid, the probe subsystem schedules no work. It exposes bounded validation codes without echoing customer-controlled values. It must not partly activate a valid subset.
+Validation is atomic. If any enabled probe or provider entry is invalid, the probe subsystem schedules no work, activates no valid subset, reuses no prior in-memory configuration, and silently substitutes no stale provider or target set. It exposes only bounded local validation codes without echoing customer-controlled values. Monitoring-ready remains false or visibly degraded for the probe subsystem; correcting configuration plus a healthy process restart is required before normal activation.
+
+This fail-closed behavior is the narrow R0-005 exception documented in [Security and Privacy Guardrails](security-guardrails.md). It records an explicit availability/security tradeoff: a malformed environment or command-line override at restart can stop probing, but reusing stale configuration could silently preserve outdated or unsafe targets or providers. R0-005 chooses visible fail-closed startup because it owns no authenticated or durable configuration store. It neither creates persistence nor establishes a rule for durable/updateable configuration, which must continue to preserve a safely stored accepted last-known-good value.
 
 At the same atomic acceptance boundary and before acceptance workload measurement or probe scheduling begins, the implementation freezes the acceptance workload manifest defined in section 8.1. The manifest and the accepted configuration cannot be replaced, reordered, or mutated during the run. Any detected configuration or manifest mutation is an acceptance failure rather than a hot-reload operation.
 
@@ -122,9 +126,10 @@ The DNS probe has one enabled flag and one query name:
 
 - default query name: `example.com`;
 - override: one trimmed ASCII DNS name, maximum 253 characters, with punycode allowed;
-- no scheme, port, user information, path, query, fragment, wildcard, credentials, or customer identifier.
+- no scheme, port, user information, path, query, fragment, wildcard, credentials, or customer identifier;
+- no list, array, fallback name, comma- or whitespace-separated multiple-name syntax, wildcard/search-domain expansion, or other expression that can produce more than one query name.
 
-The system resolver is used. A round succeeds when at least one valid A or AAAA address is returned within the timeout. Returned addresses are never logged, persisted, or added to evidence.
+The system resolver is used. Exactly one DNS transport attempt is made for the one configured name in each DNS logical round. A round succeeds when at least one valid A or AAAA address is returned within the timeout. Returned addresses are never logged, persisted, or added to evidence. One-name configuration is an explicit R0-005 source override, not an accidental omission or an authorization for fallback/search expansion.
 
 #### HTTPS provider definition
 
@@ -166,8 +171,9 @@ An operator may override the full HTTPS provider set at startup, subject to all 
 - across the complete configured set, every provider ID, declared `operator_id`, normalized endpoint host, and normalized registrable domain is pairwise distinct;
 - redirects are disabled and rejected;
 - cookies, authentication, uploads, custom authorization, and customer identifiers are forbidden;
-- each entry contains an exact integer expected status from 100 through 599;
+- each entry contains an exact integer expected status from 200 through 299, inclusive; every 1xx, 3xx (including 300–308), 4xx, and 5xx value is invalid configuration;
 - an optional exact expected body may be configured as UTF-8 text of at most 256 bytes;
+- an expected body is invalid when expected status is 204 or 205; either status remains valid without an expected body;
 - if no exact body is configured, body content is not a health condition and is not read;
 - if an exact body is configured, at most 256 bytes plus one overflow-detection byte are read, compared without normalization, and discarded;
 - endpoint bodies, headers, hostnames, URLs, DNS answers, and `operator_id` values never enter logs, persistence, probe evidence, health output, support output, or metrics.
@@ -348,6 +354,8 @@ The stable zero-eligible-candidate `missing_route` threshold is two consecutive 
 
 DNS is a separate logical probe with its own state, counter, transition history, and evidence. It uses the system resolver and the configured query name.
 
+R0-005 intentionally performs exactly one transport attempt against exactly one query name per DNS logical round. Technical Feasibility section 7.2's two-name prototype heuristic sought to reduce authoritative-domain-specific false negatives, but adopting it here would require new child aggregation, token/charge, concurrency/fairness, coverage-identity, snapshot-publication, and budget rules. Those semantics are not silently invented. Pairwise-distinct HTTPS providers separately supply internet-path diversity. The accepted one-name tradeoff is that failure of the configured authoritative domain can move this bounded DNS signal through `suspect` or `offline`; it must not by itself be labeled as broad property-outage evidence under the existing correlation rules. This decision leaves the existing DNS timeout, one-token/one-method-charge rule, attempt and charged-network formulas, threshold, one-snapshot publication, and HTTPS correlation model unchanged. A fallback or second-name query requires a separately reviewed future requirements change.
+
 Success requires a valid A or AAAA result within two seconds. Timeout, resolver failure, or no valid address is a counted DNS failure. The offline threshold is two consecutive counted failures.
 
 A DNS-only failure cannot declare the HTTPS aggregate or total internet state offline. Consumers must be able to see DNS state independently.
@@ -378,8 +386,8 @@ An endpoint succeeds only when:
 
 - DNS/connect/TLS completes within the five-second endpoint timeout;
 - normal certificate-chain and hostname validation succeeds;
-- no redirect occurs;
-- the exact configured status is returned;
+- no redirect occurs; every actual 3xx response is a terminal provider failure and can never satisfy an expected-status rule;
+- the actual status exactly equals the validated configured 2xx status;
 - when and only when an expected body is configured, the exact bounded body matches.
 
 Aggregation is deterministic:
@@ -409,6 +417,8 @@ The TCP offline threshold is two consecutive counted failures.
 ## 4. Scheduler contract
 
 ### 4.1 Activation and degradation
+
+The scheduler is never constructed or activated when atomic startup configuration validation fails. No prior process-memory configuration or partial provider/target subset may survive that failure. Probe monitoring-ready remains false or visibly degraded with bounded local validation evidence until corrected configuration is supplied and the process is restarted. This is the scoped R0-005 exception to the general last-known-good rule in [Security and Privacy Guardrails](security-guardrails.md); it adds no persistence and does not weaken the rule for configuration that has a safely stored accepted last-known-good value.
 
 The scheduler may activate only after R0-004 reports both journal readiness and formal service readiness. A configured logical target is constructed as `unknown`. At the exact injected-monotonic timestamp of successful scheduler activation, activation creates one stable process-local scheduler epoch, marks it active and enabled, moves every enabled target from `unknown` to `baselining`, clears every failure streak, recovery progress, and flapping history, makes every first round due immediately through the same global controls as later work, and creates the epoch's one process-local token bucket with exactly eight token-seconds of credit and that activation timestamp as its refill anchor. No transport round may be dispatched or reduced while a target remains `unknown`; a round result observed for an `unknown` target is an implementation invariant failure, not an operational transition.
 
@@ -695,6 +705,8 @@ Codes are not user-facing causal claims. Production logs and metrics may include
 - raw configuration or entire serialized outcomes.
 
 Unexpected exceptions may be correlated through an existing bounded correlation ID, but sensitive exception content remains out of ordinary logs and support artifacts.
+
+Security review explicitly preserves the general malformed-configuration last-known-good rule wherever a safely stored accepted durable/updateable value exists. The R0-005 startup-only exception is narrow because this task owns neither authenticated configuration nor persistence: invalid startup input activates no scheduler or subset, reuses no stale process value, remains visibly unavailable/degraded, and exposes only bounded `configuration_invalid` evidence without customer-controlled values. This availability cost avoids silently probing outdated or unsafe targets/providers and does not authorize a new store, failed-update replacement, or a general fail-closed configuration policy. Failure reports likewise expose boundary availability and `null`, never fabricated measurements or private configuration.
 
 The production probe engine opens no inbound listener, changes no firewall rule, captures no packet, and performs no broad port scan. Disposable loopback listeners belong only to controlled tests and acceptance cleanup.
 
@@ -991,16 +1003,17 @@ The JSON has these exact top-level properties in this order:
 2. `source`
 3. `configuration`
 4. `host_profile`
-5. `timing`
-6. `startup`
-7. `steady_state`
-8. `growth`
-9. `attempts`
-10. `workload_coverage`
-11. `runtime_continuity`
-12. `caps`
-13. `violations`
-14. `result`
+5. `measurement_availability`
+6. `timing`
+7. `startup`
+8. `steady_state`
+9. `growth`
+10. `attempts`
+11. `workload_coverage`
+12. `runtime_continuity`
+13. `caps`
+14. `violations`
+15. `result`
 
 `schema_version` is exactly `r0-005-resource-report/v1`. Required nested properties are:
 
@@ -1009,6 +1022,7 @@ The JSON has these exact top-level properties in this order:
 | `source` | `commit_sha`, `configuration_name`, `executable_sha256` |
 | `configuration` | `target_count`, `https_provider_count`, `logical_processor_count`, `sampling_interval_seconds`, `requested_steady_state_minutes` |
 | `host_profile` | `profile_id`, `os_product`, `os_version`, `os_build`, `os_revision`, `os_architecture`, `process_architecture`, `framework_description`, `runtime_version`, `runtime_identifier`, `gc_mode`, `logical_processor_count`, `total_physical_memory_bytes`, `processor_vendor`, `processor_family`, `processor_model`, `processor_stepping`, `virtualization`, `power_source`, `power_scheme_guid`, `battery_saver_enabled`, `process_priority`, `debugger_attached`, `profiler_attached`, `idle_preflight_average_cpu_percent`, `idle_preflight_available_memory_bytes` |
+| `measurement_availability` | `configuration_accepted`, `host_profile_complete`, `process_started`, `readiness_reached`, `steady_state_started`, `steady_state_ended`, `end_drain_finished`, `final_snapshot_window_started`, `final_snapshot_committed` |
 | `timing` | `process_start_utc`, `readiness_utc`, `startup_elapsed_ms`, `steady_state_start_barrier_elapsed_ms`, `steady_state_start_utc`, `steady_state_end_utc`, `steady_state_end_drain_elapsed_ms`, `final_runtime_snapshot_elapsed_ms`, `valid_sample_count`, `missing_sample_count` |
 | `startup` | `cpu_observation_duration_ms`, `total_cpu_ms`, `maximum_normalized_cpu_percent`, `maximum_working_set_bytes`, `attributed_disk_bytes`, `attributed_network_bytes`, `attempts_started`, `attempts_completed`, `attempts_succeeded`, `attempts_failed`, `attempts_timed_out`, `attempts_canceled`, `attempts_incomplete` |
 | `steady_state` | `average_normalized_cpu_percent`, `maximum_working_set_bytes`, `maximum_private_bytes`, `maximum_handle_count`, `maximum_thread_count`, `attributed_disk_bytes`, `disk_mb_per_day`, `attributed_network_bytes`, `network_bytes_per_minute` |
@@ -1019,7 +1033,107 @@ The JSON has these exact top-level properties in this order:
 | `caps` | `readiness_ms`, `working_set_bytes`, `average_cpu_percent`, `disk_mb_per_day`, `network_bytes_per_minute`, `growth_percent`, `working_set_growth_noise_bytes`, `private_bytes_growth_noise_bytes`, `handle_growth_noise_count`, `thread_growth_noise_count` |
 | `result` | the string `pass` or `fail` |
 
-The table is normative for nested property presence and property order. `configuration.logical_processor_count` must exactly equal `host_profile.logical_processor_count`; `configuration.target_count` must equal the manifest's distinct TCP-member count; and `configuration.https_provider_count` must equal its distinct HTTPS-provider count. The three boundary timing durations are nonnegative JSON integers in milliseconds. `timing.steady_state_start_utc` represents the UTC correlation value captured for the exact monotonic baseline-bundle commit; `steady_state_end_utc` correlates to exactly the requested duration after that commit. `steady_state_end_drain_elapsed_ms` ends at terminal attempt closure or its deadline. `final_runtime_snapshot_elapsed_ms` is required in every success or failure report, starts at end-drain completion or its failing deadline, and ends at stable final-snapshot commit; it is zero only when the complete two-map protocol commits at the same observable monotonic instant, and on final-snapshot failure records elapsed time through the failing deadline. `startup.total_cpu_ms`, `steady_state.average_normalized_cpu_percent`, `startup.attributed_disk_bytes`, and `steady_state.attributed_disk_bytes` all use the boundary model in sections 8.1, 8.4, and 8.6. The disk integers are the results of the process-start/steady-state-start and steady-state-start/stable-final snapshot pairs; `steady_state.disk_mb_per_day` is calculated only from the latter. `startup.attempts_*` values are nonnegative JSON integers for startup transport invocations and satisfy the same started/completed/outcome identities as the top-level steady-state attempt scalars. Queued work canceled before transport start appears in neither set of transport-attempt counts. The human report uses the identical baseline-bundle timestamp, CPU baseline, stable snapshot pairs, phase membership, exact method-charge derivation, coverage reconciliation, runtime-continuity derivation, timing values, and totals.
+The table is normative for nested property presence and property order. Every top-level object and fixed nested property remains present in both success and failure reports. The only representation for a required value whose producing boundary never existed is JSON `null`; an implementation must not use zero, an empty string or array, an epoch or copied/planned timestamp, `false`, a negative sentinel, NaN, infinity, or property omission to mean unavailable. A measured zero remains numeric zero only when its measurement domain existed, accounting completed, and zero is the genuine result. In the human report the exact rendering for a JSON boundary-null value is `unavailable`.
+
+`measurement_availability` has exactly this ordered shape, and every value is a derived JSON Boolean that is never `null`:
+
+```json
+"measurement_availability": {
+  "configuration_accepted": true,
+  "host_profile_complete": true,
+  "process_started": true,
+  "readiness_reached": true,
+  "steady_state_started": true,
+  "steady_state_ended": true,
+  "end_drain_finished": true,
+  "final_snapshot_window_started": true,
+  "final_snapshot_committed": true
+}
+```
+
+The flags have these exact meanings:
+
+- `configuration_accepted`: atomic R0-005 startup configuration validation succeeded and the immutable acceptance manifest was frozen.
+- `host_profile_complete`: every required acceptance-host field and preflight value was obtained and valid.
+- `process_started`: the exact service PID was created, captured, and accepted for sampling.
+- `readiness_reached`: the first valid monitoring-ready observation was accepted.
+- `steady_state_started`: the stable start snapshot and complete baseline bundle committed atomically.
+- `steady_state_ended`: the exact requested steady-state duration was reached; a planned endpoint is not an actual endpoint.
+- `end_drain_finished`: after `steady_state_ended`, the drain completed normally or reached its bounded terminal deadline and attempt accounting closed.
+- `final_snapshot_window_started`: final-snapshot stabilization began after end-drain finish.
+- `final_snapshot_committed`: one stable final runtime-file snapshot committed through the two-map protocol.
+
+The following implications are mandatory:
+
+```text
+final_snapshot_committed
+  => final_snapshot_window_started
+  => end_drain_finished
+  => steady_state_ended
+  => steady_state_started
+  => readiness_reached
+  => process_started
+
+process_started
+  => configuration_accepted
+  && host_profile_complete
+```
+
+Any contradictory flag combination fails serialization with `report_serialization_invalid`. A later failure never clears a boundary that was already reached. Once a non-null value has been produced, a later failure retains that measured value; it does not replace it with zero or `null`. If a controlling boundary is true but a required value cannot be produced or completely accounted, the value is `null`, the causal bounded violation remains mandatory, and `report_serialization_invalid` is also mandatory. A passing report requires all nine flags `true`, no `null` acceptance field, and every existing cap, identity, coverage, continuity, and violation rule to pass.
+
+The following matrix is exhaustive for every boundary-dependent fixed property. “Null before boundary” means `null` is required when the controlling flag is false. Normal types apply only when non-null. Properties grouped in one row have identical rules; every grouped property is named explicitly.
+
+| Property or exhaustive property group | Earliest producing boundary / controlling flag | Normal non-null type | Null rule | Later failure after production |
+| --- | --- | --- | --- | --- |
+| `configuration.target_count`, `configuration.https_provider_count`, `configuration.logical_processor_count`, `configuration.sampling_interval_seconds`, `configuration.requested_steady_state_minutes` | `configuration_accepted` | nonnegative JSON integer | null before boundary | retain accepted value |
+| `host_profile.profile_id`, `host_profile.os_product`, `host_profile.os_version`, `host_profile.os_architecture`, `host_profile.process_architecture`, `host_profile.framework_description`, `host_profile.runtime_version`, `host_profile.runtime_identifier`, `host_profile.gc_mode`, `host_profile.processor_vendor`, `host_profile.virtualization`, `host_profile.power_source`, `host_profile.power_scheme_guid`, `host_profile.process_priority` | `host_profile_complete` | bounded JSON string | null before boundary | retain completed value |
+| `host_profile.os_build`, `host_profile.os_revision`, `host_profile.logical_processor_count`, `host_profile.total_physical_memory_bytes`, `host_profile.processor_family`, `host_profile.processor_model`, `host_profile.processor_stepping`, `host_profile.idle_preflight_available_memory_bytes` | `host_profile_complete` | nonnegative JSON integer | null before boundary | retain completed value |
+| `host_profile.battery_saver_enabled`, `host_profile.debugger_attached`, `host_profile.profiler_attached` | `host_profile_complete` | JSON Boolean | null before boundary; `false` is a measured value, never unavailable | retain completed value |
+| `host_profile.idle_preflight_average_cpu_percent` | `host_profile_complete` | finite JSON number | null before boundary | retain completed value |
+| every named `measurement_availability` property | report model creation | JSON Boolean | never null | retain derived value |
+| `timing.process_start_utc` | `process_started` | ISO-8601 UTC string | null before boundary | retain actual timestamp |
+| `timing.readiness_utc` | `readiness_reached` | ISO-8601 UTC string | null before boundary | retain actual timestamp |
+| `timing.startup_elapsed_ms` | `process_started` | nonnegative JSON integer | null before boundary; after process start use actual elapsed time to readiness or the terminal startup failure endpoint | retain measured duration |
+| `timing.steady_state_start_barrier_elapsed_ms` | `readiness_reached` | nonnegative JSON integer | null before boundary; after readiness use actual elapsed time to baseline commit or the bounded barrier failure endpoint | retain measured duration |
+| `timing.steady_state_start_utc` | `steady_state_started` | ISO-8601 UTC string | null before boundary | retain actual commit timestamp |
+| `timing.steady_state_end_utc` | `steady_state_ended` | ISO-8601 UTC string | null before boundary; a planned end is forbidden | retain actual endpoint timestamp |
+| `timing.steady_state_end_drain_elapsed_ms` | `end_drain_finished` | nonnegative JSON integer | null before boundary and therefore always null unless `steady_state_ended` is also true | retain duration through closure or deadline |
+| `timing.final_runtime_snapshot_elapsed_ms` | `final_snapshot_window_started` | nonnegative JSON integer | null before boundary | retain duration through commit or failing deadline |
+| `timing.valid_sample_count`, `timing.missing_sample_count` | `process_started` | nonnegative JSON integer | null before boundary; zero requires initialized, closed sample accounting | retain completely reconciled count |
+| `startup.cpu_observation_duration_ms`, `startup.total_cpu_ms`, `startup.maximum_normalized_cpu_percent`, `startup.maximum_working_set_bytes` | `process_started` | nonnegative integer except finite-number CPU percent | null before boundary | retain measured value through failure endpoint |
+| `startup.attributed_disk_bytes`, `startup.attributed_network_bytes`, `startup.attempts_started`, `startup.attempts_completed`, `startup.attempts_succeeded`, `startup.attempts_failed`, `startup.attempts_timed_out`, `startup.attempts_canceled`, `startup.attempts_incomplete` | `steady_state_started` | nonnegative JSON integer | null before boundary; zero requires the startup domain to be sealed and completely reconciled | retain sealed startup value |
+| `steady_state.average_normalized_cpu_percent`, `steady_state.maximum_working_set_bytes`, `steady_state.maximum_private_bytes`, `steady_state.maximum_handle_count`, `steady_state.maximum_thread_count` | `steady_state_ended` | nonnegative integer except finite-number CPU percent | null before boundary | retain full-interval value |
+| `steady_state.attributed_network_bytes`, `steady_state.network_bytes_per_minute` | `end_drain_finished` | nonnegative integer / finite number | null before boundary | retain completely reconciled value |
+| `steady_state.attributed_disk_bytes`, `steady_state.disk_mb_per_day` | `final_snapshot_committed` | nonnegative integer / finite number | null before boundary; no ambiguous snapshot value | retain committed-snapshot value |
+| `growth.working_set.first_window_median`, `growth.working_set.final_window_median`, `growth.working_set.absolute_increase`, `growth.working_set.percent_increase`, `growth.working_set.result` | `steady_state_ended` | finite number or `pass`/`fail` string | null before boundary; `percent_increase` also uses the existing zero-to-positive mathematical-null rule | retain full-window result |
+| `growth.private_bytes.first_window_median`, `growth.private_bytes.final_window_median`, `growth.private_bytes.absolute_increase`, `growth.private_bytes.percent_increase`, `growth.private_bytes.result` | `steady_state_ended` | finite number or `pass`/`fail` string | same rule as `working_set` | retain full-window result |
+| `growth.handles.first_window_median`, `growth.handles.final_window_median`, `growth.handles.absolute_increase`, `growth.handles.percent_increase`, `growth.handles.result` | `steady_state_ended` | finite number or `pass`/`fail` string | same rule as `working_set` | retain full-window result |
+| `growth.threads.first_window_median`, `growth.threads.final_window_median`, `growth.threads.absolute_increase`, `growth.threads.percent_increase`, `growth.threads.result` | `steady_state_ended` | finite number or `pass`/`fail` string | same rule as `working_set` | retain full-window result |
+| `growth.working_set.noise_floor`, `growth.private_bytes.noise_floor`, `growth.handles.noise_floor`, `growth.threads.noise_floor`, `growth.working_set.unit`, `growth.private_bytes.unit`, `growth.handles.unit`, `growth.threads.unit` | report model creation | nonnegative number / bounded string | never null; these are contract constants, not measurements | retain constant |
+| `attempts.by_probe_kind`, `attempts.by_outcome`, `attempts.started`, `attempts.completed`, `attempts.succeeded`, `attempts.failed`, `attempts.timed_out`, `attempts.canceled`, `attempts.incomplete` | `end_drain_finished` | ordered arrays / nonnegative JSON integers | null before boundary; zero arrays/counts require initialized and completely reconciled full steady-state accounting | retain closed accounting |
+| every `attempts.by_probe_kind[*].code`, `attempts.by_outcome[*].code`, `attempts.by_probe_kind[*].count`, `attempts.by_outcome[*].count` | `end_drain_finished` | closed-vocabulary string / nonnegative JSON integer | entries exist only when their containing array is non-null; entry properties are never null | retain closed accounting |
+| `workload_coverage.gateway_required`, `workload_coverage.dns_required`, `workload_coverage.https_providers_configured`, `workload_coverage.tcp_targets_configured` | `configuration_accepted` | JSON Boolean / nonnegative JSON integer | null before boundary; accepted-configuration counts are never fabricated | retain manifest-derived value |
+| `workload_coverage.gateway_exercised`, `workload_coverage.dns_exercised`, `workload_coverage.https_providers_exercised`, `workload_coverage.tcp_targets_exercised`, `workload_coverage.all_required_exercised` | `end_drain_finished` | JSON Boolean / nonnegative JSON integer | null before boundary; `false` or zero means complete calculation found no exercise, not unavailable | retain reconciled value |
+| `runtime_continuity.monitoring_ready_continuous`, `runtime_continuity.scheduler_active_continuous`, `runtime_continuity.scheduler_epoch_unchanged`, `runtime_continuity.all_due_rounds_reconciled` | `readiness_reached` | JSON Boolean | null before boundary; `false` means the continuity interval existed and the calculation failed | retain false after later recovery |
+
+`configuration.logical_processor_count` must exactly equal `host_profile.logical_processor_count` when both are non-null; `configuration.target_count` must equal the manifest's distinct TCP-member count; and `configuration.https_provider_count` must equal its distinct HTTPS-provider count. The three boundary timing durations are nonnegative JSON integers in milliseconds when available. `timing.steady_state_start_utc` is the UTC correlation value for the exact monotonic baseline-bundle commit; `steady_state_end_utc` is the actual exact requested-duration endpoint, never a planned substitute. `steady_state_end_drain_elapsed_ms` ends at terminal attempt closure or its deadline. `final_runtime_snapshot_elapsed_ms` starts at end-drain completion, is zero only when the complete two-map protocol commits at the same observable monotonic instant, and on failure records elapsed time through the final-snapshot deadline. The disk integers retain the existing snapshot-pair meanings, and `steady_state.disk_mb_per_day` is available only from the stable final pair. Startup attempt values satisfy the same identities as top-level attempt scalars when non-null. Queued work canceled before transport start appears in neither set of counts.
+
+These flag examples are normative; every fixed property remains present and follows the matrix:
+
+| Scenario | First false boundary and required effect | Required result/evidence |
+| --- | --- | --- |
+| Configuration rejected before process start | `configuration_accepted = false`; all configuration, host-dependent process, readiness, steady-state, attempt, coverage, and continuity measurements are null | `fail`; bounded configuration violation; no scheduler |
+| Host-profile failure before process start | `host_profile_complete = false`; all host-profile fields and later-boundary measurements are null | `fail`; `host_profile_unsupported` or `host_profile_preflight_failed` |
+| Process starts but readiness times out | through `process_started = true`; `readiness_reached = false`; readiness/later fields and continuity values are null | `fail`; `readiness_timeout` |
+| Readiness reached but start barrier fails | through `readiness_reached = true`; `steady_state_started = false`; barrier duration is measured, baseline-dependent values are null | `fail`; applicable boundary/snapshot violations |
+| Steady state starts but fails before exact end | through `steady_state_started = true`; `steady_state_ended = false`; full-interval, attempt, coverage, and end/final values are null | `fail`; causal bounded violations |
+| End drain reaches its terminal deadline | through `end_drain_finished = true`; `final_snapshot_window_started = true`; attempt accounting includes actual `incomplete` values | `fail`; `attempt_accounting_incomplete` and `measurement_boundary_timeout` |
+| Final snapshot fails to stabilize | through `final_snapshot_window_started = true`; `final_snapshot_committed = false`; final elapsed is measured and disk values are null | `fail`; `runtime_file_snapshot_incomplete` and `measurement_boundary_timeout` |
+| Complete successful run | all flags are true and no acceptance field is null | `pass` only when every other rule also passes |
+
+The human report uses the identical availability flags, boundary/null decisions, baseline-bundle timestamp, CPU baseline, stable snapshot pairs, phase membership, exact method-charge derivation, coverage reconciliation, runtime-continuity derivation, timing values, and totals.
+
+When the sealed startup-attempt domain exists, it satisfies:
 
 ```text
 startup.attempts_completed =
@@ -1033,7 +1147,7 @@ startup.attempts_started =
   + startup.attempts_incomplete
 ```
 
-`host_profile.profile_id` is exactly `r0-005-windows11-x64/v1`. The bounded host-profile values and types are:
+When `host_profile_complete` is true, `host_profile.profile_id` is exactly `r0-005-windows11-x64/v1` and the remaining bounded host-profile values and types are:
 
 | Property | Required representation |
 | --- | --- |
@@ -1059,9 +1173,9 @@ startup.attempts_started =
 | `idle_preflight_average_cpu_percent` | finite JSON number; must be less than 10.0 |
 | `idle_preflight_available_memory_bytes` | JSON integer; must be at least 2,000,000,000 |
 
-All host-profile strings are derived from the listed bounded OS/runtime/hardware sources, not from arbitrary environment variables. Missing, malformed, or out-of-profile values fail as defined in sections 8.2 and 8.9.
+All non-null host-profile strings are derived from the listed bounded OS/runtime/hardware sources, not from arbitrary environment variables. Missing, malformed, or out-of-profile values fail as defined in sections 8.2 and 8.9 and use the section 8.8 availability matrix rather than fabricated replacements.
 
-The following synthetic fragment is normative for the adjacency and property order of `configuration`, `host_profile`, `timing`, and `startup`; its concrete measurement values are illustrative:
+The following synthetic fragment is normative for the adjacency and property order of `configuration`, `host_profile`, `measurement_availability`, `timing`, and `startup`; its concrete measurement values are illustrative:
 
 ```json
 "configuration": {
@@ -1098,6 +1212,17 @@ The following synthetic fragment is normative for the adjacency and property ord
   "profiler_attached": false,
   "idle_preflight_average_cpu_percent": 0.0,
   "idle_preflight_available_memory_bytes": 2000000000
+},
+"measurement_availability": {
+  "configuration_accepted": true,
+  "host_profile_complete": true,
+  "process_started": true,
+  "readiness_reached": true,
+  "steady_state_started": true,
+  "steady_state_ended": true,
+  "end_drain_finished": true,
+  "final_snapshot_window_started": true,
+  "final_snapshot_committed": true
 },
 "timing": {
   "process_start_utc": "2026-01-01T00:00:00.0000000Z",
@@ -1152,7 +1277,7 @@ The top-level `attempts` object is scoped only to invocations whose transport-st
 
 `code` is one of the closed values defined below. `count` is a nonnegative JSON integer; floating-point and negative counts are forbidden. Unknown or extension codes are forbidden in `r0-005-resource-report/v1`. Every defined code appears exactly once, including mandatory zero-count entries. Additional properties are forbidden. The arrays use the exact fixed orders below, which are also ordinal code order; implementations must not depend on locale, dictionary iteration, discovery order, or runtime sorting.
 
-`attempts.by_probe_kind` counts steady-state transport invocations that actually started. It contains exactly five entries in this order:
+When non-null after `end_drain_finished`, `attempts.by_probe_kind` counts steady-state transport invocations that actually started and contains exactly five entries in this order:
 
 | `code` | Definition |
 | --- | --- |
@@ -1168,7 +1293,7 @@ Every HTTPS provider child counts as one `https` invocation even when children s
 
 For each recognized `by_probe_kind` invocation, the report model derives its exact charged bytes from the one section 4.4 table: `gateway_icmp` 128, `dns` 1,024, `tcp` 1,024, and `https` 8,192. The report never accepts an adapter-provided charge. An `unknown` invocation uses only the fixed zero sentinel and measured bytes defined in section 8.7, so totals serialize deterministically while the run remains failed. These derivations do not add per-attempt customer, provider, endpoint, or payload fields to the JSON contract.
 
-`attempts.by_outcome` contains exactly five entries in this order:
+When non-null after `end_drain_finished`, `attempts.by_outcome` contains exactly five entries in this order:
 
 | `code` | Definition |
 | --- | --- |
@@ -1186,7 +1311,7 @@ Scheduler-level and attempt-level incompleteness are distinct:
 - Attempt-level `incomplete` applies only when a transport invocation actually started and attempt accounting closes before that invocation receives exactly one of `succeeded`, `failed`, `timed_out`, or `canceled`.
 - Attempt-level `incomplete` is always an acceptance failure and adds violation `attempt_accounting_incomplete`.
 
-The scalar attempt properties have these exact definitions:
+When non-null after `end_drain_finished`, the scalar attempt properties have these exact definitions:
 
 | Property | Definition |
 | --- | --- |
@@ -1198,7 +1323,7 @@ The scalar attempt properties have these exact definitions:
 | `canceled` | Identical to `by_outcome.canceled`. |
 | `incomplete` | Identical to `by_outcome.incomplete`. |
 
-The report must satisfy these exact identities:
+When `attempts` is non-null after `end_drain_finished`, the report must satisfy these exact identities:
 
 ```text
 started =
@@ -1221,7 +1346,7 @@ started =
   completed + incomplete
 ```
 
-`workload_coverage` is derived from the frozen manifest and terminal steady-state attempt records, never independently assigned. Gateway and DNS use JSON Booleans; the provider and target values are nonnegative JSON integers. Its properties appear exactly in the table order above. `gateway_required` is always `true`; `dns_required` reflects whether DNS was enabled in the accepted configuration. The corresponding exercised Boolean is `true` only when that required member meets section 8.1, while disabled DNS requires both DNS flags to be `false`. Configured counts equal the manifest's distinct category counts and exercised counts deduplicate exact internal member identity. `all_required_exercised` is `true` if and only if every equality in section 8.1 holds, the Gateway logical-round/ICMP rule holds, no manifest identity or configuration defect exists, and every required member is distinctly exercised.
+`workload_coverage` is derived from the frozen manifest and terminal steady-state attempt records, never independently assigned. When non-null, Gateway and DNS values are JSON Booleans and provider/target values are nonnegative JSON integers. Its properties appear exactly in the table order above. After `configuration_accepted`, `gateway_required` is `true`, `dns_required` reflects the accepted DNS-enabled value, and configured counts equal the manifest's distinct category counts; before that boundary those four fields are `null`. After `end_drain_finished`, the corresponding exercised Boolean is `true` only when that required member meets section 8.1, disabled DNS requires both DNS flags to be `false`, exercised counts deduplicate exact internal member identity, and `all_required_exercised` is `true` if and only if every equality in section 8.1 holds, the Gateway logical-round/ICMP rule holds, no manifest identity or configuration defect exists, and every required member is distinctly exercised. Before complete end-drain accounting those five exercised fields are `null`, not false or zero.
 
 The required passing two-provider, DNS-enabled, 25-TCP-target run has this ordered object shape:
 
@@ -1245,9 +1370,9 @@ The required passing two-provider, DNS-enabled, 25-TCP-target run has this order
 }
 ```
 
-`runtime_continuity` is derived from the subscribed readiness-transition history, sampled readiness/scheduler/PID levels, scheduler-epoch and workload-ownership checks, immutable configuration/manifest checks, and the internal due-round ledger. Its four values are JSON Booleans and appear exactly in the table order above. A required run can pass only when all four are `true`. A later recovery cannot change a derived `false` back to `true`. If first readiness is never observed, all four values are `false`, `readiness_timeout` remains mandatory, and `monitoring_readiness_lost` does not replace that pre-continuity failure. Scheduler epoch, target/member/provider identity, endpoint, route/interface value, transition timestamp detail, and private host value never enter this object or the human report.
+`runtime_continuity` is derived from the subscribed readiness-transition history, sampled readiness/scheduler/PID levels, scheduler-epoch and workload-ownership checks, immutable configuration/manifest checks, and the internal due-round ledger. When the continuity interval exists, its four values are JSON Booleans and appear exactly in the table order above. A required run can pass only when all four are `true`. A later recovery cannot change a derived `false` back to `true`. If first readiness is never observed, the continuity interval never exists and all four values are `null`, `readiness_timeout` remains mandatory, and `monitoring_readiness_lost` does not replace that pre-continuity failure. Scheduler epoch, target/member/provider identity, endpoint, route/interface value, transition timestamp detail, and private host value never enter this object or the human report.
 
-The complete report fails deterministic serialization when `workload_coverage` or `runtime_continuity` is missing, reordered, malformed, contains an additional property, uses an invalid type, conflicts with configuration, internal manifest, readiness, scheduler, PID, epoch, or due-ledger reconciliation, or disagrees with the identical human-report calculation. No endpoint, provider ID, target ID, host, port, operator ID, scheduler key, scheduler epoch, internal member identity, transition timestamp detail, or private path enters either report.
+The complete report fails deterministic serialization when `measurement_availability`, `workload_coverage`, or `runtime_continuity` is missing, reordered, malformed, contains an additional property, uses an invalid type, violates the exhaustive availability matrix or implication chain, conflicts with configuration, internal manifest, readiness, scheduler, PID, epoch, or due-ledger reconciliation, or disagrees with the identical human-report calculation. No endpoint, provider ID, target ID, host, port, operator ID, scheduler key, scheduler epoch, internal member identity, transition timestamp detail, or private path enters either report.
 
 The following object fragment is the normative zero-attempt representation for the required two-provider, DNS-enabled, 25-TCP-target run:
 
@@ -1294,7 +1419,7 @@ The following object fragment is the normative zero-attempt representation for t
 }
 ```
 
-This example is normative for property names, property order, array order, closed vocabularies, mandatory zero entries, integer count encoding, Boolean encoding, scalar representation, and the adjacency of workload and continuity evidence. It is an object fragment from the complete `r0-005-resource-report/v1` report, not a standalone full report. Counts in other valid configurations reflect their accepted manifest. The zero-attempt representation remains a valid deterministic diagnostic, but it cannot pass when the manifest is nonempty: the exercised values remain false or zero, `all_required_exercised` is `false`, and `acceptance_workload_incomplete` is mandatory. This representative idle-scheduler fragment also derives false scheduler and due-round continuity; another failing zero-attempt diagnostic must serialize the four Booleans from its actual bounded evidence rather than copy these illustrative values.
+This example is normative for property names, property order, array order, closed vocabularies, mandatory zero entries, integer count encoding, Boolean encoding, scalar representation, and the adjacency of workload and continuity evidence when the full accounting domains existed and closed. It is an object fragment from the complete `r0-005-resource-report/v1` report, not a standalone full report and not a substitute for `null` before the controlling boundary. Counts in other valid configurations reflect their accepted manifest. The zero-attempt representation remains a valid deterministic diagnostic only after steady-state attempt accounting closed; it cannot pass when the manifest is nonempty: the exercised values remain false or zero, `all_required_exercised` is `false`, and `acceptance_workload_incomplete` is mandatory. This representative idle-scheduler fragment also derives false scheduler and due-round continuity; another failing zero-attempt diagnostic must serialize the values from its actual bounded evidence and availability flags rather than copy these illustrative values.
 
 `violations` is an ordinal-sorted array containing only these stable bounded codes when applicable:
 
@@ -1302,6 +1427,7 @@ This example is normative for property names, property order, array order, close
 - `acceptance_scheduler_inactive`
 - `acceptance_workload_incomplete`
 - `attempt_accounting_incomplete`
+- `configuration_invalid`
 - `counter_negative`
 - `counter_overflow`
 - `counter_reset`
@@ -1363,7 +1489,7 @@ Coverage proves execution, not endpoint health. A completely accounted failed, t
 
 Violation `unknown_probe_method` is mandatory whenever `attempts.by_probe_kind["unknown"] > 0`. Both `attempt_accounting_incomplete` and `unknown_probe_method` appear when both conditions apply. Every applicable violation appears exactly once, and the `violations` array remains in ordinal code order.
 
-Schema, property-order, array-order, and type defects also make the report `result` equal `fail` and cause a nonzero sampler exit. This is required even when the report can still serialize a bounded violation list; every other independently applicable violation code also appears exactly once.
+Violation `report_serialization_invalid` is mandatory when the availability object or any report property violates section 8.8, including a missing, additional, reordered, non-Boolean, or contradictory availability flag; a missing/reordered fixed property; a non-null value before its controlling boundary; `null` after its controlling boundary when complete accounting was required; zero, false, an empty value, a copied/planned/epoch timestamp, or another sentinel used as unavailable; a pass report with any false availability flag or null acceptance field; or disagreement between JSON and human availability/value rendering. Schema, property-order, array-order, and type defects also make `result` equal `fail` and cause a nonzero sampler exit. This remains required when the report can serialize a bounded violation list; every other independently applicable violation code also appears exactly once.
 
 The report contains no machine name, username, domain membership, serial number, BIOS serial, device UUID, Windows product key, MAC address, IP address, disk serial, cloud instance ID, arbitrary environment variable, absolute path, endpoint, target, provider/member identity, scheduler key or epoch, route/interface candidate value, `DisableDefaultRoutes` value, interface identity or type, VPN status, next hop, readiness-transition timestamp detail, DNS answer, payload, header, body, exception text, credential, customer identifier, or DNS-correlation snapshot field. The human report must contain the same required host-profile, timing, startup-attempt, steady-state-attempt, workload-coverage, runtime-continuity, cap, and violation values and must not apply different calculations, phase membership, property meaning, or privacy rules.
 
@@ -1371,6 +1497,8 @@ The report contains no machine name, username, domain membership, serial number,
 
 The sampler exits nonzero when:
 
+- configuration is rejected, including under the scoped fail-closed/no-scheduler R0-005 startup rule;
+- any acceptance-required availability flag is false, any required value is unavailable, or an availability implication/matrix rule fails;
 - readiness exceeds 60 seconds;
 - readiness is lost, unavailable, or contradictory after first readiness and before the continuity endpoint;
 - the accepted scheduler is inactive, disabled, disposed, replaced, changes/loses epoch or workload ownership, or fails exact due-round reconciliation at any point in the continuity interval;
@@ -1393,6 +1521,8 @@ The sampler exits nonzero when:
 - an unknown probe method is encountered;
 - report serialization violates schema, property or array ordering, type, numeric, or privacy requirements;
 - synthetic-listener or acceptance cleanup fails.
+
+Every failure report retains all fixed objects and properties in binding order, derives the nine availability flags, writes JSON `null` for values whose producing boundaries never existed, includes every causal bounded violation exactly once, renders those values as `unavailable` in the human report, and sets `result` to `fail`. It must never fabricate a zero, Boolean, timestamp, empty collection, or estimate to fill an unavailable field.
 
 ## 9. Required verification for implementation
 
@@ -1449,13 +1579,18 @@ Use fake transports, an injected clock, deterministic jitter, and synthetic rout
 - shutdown and degradation cancellation;
 - flapping detection, rolling-window eviction, clearing, restart reset, and degradation reset;
 - configuration bounds, atomic rejection, duplicate IDs, 0/25/26 targets, interval/port limits, credential-like values, and URI/range rejection;
+- malformed startup configuration activating no scheduler or partial valid subset, preserving no prior in-memory state or stale provider/target set across restart, leaving readiness unavailable/degraded with bounded value-free evidence, and corrected configuration plus restart permitting normal activation;
+- a document-drift check proving the R0-005 no-durable-LKG exception remains narrow and consistent with `docs/security-guardrails.md`, while durable/updateable configuration outside this exception continues to preserve its safely stored accepted last-known-good value;
+- default one-name DNS configuration, one valid trimmed override, atomic rejection of lists, arrays, comma- or whitespace-separated multiple names, fallback names, wildcard/search-domain expansion, URI/credential/customer syntax, and configuration order or representation never introducing another name;
+- exactly one DNS transport attempt and one DNS method charge per logical round, unchanged attempt/network-budget examples, one aggregate DNS snapshot per completed round, failure affecting only DNS state under existing correlation language, and a drift check preventing silent fallback or second-name queries;
 - missing or invalid `operator_id` and rejection when any provider pair shares a provider ID, declared operator, normalized endpoint host, or normalized registrable domain;
 - valid two-, three-, and four-provider configurations whose provider IDs, declared operators, normalized hosts, and normalized registrable domains are all pairwise distinct, including the built-in Google/Cloudflare declarations;
 - registrable-domain cases for `example.com`, a multi-label suffix such as `example.co.uk`, exact, wildcard, exception, and PRIVATE-section rules, one optional terminal dot, a host equal to a public suffix, IP-literal rejection, two subdomains sharing one registrable domain, and Unicode/IDNA-equivalent hosts normalizing to the same domain;
 - byte-for-byte pinned suffix-data verification and deterministic registrable-domain behavior across restarts;
 - provider-set count, pairwise provider/domain/host/declared-operator separation, configuration-order independence, atomic rejection with no partial scheduler activation, and a drift test proving every requirements statement uses `distinct_registrable_domain_count = N` for all 2–4 providers;
-- HTTPS-only URLs, strict statuses, redirect rejection, and bounded optional-body validation;
-- HTTPS endpoint outcomes for 204, 200 status-only, wrong status, redirect, TLS failure, timeout, cancellation, oversized body, body not retained, partial provider failure, all-provider failure, and two-provider independence;
+- HTTPS-only URLs; validation acceptance for otherwise valid expected statuses 200, 204, 206, and 299; atomic rejection for 100, 199, 300, 302, 304, 307, 308, 400, 500, and 599; configuration-order independence; and no partial provider subset activation;
+- expected-body rejection with status 204 or 205, acceptance of 204 or 205 without a body, optional bounded exact UTF-8 body comparison for other accepted 2xx statuses, and unchanged Google-204/Cloudflare-200 defaults;
+- HTTPS endpoint outcomes for 204, 200 status-only, wrong status, every actual 3xx as terminal failure, redirects disabled, TLS failure, timeout, cancellation, oversized body, body not retained, partial provider failure, all-provider failure, and two-provider independence;
 - DNS snapshot correlation for DNS completion before HTTPS start, DNS completion after HTTPS start, concurrent completions in opposite task orders producing the same HTTPS result, the exact 60-second freshness boundary, stale snapshot, no snapshot, fresh success, fresh counted failure, fresh non-counting result, DNS disabled, and timestamp reversal;
 - DNS-blocked HTTPS aggregation, `dns_correlation_unavailable`, DNS independence, and absence of snapshot fields from logs and evidence;
 - one IPv4 default route, one IPv6 default route, simultaneous-family routes, lower effective metric winning across families, IPv4 winning only an exact effective-metric tie, and route/interface metric composition using checked addition from the same family-matching IP-interface row that supplies `Connected` and `DisableDefaultRoutes`;
@@ -1469,6 +1604,7 @@ Use fake transports, an injected clock, deterministic jitter, and synthetic rout
 - no `DisableDefaultRoutes` value, VPN/interface identity or type, route/interface candidate field, address, next hop, metric, LUID, index, protocol, origin, or scheduler/endpoint identity entering evidence; and
 - a document-drift test failing if any default-route eligibility list or summary omits the mandatory `DisableDefaultRoutes == false` requirement;
 - evidence-code allowlisting and redaction.
+- exact `measurement_availability` placement and flag order, every implication, every boundary-to-null transition, actual zero versus unavailable, no fake or planned timestamps, all eight normative failure/success examples, human `unavailable`/JSON-null agreement, byte-stable failure JSON, pass reports containing no null, and inconsistent null/value combinations adding `report_serialization_invalid`.
 
 ### 9.2 Integration tests
 
@@ -1476,11 +1612,14 @@ Use disposable local endpoints or fakes only. Cover:
 
 - local TCP accept, refuse, timeout, cancellation, and socket disposal;
 - local HTTPS status/body/redirect/streaming behavior with test certificates as appropriate;
+- local HTTPS validation/execution for the complete accepted/rejected status set, 204/205 body contradictions, actual 3xx never succeeding, redirects remaining disabled, provider-order independence, and preserved default-provider validity;
 - two-, three-, and four-provider local HTTPS fan-out with concurrent all-timeout completion, partial success, global/per-provider limits, non-overlapping aggregate rounds, contention incompleteness, and sustained mixed-work fairness;
 - two-, three-, and four-provider startup acceptance with pairwise-distinct IDs/operators/hosts/domains, plus atomic no-scheduler rejection for every pairwise duplicate and for IDNA-equivalent or configuration-order-permuted duplicates;
 - system-resolver adapter success/failure through a controlled abstraction;
+- controlled one-name DNS operation with exactly one resolver invocation, no fallback/search expansion, one snapshot result, and unchanged token/charged-byte accounting;
 - scheduler activation after readiness creating one full process-local bucket, exact monotonic lazy refill during local fake/endpoint work, and prompt stop plus bucket discard on readiness degradation;
 - restart rebinds static configuration, reconstructs enabled probes as `unknown`, moves them to `baselining` only through scheduler activation after readiness, and creates a new full bucket/anchor without prior credit;
+- malformed restart-time configuration producing no scheduler or partial activation, reusing no prior process-memory or stale provider/target set, remaining visibly unavailable/degraded with value-free bounded evidence, and corrected configuration on a later healthy restart activating normally;
 - an acceptance coordinator subscribed before readiness, continuous event/sample reconciliation, permanent failure after transient readiness loss, same-epoch ownership through both barriers/final stabilization, and no same-run scheduler restart after continuity failure;
 - deterministic due-round reconciliation through success, failure, timeout, cancellation, rate/capacity incomplete, admission pauses, and injected silent-round loss, with token-bucket continuity across acceptance barriers;
 - an injected Windows route adapter exercising stable A/B current-compartment snapshots; same-pass, family-specific `Connected`/`Metric`/`DisableDefaultRoutes` lookup; false/true policy filtering and both toggle directions; exact candidate ordering/deduplication; enabled-higher-metric selection over a disabled lower-metric route; stable-all-disabled `missing_route`; API/incomplete-row `route_selection_unavailable`; workload exclusion; and no route/interface or VPN-policy value leakage;
@@ -1495,11 +1634,13 @@ Verify:
 
 - URI user information, credentials, credential-assignment syntax, query strings, fragments, and customer/device identifiers are rejected;
 - HTTPS redirects and invalid TLS are rejected without fallback or weakened validation;
+- the R0-005 startup-only configuration exception remains atomic, fail-closed, nonpersistent, and value-redacted, while no failed cloud-delivered or durable/updateable configuration replaces a safely stored accepted last-known-good value;
 - endpoint URLs/hosts, DNS queries/answers, DNS-correlation snapshot fields, target IDs/labels/hosts/ports, response bodies, headers, `DisableDefaultRoutes` values, VPN status, interface identities/types, interface/route candidate data, IP addresses, next hops, metrics, LUIDs, indices, protocols/origins, exception text, machine paths, and other customer-controlled values do not appear in JSON or human reports, production logs, health output, support evidence, metrics, or other evidence;
 - workload manifests, scheduler keys or epochs, readiness-transition timestamp details, internal member identities, per-provider identities, and per-target identities do not appear in JSON or human acceptance reports, logs, health, support output, or metrics;
 - response-body readers stop at the 256-byte bound plus one overflow-detection byte and retain no bytes;
 - no production inbound listener, firewall mutation, packet capture, subnet/range expansion, broad port scan, or arbitrary gateway TCP probe exists;
 - no probe journal/outbox call, schema artifact, identity fabrication, or raw LAN inventory is introduced.
+- document-drift checks keep the requirements/source-precedence/startup/activation/failure/test language aligned with the narrow security-guardrail exception and do not generalize it.
 
 ### 9.4 Native Windows acceptance
 
@@ -1517,6 +1658,7 @@ Native acceptance must verify:
 - steady-state sampling is anchored at exact `steady_state_start + 5n seconds`, and startup/steady-state CPU and disk attribution share the committed boundary without an omitted or double-counted interval;
 - the exact PID remains alive and unchanged and CPU, disk, and working-set enforcement continue through stable final-snapshot commit while attempt and network membership stop at exact `steady_state_end`;
 - monitoring-ready is achieved within 60 seconds after network availability;
+- injected pre-process configuration rejection and host-profile failure produce fixed-shape reports with correct availability/null encoding and no scheduler; injected readiness timeout, start-barrier failure, early steady-state failure, end-drain timeout, and final-snapshot failure each produce the exact boundary flags, causal violations, human `unavailable` values, and JSON nulls required by section 8.8;
 - monitoring-ready remains continuously true from its first accepted observation through stable final-snapshot commit, the same active/enabled/undisposed scheduler epoch owns the unchanged accepted workload, and every due round before `steady_state_end` is terminally or explicitly incompletely reconciled;
 - injected native acceptance failure proves readiness loss, scheduler/epoch loss, or silent due-round loss cannot be forgiven by recovery or a same-run scheduler restart;
 - no inbound listener or firewall rule is added;
@@ -1552,6 +1694,7 @@ Deterministic automated tests must cover:
 - every static host-profile boundary, OS build below minimum, x86 or ARM process rejection, insufficient processors or physical memory, battery/power-scheme failure, debugger/profiler rejection, the idle CPU boundary, and the available-memory boundary;
 - physical, virtual, and unknown virtualization values;
 - exact `r0-005-resource-report/v1` top-level, `host_profile`, `timing`, `startup`, `runtime_continuity`, and remaining nested property names/order, invariant numeric and UTC serialization, no NaN/infinity, and identical values/calculations in the JSON and human report;
+- exact `measurement_availability` placement after `host_profile`, its nine-property order and Boolean encoding, every implication, the exhaustive per-property availability matrix, all eight normative examples, no fabricated zero/false/empty/timestamp evidence, and `report_serialization_invalid` for every inconsistent flag/null/value combination;
 - exact `by_probe_kind` vocabulary and exact `dns`, `gateway_icmp`, `https`, `tcp`, `unknown` order;
 - exact `by_outcome` vocabulary and exact `canceled`, `failed`, `incomplete`, `succeeded`, `timed_out` order;
 - exact `{code,count}` property order, mandatory zero-count entries, and the normative zero-attempt representation;
@@ -1581,6 +1724,7 @@ Deterministic automated tests must cover:
 - missing, malformed, negative, nonintegral, adapter-supplied, overridden, and conflicting charged values for recognized methods adding `attempt_accounting_incomplete` while totals remain table-derived;
 - both `attempt_accounting_incomplete` and `unknown_probe_method` appearing exactly once and in ordinal order when both apply;
 - byte-for-byte stable JSON for identical report models;
+- byte-for-byte stable JSON for identical failure models, pass reports with all availability flags true and no null acceptance field, and exact human `unavailable` rendering for every boundary-null value;
 - identical attempt counts, exact method-charge-derived network totals, timing boundaries, startup values, steady-state values, and disk values in the human and JSON reports;
 - privacy exclusion of machine names, usernames, domain membership, serials, device UUIDs, product keys, MAC/IP addresses, disk serials, cloud instance IDs, arbitrary environment variables, absolute paths, endpoints, targets, `DisableDefaultRoutes` values, VPN status, interface identities/types, next hops, other route/interface fields, DNS answers, DNS-correlation snapshot fields, payloads, headers, bodies, exception text, credentials, and customer identifiers, including identical exclusions in JSON and human evidence;
 - deterministic `host_profile` property order and rejection of missing or additional host-profile fields;
@@ -1605,7 +1749,7 @@ Deferred integration after authenticated identity exists must specify tenant own
 
 ## 11. Known limitation
 
-Pre-registration configuration and all operational evidence are intentionally volatile. Restart or readiness degradation loses counters, transitions, and flapping history. Restart reconstructs enabled targets as `unknown`; scheduler activation after readiness moves them to `baselining`. In addition, the inherited R0-004 limitation remains: simultaneous journal and lifecycle-marker failure can leave the durable marker stale until restart even though in-process readiness is false. R0-005 must stop on that in-process false state.
+Pre-registration configuration and all operational evidence are intentionally volatile. Restart or readiness degradation loses counters, transitions, and flapping history. Restart reconstructs enabled targets as `unknown`; scheduler activation after readiness moves them to `baselining`. A malformed restart-time override can therefore stop probing until configuration is fixed and another restart succeeds; R0-005 accepts that visible availability loss rather than silently reusing stale targets/providers, and this scoped exception does not apply once an approved durable configuration owner exists. In addition, the inherited R0-004 limitation remains: simultaneous journal and lifecycle-marker failure can leave the durable marker stale until restart even though in-process readiness is false. R0-005 must stop on that in-process false state.
 
 ## 12. Delivery boundary
 
