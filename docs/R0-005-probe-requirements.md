@@ -137,8 +137,12 @@ The default configuration contains exactly two reviewed, separately operated pro
 
 | Stable ID | Declared `operator_id` | URL | Required result |
 | --- | --- | --- | --- |
-| `google-generate-204` | `google` | `https://www.google.com/generate_204` | Valid TLS and hostname; no redirect; HTTP 204; no required body. |
-| `cloudflare-trace` | `cloudflare` | `https://www.cloudflare.com/cdn-cgi/trace` | Valid TLS and hostname; no redirect; HTTP 200; no expected-body rule. |
+| `google-generate-204` | `google` | `https://www.google.com/generate_204` | GET with no request body; valid TLS and hostname; no redirect; HTTP 204; no required body. |
+| `cloudflare-trace` | `cloudflare` | `https://www.cloudflare.com/cdn-cgi/trace` | GET with no request body; valid TLS and hostname; no redirect; HTTP 200; status-only validation with no expected-body rule. |
+
+Every HTTPS provider child attempt, whether built in or supplied by a valid custom provider-set override, uses the uppercase invariant HTTP method token `GET`. The method is fixed by the R0-005 contract and is not a startup-configuration or provider-override field. `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`, `CONNECT`, `TRACE`, and every extension or custom method are prohibited. A transport adapter must not replace GET with HEAD as an optimization, including for a status-only provider. A provider definition cannot request or imply another method. If an implementation exposes an internal method parameter, that parameter is fixed to GET and any contradictory value is rejected as an implementation/configuration invariant before scheduler activation.
+
+Every provider GET has no request body, uploaded payload, caller-supplied request content, authentication, cookie, redirect-following behavior, certificate exception, or HTTP fallback. Request content must not be derived from customer, device, property, tenant, target, endpoint, configuration, or other identity. The request does not emit `Content-Length` or another entity-body header unless the reviewed HTTP stack deterministically emits a zero-body representation that does not change semantics.
 
 The Google default is supported by current Chromium source, which defines `https://www.google.com/generate_204` as its HTTPS-first default probe and treats HTTP 204 as validated:
 
@@ -152,7 +156,7 @@ Cloudflare documents that the trace response contains connection metadata, inclu
 
 - <https://developers.cloudflare.com/privacy-proxy/get-started/>
 
-For that reason, the Cloudflare default is status-only. The request uses response-headers-first streaming; once status is known, the implementation disposes the response. It must not parse, log, persist, compare, expose as health evidence, or otherwise retain the body. A defensive reader used by a transport must stop at 256 bytes and still discard the bytes.
+For that reason, the Cloudflare default is status-only. Its GET uses response-headers-first streaming; once status is known, the implementation disposes the response without opening or reading the content stream. It must not parse, log, persist, compare, expose as health evidence, or otherwise retain the body. A defensive reader exists only for a provider with an expected-body rule, must stop at 256 bytes plus one overflow-detection byte, and must still discard every byte.
 
 `http://www.msftconnecttest.com/connecttest.txt` is explicitly not a default. Microsoft's NCSI documentation defines it as a plain-HTTP probe with HTTP 200 and expected text:
 
@@ -160,7 +164,7 @@ For that reason, the Cloudflare default is status-only. The request uses respons
 
 Plain HTTP conflicts with this repository's outbound HTTPS-only rule. During requirements verification, the corresponding HTTPS request also failed strict Windows hostname validation. R0-005 must not disable certificate validation, fall back to HTTP, add a provider exception, or treat the Microsoft endpoint as required.
 
-An operator may override the full HTTPS provider set at startup, subject to all of these rules:
+An operator may override the full HTTPS provider set at startup, but every accepted custom provider still uses GET with no request body and no method override. The provider-set override is subject to all of these rules:
 
 - exactly 2–4 entries;
 - stable IDs are required, 1–64 characters, and unique ignoring case;
@@ -174,9 +178,10 @@ An operator may override the full HTTPS provider set at startup, subject to all 
 - each entry contains an exact integer expected status from 200 through 299, inclusive; every 1xx, 3xx (including 300–308), 4xx, and 5xx value is invalid configuration;
 - an optional exact expected body may be configured as UTF-8 text of at most 256 bytes;
 - an expected body is invalid when expected status is 204 or 205; either status remains valid without an expected body;
-- if no exact body is configured, body content is not a health condition and is not read;
-- if an exact body is configured, at most 256 bytes plus one overflow-detection byte are read, compared without normalization, and discarded;
-- endpoint bodies, headers, hostnames, URLs, DNS answers, and `operator_id` values never enter logs, persistence, probe evidence, health output, support output, or metrics.
+- if no exact body is configured, the provider still uses GET, body content is not a health condition, and the content stream is not opened or read;
+- if an exact body is configured, the provider uses GET and at most 256 bytes plus one overflow-detection byte are read, compared without normalization, and discarded; HEAD cannot substitute and a missing, truncated, oversized, unreadable, mismatched, or otherwise invalid body retains the existing terminal provider-failure classification;
+- the fixed method is contract behavior rather than evidence: no HTTP request-method field or method string enters startup configuration, provider overrides, JSON or human reports, logs, persistence, probe evidence, health output, support output, or metrics;
+- endpoint bodies, request bodies, headers, hostnames, URLs, DNS answers, and `operator_id` values never enter logs, persistence, probe evidence, health output, support output, or metrics.
 
 #### Registrable-domain normalization and pinned suffix data
 
@@ -228,14 +233,14 @@ This validation is intentionally structural. Pairwise-distinct registrable domai
 
 ### 2.4 External endpoint verification record
 
-Requirements resolution performed a bounded, read-only verification on 2026-07-29 using system TLS validation, disabled redirects, response-headers-first completion, and no retained bodies:
+Requirements resolution performed a bounded, read-only verification on 2026-07-29 using GET with no request body, system TLS validation, disabled redirects, response-headers-first completion, and no retained bodies:
 
-| Endpoint | Observed status | Redirect | Bounded first read |
+| Endpoint | Observed status | Redirect | Requirements-only bounded first read |
 | --- | ---: | --- | ---: |
 | Google `generate_204` | 204 | no | 0 bytes |
 | Cloudflare `cdn-cgi/trace` | 200 | no | 200 bytes, immediately discarded |
 
-This is requirements evidence, not a CI dependency or uptime guarantee. Runtime behavior is governed by the aggregation rules below, and automated tests use fakes or disposable local endpoints.
+The Cloudflare read in this one-time requirements-resolution record is historical discovery evidence, not permitted runtime behavior. Every R0-005 Cloudflare runtime GET is status-only and disposes the response without opening or reading its content stream. This record is not a CI dependency or uptime guarantee; runtime behavior is governed by the aggregation rules below, and automated tests use fakes or disposable local endpoints.
 
 ### 2.5 Backlog ownership
 
@@ -372,6 +377,8 @@ These fields are internal coordination data. They must not enter logs, health ou
 ### 3.3 HTTPS aggregate
 
 One logical HTTPS round attempts every provider in the atomically accepted pairwise-distinct set, subject to global limits and the logical-round deadline. Provider count `N` is therefore also the distinct provider-ID, operator-ID, normalized-host, and normalized-registrable-domain count; aggregation never collapses or substitutes providers by shared domain, host, operator, or ID. The HTTPS aggregate is one logical target and has at most one active logical round. Each configured provider invocation is a child transport attempt within that round, not another logical target. Within the one active round, at most one attempt per configured provider may be active, provider attempts may overlap, and no provider may be attempted more than once. A second HTTPS aggregate round cannot be admitted or started until the first round has reduced to one terminal aggregate result.
+
+Every child transport invocation is exactly one GET with no request body. This binding is identical for built-in providers, custom providers, status-only providers, and providers with an expected-body rule. An adapter never sends HEAD or another method, even when only status is evaluated. A status-only GET disposes the response after headers without reading or exposing its body; an expected-body GET applies only the existing bounded exact-read rules. Method binding changes no timeout, deadline, fan-out, token, fixed 8,192-byte method charge, measured-byte attribution, attempt accounting, phase membership, workload coverage, aggregate reduction, or report shape.
 
 At the HTTPS logical-round start timestamp, the reducer captures exactly one immutable copy of the most recent published DNS snapshot whose completion timestamp is less than or equal to the HTTPS round start. A DNS round that completes after the HTTPS round starts can never alter that HTTPS round. Snapshot age uses only the injected monotonic clock:
 
@@ -682,16 +689,29 @@ State is observational, not causal. `offline` means repeated technical failure; 
 
 ## 6. Flapping evidence
 
-A logical target is flapping when at least four state transitions among `healthy`, `suspect`, `offline`, and `recovering` occur in a rolling ten-minute window.
+A logical target is flapping when at least four state transitions among `healthy`, `suspect`, `offline`, and `recovering` occur in the authoritative rolling ten-minute window. The existing transition-count threshold and qualifying-state set do not change.
 
-- Entry into `unknown` or `baselining` is not qualifying.
-- Repeated rounds that leave state unchanged are not transitions.
-- In particular, repeated success in `healthy`, below-threshold failure in `suspect`, and counted failure in `offline` do not add flapping transitions.
-- The flag clears after 20 consecutive minutes without a qualifying transition.
-- History is bounded to timestamps needed for the current ten-minute window plus the last qualifying transition.
-- Time comes from the injected clock.
-- Flapping does not replace the operational state, change cadence or thresholds, create a cloud/user incident, or suppress notifications.
-- Evidence is in memory only and resets on restart or degradation.
+Each qualifying material state transition receives exactly one internal timestamp from the same injected monotonic clock used for deterministic elapsed-time behavior elsewhere in R0-005. The timestamp is sampled at the exact atomic state-transition commit boundary and is the committed transition instant. Probe admission, transport start or completion, callback delivery, log write, UTC sampling, report generation, event-log time, and file time are not transition timestamps. Entry into `unknown` or `baselining` is not qualifying. Repeated rounds that leave state unchanged are not transitions and receive no flapping-history entry. In particular, repeated success in `healthy`, below-threshold failure in `suspect`, and counted failure in `offline` neither add a transition nor restart the clear interval.
+
+For evaluation at one injected monotonic time `now`, the authoritative ten-minute history is:
+
+```text
+now - 10 minutes < transition_timestamp <= now
+```
+
+Before threshold evaluation, evict every timestamp satisfying `transition_timestamp <= now - 10 minutes`. A transition exactly ten monotonic minutes old is expired, a transition one monotonic tick newer remains, and a transition committed at `now` is included. Evaluation and a newly committed transition use one deterministic injected-monotonic `now` at the transition boundary; aligned wall-clock buckets and calendar minutes are prohibited.
+
+Once active, flapping clears only when the injected monotonic age since the latest qualifying transition satisfies:
+
+```text
+now - latest_transition_timestamp >= 20 minutes
+```
+
+Clearing does not occur one monotonic tick before the boundary and occurs at exactly 20 monotonic minutes. Any new qualifying transition before that boundary becomes the latest transition and restarts the 20-minute age. Self-transitions and other nonqualifying observations do not restart it.
+
+Flapping transition ordering, window membership, eviction, threshold evaluation, activation, clearing, and elapsed-duration calculation use only injected monotonic time with checked deterministic arithmetic. UTC or local wall time, timezone, DST, NTP adjustment, manual clock correction, leap-second representation, event-log timestamps, operating-system file timestamps, timer ticks, and calendar buckets cannot affect the result. Existing bounded UTC correlation may continue where separately permitted, but UTC never participates in flapping behavior. A monotonic reversal, malformed value, overflow, or inability to evaluate an interval is an implementation invariant failure and cannot fall back to UTC or wall time.
+
+History is bounded to timestamps needed for the current ten-minute window plus the latest qualifying transition. It remains process-local internal state: no flapping timestamp or HTTP method is added to reports, persistence, logs, metrics, health, or support output. Restart or degradation discards the history, enabled probes resume through the existing initial/baselining lifecycle, and prior-process monotonic values are never compared with the new process. Flapping does not replace operational state, change cadence or thresholds, create a cloud/user incident, or suppress notifications.
 
 Notification cooldown and suppression policy remain outside R0-005.
 
@@ -1784,7 +1804,11 @@ Use fake transports, an injected clock, deterministic jitter, and synthetic rout
 - stable rotating fair-queue order, bounded HTTPS fan-out, pending-child/non-HTTPS alternation, no systematic Gateway/DNS/TCP starvation under sustained valid mixed demand, cancellation before token consumption, and a started timeout consuming one token;
 - genuine capacity or token contention that prevents required provider completion still producing the existing non-counting incomplete aggregate result;
 - shutdown and degradation cancellation;
-- flapping detection, rolling-window eviction, clearing, restart reset, and degradation reset;
+- flapping activation at the existing fourth-transition threshold, with each qualifying transition timestamped once at the atomic state-transition commit boundary and self-transitions/nonqualifying observations receiving no history entry;
+- the injected-monotonic ten-minute window including a current transition and one exactly inside the boundary, evicting a transition exactly ten minutes old and one tick older, and retaining one tick newer;
+- the injected-monotonic clear interval remaining active one tick before 20 minutes, clearing exactly at 20 minutes, and restarting from a new qualifying transition without changing transition eligibility;
+- forward/backward UTC jumps, constant UTC with advancing monotonic time, timezone/DST changes, and identical monotonic sequences with different UTC sequences producing identical flapping results; monotonic reversal, malformed arithmetic, and overflow fail without wall-time fallback; restart and degradation discard history without persistence;
+- document-drift tests failing if flapping uses an unspecified injected clock rather than injected monotonic time, permits UTC or wall time in calculations, changes the exact ten-minute or 20-minute boundary, broadens transition eligibility, or implies persisted flapping timestamps;
 - configuration bounds, atomic rejection, duplicate IDs, 0/25/26 targets, interval/port limits, credential-like values, and URI/range rejection;
 - malformed startup configuration activating no scheduler or partial valid subset, preserving no prior in-memory state or stale provider/target set across restart, leaving readiness unavailable/degraded with bounded value-free evidence, and corrected configuration plus restart permitting normal activation;
 - a document-drift check proving the R0-005 no-durable-LKG exception remains narrow and consistent with `docs/security-guardrails.md`, while durable/updateable configuration outside this exception continues to preserve its safely stored accepted last-known-good value;
@@ -1795,9 +1819,11 @@ Use fake transports, an injected clock, deterministic jitter, and synthetic rout
 - registrable-domain cases for `example.com`, a multi-label suffix such as `example.co.uk`, exact, wildcard, exception, and PRIVATE-section rules, one optional terminal dot, a host equal to a public suffix, IP-literal rejection, two subdomains sharing one registrable domain, and Unicode/IDNA-equivalent hosts normalizing to the same domain;
 - byte-for-byte pinned suffix-data verification and deterministic registrable-domain behavior across restarts;
 - provider-set count, pairwise provider/domain/host/declared-operator separation, configuration-order independence, atomic rejection with no partial scheduler activation, and a drift test proving every requirements statement uses `distinct_registrable_domain_count = N` for all 2–4 providers;
-- HTTPS-only URLs; validation acceptance for otherwise valid expected statuses 200, 204, 206, and 299; atomic rejection for 100, 199, 300, 302, 304, 307, 308, 400, 500, and 599; configuration-order independence; and no partial provider subset activation;
-- expected-body rejection with status 204 or 205, acceptance of 204 or 205 without a body, optional bounded exact UTF-8 body comparison for other accepted 2xx statuses, and unchanged Google-204/Cloudflare-200 defaults;
-- HTTPS endpoint outcomes for 204, 200 status-only, wrong status, every actual 3xx as terminal failure, redirects disabled, TLS failure, timeout, cancellation, oversized body, body not retained, partial provider failure, all-provider failure, and two-provider independence;
+- HTTPS-only URLs; every built-in and custom provider producing uppercase GET with no request body; no method override; HEAD rejected for both status-only and expected-body providers; and POST/PUT/PATCH/DELETE/OPTIONS/CONNECT/TRACE/extension methods rejected before scheduler activation;
+- validation acceptance for otherwise valid expected statuses 200, 204, 206, and 299; atomic rejection for 100, 199, 300, 302, 304, 307, 308, 400, 500, and 599; configuration-order independence; and no partial provider subset activation;
+- expected-body rejection with status 204 or 205, acceptance of 204 or 205 without a body, optional bounded exact UTF-8 body comparison over GET for other accepted 2xx statuses, and unchanged Google-204/Cloudflare-200 defaults;
+- HTTPS endpoint outcomes for GET 204, GET 200 status-only without body inspection, GET expected-body success, wrong status, every actual 3xx as terminal failure, redirects disabled, TLS failure, timeout, cancellation, oversized or unreadable body, body not retained, partial provider failure, all-provider failure, and two-provider independence;
+- method binding leaving tokens, fixed 8,192-byte charge, measured bytes, attempts, concurrency, deadline, phase membership, workload coverage, aggregate reduction, and report shape unchanged, with document-drift tests failing if any provider path omits GET, permits another method or request content, or adds an HTTP method field to evidence;
 - DNS snapshot correlation for DNS completion before HTTPS start, DNS completion after HTTPS start, concurrent completions in opposite task orders producing the same HTTPS result, the exact 60-second freshness boundary, stale snapshot, no snapshot, fresh success, fresh counted failure, fresh non-counting result, DNS disabled, and timestamp reversal;
 - DNS-blocked HTTPS aggregation, `dns_correlation_unavailable`, DNS independence, and absence of snapshot fields from logs and evidence;
 - one IPv4 default route, one IPv6 default route, simultaneous-family routes, lower effective metric winning across families, IPv4 winning only an exact effective-metric tie, and route/interface metric composition using checked addition from the same family-matching IP-interface row that supplies `Connected` and `DisableDefaultRoutes`;
@@ -1841,13 +1867,15 @@ Use fake transports, an injected clock, deterministic jitter, and synthetic rout
 Use disposable local endpoints or fakes only. Cover:
 
 - local TCP accept, refuse, timeout, cancellation, and socket disposal;
-- local HTTPS status/body/redirect/streaming behavior with test certificates as appropriate;
+- local HTTPS GET status/body/redirect/streaming behavior with test certificates as appropriate, proving Google-shaped 204 and Cloudflare-shaped 200 status-only behavior, no request body, and no Cloudflare-style or custom status-only response-body read, retention, or exposure;
+- local HTTPS GET expected-body success and a controlled endpoint where HEAD would differ but is never invoked; interception proving POST/PUT/PATCH/DELETE/OPTIONS/CONNECT/TRACE/extension methods are never sent; and exact per-provider attempt/token/charge accounting unchanged;
 - local HTTPS validation/execution for the complete accepted/rejected status set, 204/205 body contradictions, actual 3xx never succeeding, redirects remaining disabled, provider-order independence, and preserved default-provider validity;
 - two-, three-, and four-provider local HTTPS fan-out with concurrent all-timeout completion, partial success, global/per-provider limits, non-overlapping aggregate rounds, contention incompleteness, and sustained mixed-work fairness;
 - two-, three-, and four-provider startup acceptance with pairwise-distinct IDs/operators/hosts/domains, plus atomic no-scheduler rejection for every pairwise duplicate and for IDNA-equivalent or configuration-order-permuted duplicates;
 - system-resolver adapter success/failure through a controlled abstraction;
 - controlled one-name DNS operation with exactly one resolver invocation, no fallback/search expansion, one snapshot result, and unchanged token/charged-byte accounting;
 - scheduler activation after readiness creating one full process-local bucket plus an empty rolling admission ledger, exact monotonic lazy refill/rolling expiry during local fake/endpoint work, and prompt stop plus bucket/ledger discard on readiness degradation;
+- an injected dual-clock abstraction where monotonic time advances while UTC jumps forward, jumps backward, or remains constant, proving flapping transition ordering, ten-minute eviction, threshold evaluation, and exact 20-minute clearing depend only on monotonic input; restart clears history and no flapping timestamp is reported or persisted;
 - restart rebinds static configuration, reconstructs enabled probes as `unknown`, moves them to `baselining` only through scheduler activation after readiness, and creates a new full bucket/anchor and empty rolling ledger without prior credit or entry;
 - malformed restart-time configuration producing no scheduler or partial activation, reusing no prior process-memory or stale provider/target set, remaining visibly unavailable/degraded with value-free bounded evidence, and corrected configuration on a later healthy restart activating normally;
 - an acceptance coordinator subscribed before readiness, continuous event/sample reconciliation, permanent failure after transient readiness loss, same-epoch ownership through both barriers/final stabilization, and no same-run scheduler restart after continuity failure;
@@ -1877,7 +1905,8 @@ Verify:
 - source fields contain only the independently exact-tree-proven full commit SHA, fixed acceptance-profile identifier, and exact complete single-artifact digest, with no machine/user/domain/property/tenant/customer/target/provider value, source/worktree/Git-object/build/package/intermediate/project/source/artifact path or filename, tree/blob/analyzer/generator identity, executable/extraction filename, assembly/module identity, checkout, branch, arbitrary environment value, or exception text in JSON or human evidence;
 - process evidence exposes no command line, executable/module path, debugger identity, profiler identity/CLSID, diagnostic endpoint, process token, security descriptor, environment-variable value, event-source payload, or account/user identity, and JSON/human reports agree on initial values, nulls, validation, violations, and retention;
 - publication paths, staging paths, filenames, directory identities, handles, filesystem/operating-system errors, exception text, host/account identity, and private destination detail appear in neither report nor bounded console/status output, including destination-collision, rename, and staging-cleanup failures;
-- endpoint URLs/hosts, DNS queries/answers, DNS-correlation snapshot fields, target IDs/labels/hosts/ports, response bodies, headers, `DisableDefaultRoutes` values, VPN status, interface identities/types, interface/route candidate data, IP addresses, next hops, metrics, LUIDs, indices, protocols/origins, exception text, machine paths, and other customer-controlled values do not appear in JSON or human reports, production logs, health output, support evidence, metrics, or other evidence;
+- endpoint URLs/hosts, HTTP method strings or method-specific details, request/response bodies, headers, DNS queries/answers, DNS-correlation snapshot fields, target IDs/labels/hosts/ports, `DisableDefaultRoutes` values, VPN status, interface identities/types, interface/route candidate data, IP addresses, next hops, metrics, LUIDs, indices, protocols/origins, exception text, machine paths, and other customer-controlled values do not appear in JSON or human reports, production logs, health output, support evidence, metrics, or other evidence;
+- every HTTPS provider request is GET with no caller-supplied content, upload, authentication, cookie, or unauthorized entity-body header, and status-only responses are disposed without content-stream reads;
 - workload manifests, scheduler keys or epochs, rolling-ledger entries or timestamps, readiness-transition timestamp details, internal member identities, per-provider identities, and per-target identities do not appear in JSON or human acceptance reports, logs, health, support output, or metrics;
 - response-body readers stop at the 256-byte bound plus one overflow-detection byte and retain no bytes;
 - no production inbound listener, firewall mutation, packet capture, subnet/range expansion, broad port scan, or arbitrary gateway TCP probe exists;
@@ -1898,6 +1927,8 @@ Native acceptance must verify:
 - current-compartment IPv4/IPv6 default-route discovery through the required IP Helper rows; same-pass, family-specific `Connected`/`Metric`/`DisableDefaultRoutes` resolution; stable A/B candidate-set commit; exclusion before sorting when the policy value is true; both flag-toggle directions causing retry; family-specific effective-metric composition; exact tuple selection; and bounded `missing_route`/`icmp_unavailable`/`route_selection_unavailable` distinctions;
 - Ethernet, Wi-Fi, PPP, VPN, tunnel, and virtual competition resolved uniformly by mandatory `DisableDefaultRoutes == false` plus the binding metric/tuple policy, with an enabled higher-metric route selected over a disabled lower-metric route and without policy value, VPN status, interface identity/type, address, next hop, metric, LUID, index, protocol, or origin disclosure;
 - ICMP success when permitted and `icmp_unavailable` behavior when it is not;
+- controlled internal interception proves every built-in and custom HTTPS provider child uses GET with no request body, without exposing endpoints, headers, payloads, response bodies, or method details in reports;
+- controlled wall-clock-correction simulation through the injected dual-clock abstraction proves flapping is driven only by monotonic elapsed time; acceptance does not change the host clock, timezone, NTP state, or Windows time-service configuration;
 - cancellation and service stop complete within five seconds;
 - the 25-target resource sampler passes only after the Gateway, enabled DNS, both HTTPS providers, and all 25 distinct synthetic TCP members receive terminal steady-state exercise;
 - exact internal start/charge evidence proves activation and every later rolling monotonic 60-second window contains at most 60 starts and less than 100,000 fixed charged bytes, with candidate order and exact-age expiry deterministic and JSON/human aggregates derived from the same started-attempt records;
@@ -1992,7 +2023,7 @@ Deterministic automated tests must cover:
 - equality between each outcome scalar and its corresponding array entry, plus every started/completed/outcome accounting identity;
 - mutually exclusive probe-kind assignment and mutually exclusive outcome assignment for every invocation;
 - every started invocation receiving exactly one outcome and rejection of an outcome without a corresponding started invocation;
-- separate accounting for every HTTPS provider request;
+- separate accounting for every HTTPS provider GET request, fixed GET behavior for every provider member, identical scheduling/accounting for expected-body and status-only providers, method-independent fixed charge and report shape, and no HTTP request-method field in JSON or human output;
 - complete required workload passing only after the Gateway logical-round/terminal-ICMP rule, enabled DNS, every configured HTTPS provider, and all 25 TCP members are distinctly exercised during steady state, with terminal failed/timed-out attempts eligible and no exact success count required;
 - a zero-attempt run, one missing TCP target, 24 distinct TCP targets plus duplicate work on another, one missing HTTPS provider, aggregate HTTPS counts masking an unexercised provider, missing Gateway coverage, and enabled-but-unexercised DNS each adding `acceptance_workload_incomplete` and failing;
 - disabled DNS producing no required member and both DNS flags false; startup-only work and pre-start cancellation not satisfying coverage; and a started nonterminal attempt satisfying neither coverage nor existing attempt closure while adding both applicable violations;
