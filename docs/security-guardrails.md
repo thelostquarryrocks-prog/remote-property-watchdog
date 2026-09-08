@@ -27,7 +27,8 @@
 ## Security failure behavior
 
 - Invalid or expired credentials fail closed.
-- A malformed configuration does not replace last-known-good configuration.
+- A malformed durable or updateable configuration does not replace a safely stored, previously accepted last-known-good configuration. Failed cloud-delivered or authenticated updates must preserve that working state.
+- Narrow R0-005 exception: the documented pre-registration, startup-only probe configuration has no authenticated or durable owner and no stored last-known-good value. Until a later approved task introduces persistent configuration ownership, R0-005 atomically rejects malformed startup configuration, activates no probe scheduler or partial subset, reuses no prior process-memory or stale provider/target set, and remains visibly unavailable or degraded until the operator fixes configuration and restarts. This exception neither authorizes R0-005 persistence nor permits any other configuration path to discard a durable last-known-good value.
 - A failed update signature blocks installation.
 - If secrets cannot be unprotected, monitoring enters visible degraded state rather than deleting/recreating them silently.
 - Cloud/provider failure must not be presented as a property outage without correlation and platform-health checks.
